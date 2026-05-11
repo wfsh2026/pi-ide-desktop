@@ -1,7 +1,7 @@
 use once_cell::sync::Lazy;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
-use std::{env, fs, io::{Read, Write}, path::PathBuf};
+use std::{env, fs, io::{Read, Write}, path::{Path, PathBuf}, process::Command};
 use tauri::Emitter;
 use tokio::sync::Mutex;
 
@@ -28,6 +28,23 @@ struct SessionNode {
 struct LaunchContext {
   opened_from_context: bool,
   project_path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DirectoryTreeNode {
+  name: String,
+  path: String,
+  is_dir: bool,
+  omitted: bool,
+  children: Vec<DirectoryTreeNode>,
+}
+
+#[derive(Debug, Serialize)]
+struct DirectoryTreeResponse {
+  root: String,
+  lines: Vec<String>,
+  tree: DirectoryTreeNode,
+  truncated: bool,
 }
 
 fn storage_dir() -> Result<PathBuf, String> {
@@ -66,6 +83,257 @@ fn launch_project_path() -> Option<PathBuf> {
 fn get_launch_context() -> LaunchContext {
   let project_path = launch_project_path().map(|p| p.to_string_lossy().to_string());
   LaunchContext { opened_from_context: project_path.is_some(), project_path }
+}
+
+fn should_omit_dir(name: &str) -> bool {
+  matches!(
+    name,
+    ".git" | "node_modules" | "target" | "dist" | "build" | ".next" | ".vite" | "coverage" | "release"
+  )
+}
+
+fn sorted_directory_entries(dir: &Path) -> Result<Vec<fs::DirEntry>, String> {
+  let mut entries = fs::read_dir(dir)
+    .map_err(|e| format!("读取目录失败 {:?}: {e}", dir))?
+    .filter_map(|entry| entry.ok())
+    .collect::<Vec<_>>();
+
+  entries.sort_by(|a, b| {
+    let a_is_dir = a.file_type().map(|t| t.is_dir()).unwrap_or(false);
+    let b_is_dir = b.file_type().map(|t| t.is_dir()).unwrap_or(false);
+    b_is_dir
+      .cmp(&a_is_dir)
+      .then_with(|| a.file_name().to_string_lossy().to_lowercase().cmp(&b.file_name().to_string_lossy().to_lowercase()))
+  });
+
+  Ok(entries)
+}
+
+fn push_directory_tree_lines(
+  dir: &Path,
+  prefix: &str,
+  depth: usize,
+  max_depth: usize,
+  max_lines: usize,
+  lines: &mut Vec<String>,
+  truncated: &mut bool,
+) -> Result<(), String> {
+  if *truncated || depth >= max_depth {
+    return Ok(());
+  }
+
+  let entries = sorted_directory_entries(dir)?;
+
+  for (index, entry) in entries.iter().enumerate() {
+    if lines.len() >= max_lines {
+      lines.push(format!("{}… 已省略更多条目", prefix));
+      *truncated = true;
+      break;
+    }
+
+    let name = entry.file_name().to_string_lossy().to_string();
+    let is_last = index + 1 == entries.len();
+    let connector = if is_last { "└─ " } else { "├─ " };
+    let child_prefix = if is_last { "   " } else { "│  " };
+    let file_type = entry.file_type().map_err(|e| format!("读取文件类型失败 {:?}: {e}", entry.path()))?;
+
+    if file_type.is_dir() {
+      if should_omit_dir(&name) {
+        lines.push(format!("{}{}{}/（已省略）", prefix, connector, name));
+      } else {
+        lines.push(format!("{}{}{}/", prefix, connector, name));
+        push_directory_tree_lines(
+          &entry.path(),
+          &format!("{}{}", prefix, child_prefix),
+          depth + 1,
+          max_depth,
+          max_lines,
+          lines,
+          truncated,
+        )?;
+      }
+    } else {
+      lines.push(format!("{}{}{}", prefix, connector, name));
+    }
+  }
+
+  Ok(())
+}
+
+fn build_directory_tree_node(
+  path: &Path,
+  name: String,
+  depth: usize,
+  max_depth: usize,
+  max_nodes: usize,
+  node_count: &mut usize,
+  truncated: &mut bool,
+) -> Result<DirectoryTreeNode, String> {
+  let is_dir = path.is_dir();
+  let mut node = DirectoryTreeNode {
+    name,
+    path: path.to_string_lossy().to_string(),
+    is_dir,
+    omitted: false,
+    children: vec![],
+  };
+
+  if !is_dir || *truncated || depth >= max_depth {
+    return Ok(node);
+  }
+
+  for entry in sorted_directory_entries(path)? {
+    if *node_count >= max_nodes {
+      node.children.push(DirectoryTreeNode {
+        name: "… 已省略更多条目".to_string(),
+        path: path.to_string_lossy().to_string(),
+        is_dir: false,
+        omitted: true,
+        children: vec![],
+      });
+      *truncated = true;
+      break;
+    }
+
+    let child_path = entry.path();
+    let child_name = entry.file_name().to_string_lossy().to_string();
+    let file_type = entry.file_type().map_err(|e| format!("读取文件类型失败 {:?}: {e}", child_path))?;
+    *node_count += 1;
+
+    if file_type.is_dir() && should_omit_dir(&child_name) {
+      node.children.push(DirectoryTreeNode {
+        name: child_name,
+        path: child_path.to_string_lossy().to_string(),
+        is_dir: true,
+        omitted: true,
+        children: vec![],
+      });
+    } else {
+      node.children.push(build_directory_tree_node(
+        &child_path,
+        child_name,
+        depth + 1,
+        max_depth,
+        max_nodes,
+        node_count,
+        truncated,
+      )?);
+    }
+  }
+
+  Ok(node)
+}
+
+#[tauri::command]
+fn open_path_in_file_manager(path: String) -> Result<(), String> {
+  let raw_path = PathBuf::from(path.trim());
+  if !raw_path.exists() {
+    return Err(format!("路径不存在：{}", raw_path.to_string_lossy()));
+  }
+  let target = if raw_path.is_dir() {
+    raw_path
+  } else {
+    raw_path
+      .parent()
+      .ok_or_else(|| format!("无法定位所在目录：{}", raw_path.to_string_lossy()))?
+      .to_path_buf()
+  };
+
+  #[cfg(windows)]
+  {
+    Command::new("explorer.exe")
+      .arg(&target)
+      .spawn()
+      .map_err(|e| format!("打开资源管理器失败：{e}"))?;
+  }
+
+  #[cfg(target_os = "macos")]
+  {
+    Command::new("open")
+      .arg(&target)
+      .spawn()
+      .map_err(|e| format!("打开 Finder 失败：{e}"))?;
+  }
+
+  #[cfg(all(unix, not(target_os = "macos")))]
+  {
+    Command::new("xdg-open")
+      .arg(&target)
+      .spawn()
+      .map_err(|e| format!("打开文件管理器失败：{e}"))?;
+  }
+
+  Ok(())
+}
+
+#[tauri::command]
+fn open_file_with_default_app(path: String) -> Result<(), String> {
+  let target = PathBuf::from(path.trim());
+  if !target.exists() {
+    return Err(format!("文件不存在：{}", target.to_string_lossy()));
+  }
+  if !target.is_file() {
+    return Err(format!("不是文件：{}", target.to_string_lossy()));
+  }
+
+  #[cfg(windows)]
+  {
+    Command::new("cmd.exe")
+      .arg("/C")
+      .arg("start")
+      .arg("")
+      .arg(&target)
+      .spawn()
+      .map_err(|e| format!("打开文件失败：{e}"))?;
+  }
+
+  #[cfg(target_os = "macos")]
+  {
+    Command::new("open")
+      .arg(&target)
+      .spawn()
+      .map_err(|e| format!("打开文件失败：{e}"))?;
+  }
+
+  #[cfg(all(unix, not(target_os = "macos")))]
+  {
+    Command::new("xdg-open")
+      .arg(&target)
+      .spawn()
+      .map_err(|e| format!("打开文件失败：{e}"))?;
+  }
+
+  Ok(())
+}
+
+#[tauri::command]
+fn get_directory_tree(path: String) -> Result<DirectoryTreeResponse, String> {
+  let root = PathBuf::from(path.trim());
+  if !root.exists() {
+    return Err(format!("目录不存在：{}", root.to_string_lossy()));
+  }
+  if !root.is_dir() {
+    return Err(format!("不是目录：{}", root.to_string_lossy()));
+  }
+
+  let root_name = root
+    .file_name()
+    .and_then(|name| name.to_str())
+    .unwrap_or("当前项目")
+    .to_string();
+  let mut lines = vec![format!("{}/", root_name)];
+  let mut truncated = false;
+  push_directory_tree_lines(&root, "", 0, 4, 500, &mut lines, &mut truncated)?;
+
+  let mut node_count = 1;
+  let tree = build_directory_tree_node(&root, root_name, 0, 4, 500, &mut node_count, &mut truncated)?;
+
+  Ok(DirectoryTreeResponse {
+    root: root.to_string_lossy().to_string(),
+    lines,
+    tree,
+    truncated,
+  })
 }
 
 #[cfg(windows)]
@@ -199,7 +467,7 @@ fn build_pi_command(raw: &str) -> Result<CommandBuilder, String> {
   if raw.contains('\n') || raw.contains('\r') || raw.to_ascii_lowercase().starts_with("@echo") || raw.to_ascii_lowercase().starts_with("set ") {
     let scripts_dir = storage_dir()?.join("launch-scripts");
     fs::create_dir_all(&scripts_dir).map_err(|e| format!("创建启动脚本目录失败: {e}"))?;
-    let script_path = scripts_dir.join("pi-launch.cmd");
+    let script_path = scripts_dir.join("pi-launch.bat");
     let mut script = raw.replace('\r', "");
     if !script.ends_with('\n') { script.push('\n'); }
     fs::write(&script_path, script).map_err(|e| format!("写入启动脚本失败: {e}"))?;
@@ -207,7 +475,12 @@ fn build_pi_command(raw: &str) -> Result<CommandBuilder, String> {
     let mut cmd = CommandBuilder::new("cmd.exe");
     cmd.arg("/D");
     cmd.arg("/C");
-    cmd.arg(format!("call \"{}\"", script_path.to_string_lossy()));
+    // 不要把带引号的 `call "..."` 拼成一个参数传给 cmd.exe。
+    // portable-pty/CreateProcess 会再次转义内部引号，cmd 可能把
+    // `"C:\...\pi-launch.bat"` 当成带反斜杠和引号的字面命令，导致
+    // “不是内部或外部命令”。直接把脚本路径作为 /C 的命令参数交给
+    // CommandBuilder 处理一次转义即可，含空格的用户目录也能正常启动。
+    cmd.arg(script_path);
     if let Some(path) = windows_augmented_path() {
       cmd.env("PATH", path);
     }
@@ -434,6 +707,9 @@ fn main() {
     .plugin(tauri_plugin_clipboard_manager::init())
     .invoke_handler(tauri::generate_handler![
       get_launch_context,
+      open_path_in_file_manager,
+      open_file_with_default_app,
+      get_directory_tree,
       start_pi,
       send_pi_input,
       stop_pi,
