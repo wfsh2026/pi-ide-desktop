@@ -1,7 +1,7 @@
 use once_cell::sync::Lazy;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
-use std::{fs, io::{Read, Write}, path::PathBuf};
+use std::{env, fs, io::{Read, Write}, path::PathBuf};
 use tauri::Emitter;
 use tokio::sync::Mutex;
 
@@ -22,6 +22,12 @@ struct SessionNode {
   title: String,
   command: String,
   created_at: String,
+}
+
+#[derive(Debug, Serialize)]
+struct LaunchContext {
+  opened_from_context: bool,
+  project_path: Option<String>,
 }
 
 fn storage_dir() -> Result<PathBuf, String> {
@@ -47,6 +53,49 @@ fn write_json_array<T: Serialize>(path: PathBuf, value: &Vec<T>) -> Result<(), S
   let raw = serde_json::to_string_pretty(value).map_err(|e| format!("JSON 序列化失败: {e}"))?;
   fs::write(&path, raw).map_err(|e| format!("写入文件失败 {:?}: {e}", path))
 }
+
+fn launch_project_path() -> Option<PathBuf> {
+  env::args_os().skip(1).find_map(|arg| {
+    let path = PathBuf::from(arg);
+    if !path.exists() { return None; }
+    if path.is_dir() { Some(path) } else { path.parent().map(|p| p.to_path_buf()) }
+  })
+}
+
+#[tauri::command]
+fn get_launch_context() -> LaunchContext {
+  let project_path = launch_project_path().map(|p| p.to_string_lossy().to_string());
+  LaunchContext { opened_from_context: project_path.is_some(), project_path }
+}
+
+#[cfg(windows)]
+fn register_windows_context_menu() -> Result<(), String> {
+  use winreg::enums::HKEY_CURRENT_USER;
+  use winreg::RegKey;
+
+  let exe = env::current_exe().map_err(|e| format!("获取当前 exe 路径失败: {e}"))?;
+  let exe = exe.to_string_lossy().to_string();
+  let command = format!("\"{}\" \"%1\"", exe);
+  let background_command = format!("\"{}\" \"%V\"", exe);
+  let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+
+  for (key_path, cmd) in [
+    ("Software\\Classes\\Directory\\shell\\OpenWithPiDesktop", command.as_str()),
+    ("Software\\Classes\\Drive\\shell\\OpenWithPiDesktop", command.as_str()),
+    ("Software\\Classes\\Directory\\Background\\shell\\OpenWithPiDesktop", background_command.as_str()),
+  ] {
+    let (key, _) = hkcu.create_subkey(key_path).map_err(|e| format!("创建右键菜单注册表失败 {key_path}: {e}"))?;
+    key.set_value("", &"Open with Pi Desktop").map_err(|e| format!("写入右键菜单名称失败: {e}"))?;
+    key.set_value("Icon", &exe).map_err(|e| format!("写入右键菜单图标失败: {e}"))?;
+    let (command_key, _) = key.create_subkey("command").map_err(|e| format!("创建右键菜单命令失败: {e}"))?;
+    command_key.set_value("", &cmd).map_err(|e| format!("写入右键菜单命令失败: {e}"))?;
+  }
+
+  Ok(())
+}
+
+#[cfg(not(windows))]
+fn register_windows_context_menu() -> Result<(), String> { Ok(()) }
 
 #[cfg(windows)]
 fn windows_path_entries() -> Vec<PathBuf> {
@@ -142,6 +191,30 @@ fn pi_cli_js_from_wrapper(wrapper: &PathBuf) -> Option<PathBuf> {
 
 #[cfg(windows)]
 fn build_pi_command(raw: &str) -> Result<CommandBuilder, String> {
+  let raw = raw.trim();
+  if raw.is_empty() {
+    return Err("Pi 命令为空".to_string());
+  }
+
+  if raw.contains('\n') || raw.contains('\r') || raw.to_ascii_lowercase().starts_with("@echo") || raw.to_ascii_lowercase().starts_with("set ") {
+    let scripts_dir = storage_dir()?.join("launch-scripts");
+    fs::create_dir_all(&scripts_dir).map_err(|e| format!("创建启动脚本目录失败: {e}"))?;
+    let script_path = scripts_dir.join("pi-launch.cmd");
+    let mut script = raw.replace('\r', "");
+    if !script.ends_with('\n') { script.push('\n'); }
+    fs::write(&script_path, script).map_err(|e| format!("写入启动脚本失败: {e}"))?;
+
+    let mut cmd = CommandBuilder::new("cmd.exe");
+    cmd.arg("/D");
+    cmd.arg("/C");
+    cmd.arg(format!("call \"{}\"", script_path.to_string_lossy()));
+    if let Some(path) = windows_augmented_path() {
+      cmd.env("PATH", path);
+    }
+    cmd.env("FORCE_COLOR", "1");
+    return Ok(cmd);
+  }
+
   let parts = split_windows_command_line(raw);
   let (program, args) = parts.split_first().ok_or("Pi 命令为空")?;
 
@@ -260,8 +333,7 @@ async fn send_pi_input(input: String) -> Result<(), String> {
   writer.flush().map_err(|e| format!("刷新 Pi PTY 失败: {e}"))
 }
 
-#[tauri::command]
-async fn stop_pi(app: tauri::AppHandle) -> Result<(), String> {
+async fn stop_pi_runtime() {
   *PI_WRITER.lock().await = None;
   *PI_MASTER.lock().await = None;
   let mut guard = PI_CHILD.lock().await;
@@ -269,6 +341,11 @@ async fn stop_pi(app: tauri::AppHandle) -> Result<(), String> {
     let _ = child.kill();
   }
   *guard = None;
+}
+
+#[tauri::command]
+async fn stop_pi(app: tauri::AppHandle) -> Result<(), String> {
+  stop_pi_runtime().await;
   let _ = app.emit("pi-status", "Pi 已停止");
   Ok(())
 }
@@ -356,6 +433,7 @@ fn main() {
     .plugin(tauri_plugin_dialog::init())
     .plugin(tauri_plugin_clipboard_manager::init())
     .invoke_handler(tauri::generate_handler![
+      get_launch_context,
       start_pi,
       send_pi_input,
       stop_pi,
@@ -370,11 +448,21 @@ fn main() {
       get_storage_paths
     ])
     .setup(|app| {
+      if let Err(e) = register_windows_context_menu() {
+        eprintln!("register context menu failed: {e}");
+      }
       let handle = app.handle().clone();
       tauri::async_runtime::spawn(async move {
         let _ = handle.emit("pi-status", "Pi IDE 已就绪");
       });
       Ok(())
+    })
+    .on_window_event(|_window, event| {
+      if let tauri::WindowEvent::CloseRequested { .. } = event {
+        tauri::async_runtime::block_on(async {
+          stop_pi_runtime().await;
+        });
+      }
     })
     .run(tauri::generate_context!())
     .expect("error while running tauri application");

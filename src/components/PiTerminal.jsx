@@ -4,7 +4,14 @@ import { listen } from "@tauri-apps/api/event";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 
-export default function PiTerminal({ clearSignal, onOutput, terminalInputEnabled = false }) {
+function normalizeForScrollableTerminal(data) {
+  return String(data || "")
+    .replace(/\x1b\[\?(?:1000|1002|1003|1005|1006|1015|1007|2004)[hl]/g, "")
+    .replace(/\x1b\[\?(?:1047|1048|1049)[hl]/g, "")
+    .replace(/\x1b\[3J/g, "");
+}
+
+export default function PiTerminal({ clearSignal, replaySignal = 0, replayContent = "", onOutput, terminalInputEnabled = true }) {
   const hostRef = useRef(null);
   const scrollbarRef = useRef(null);
   const thumbRef = useRef(null);
@@ -86,14 +93,8 @@ export default function PiTerminal({ clearSignal, onOutput, terminalInputEnabled
       });
     };
 
-    const normalizeForScrollableTerminal = (data) => data
-      // 增强输入模式下，禁止 Pi TUI 接管鼠标/alternate screen，优先保证滚动历史可用。
-      .replace(/\x1b\[\?(?:1000|1002|1003|1005|1006|1015|1007|2004)[hl]/g, "")
-      .replace(/\x1b\[\?(?:1047|1048|1049)[hl]/g, "")
-      .replace(/\x1b\[3J/g, "");
-
     const writeTerminal = (data) => {
-      pendingRef.current += terminalInputEnabledRef.current ? data : normalizeForScrollableTerminal(data);
+      pendingRef.current += normalizeForScrollableTerminal(data);
       flush();
     };
 
@@ -210,6 +211,17 @@ export default function PiTerminal({ clearSignal, onOutput, terminalInputEnabled
     writingRef.current = false;
     term.clear();
   }, [clearSignal]);
+
+  useEffect(() => {
+    if (replaySignal === 0) return;
+    const term = terminalRef.current;
+    if (!term) return;
+    pendingRef.current = "";
+    writingRef.current = false;
+    term.reset();
+    const content = normalizeForScrollableTerminal(replayContent);
+    if (content) term.write(content);
+  }, [replaySignal, replayContent]);
 
   return (
     <div className={`xterm-frame ${terminalInputEnabled ? "terminal-native" : "terminal-enhanced"}`}>
