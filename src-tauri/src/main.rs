@@ -1,6 +1,6 @@
 use once_cell::sync::Lazy;
-use serde::{Deserialize, Serialize};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use serde::{Deserialize, Serialize};
 use std::{fs, io::{Read, Write}, path::PathBuf};
 use tauri::Emitter;
 use tokio::sync::Mutex;
@@ -317,6 +317,29 @@ fn append_session_node(parent_id: Option<String>, title: String, command: String
 }
 
 #[tauri::command]
+fn delete_session_node(id: String) -> Result<Vec<SessionNode>, String> {
+  let nodes: Vec<SessionNode> = read_json_array(sessions_path()?)?;
+  let mut delete_ids = std::collections::HashSet::new();
+  delete_ids.insert(id.clone());
+
+  let mut changed = true;
+  while changed {
+    changed = false;
+    for node in &nodes {
+      if let Some(parent_id) = &node.parent_id {
+        if delete_ids.contains(parent_id) && delete_ids.insert(node.id.clone()) {
+          changed = true;
+        }
+      }
+    }
+  }
+
+  let kept: Vec<SessionNode> = nodes.into_iter().filter(|node| !delete_ids.contains(&node.id)).collect();
+  write_json_array(sessions_path()?, &kept)?;
+  Ok(kept)
+}
+
+#[tauri::command]
 fn clear_sessions() -> Result<(), String> { write_json_array::<SessionNode>(sessions_path()?, &vec![]) }
 
 #[tauri::command]
@@ -342,6 +365,7 @@ fn main() {
       clear_history,
       load_sessions,
       append_session_node,
+      delete_session_node,
       clear_sessions,
       get_storage_paths
     ])
