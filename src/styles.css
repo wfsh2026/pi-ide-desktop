@@ -41,6 +41,28 @@ label { font-size: 12px; color: #94a3b8; display: block; margin: 10px 0 5px; }
 .project-context-menu button:hover { background: rgba(148,163,184,.12); }
 .project-empty-session { color: #64748b; font-size: 12px; padding: 5px 8px; }
 .fill-half { min-height: 0; flex: 1; display: flex; flex-direction: column; }
+.tool-panel { min-height: 0; flex: 1; display: flex; flex-direction: column; gap: 12px; overflow: hidden; }
+.tool-panel-title { padding-bottom: 10px; border-bottom: 1px solid rgba(148,163,184,.16); margin-bottom: 0; }
+.tool-button-list { display: grid; grid-template-columns: 1fr; gap: 8px; padding: 10px; border: 1px solid rgba(148,163,184,.18); border-radius: 14px; background: rgba(2,6,23,.22); }
+.tool-button-list button { justify-content: flex-start; }
+.tool-content { min-height: 0; flex: 1; border: 1px solid rgba(96,165,250,.28); border-radius: 14px; background: rgba(2,6,23,.30); overflow: hidden; }
+.directory-tree-card { display: flex; flex-direction: column; }
+.directory-tree-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; padding: 10px; border-bottom: 1px solid rgba(148,163,184,.16); }
+.directory-tree-header strong { display: block; color: #dbeafe; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 210px; }
+.directory-tree-header small { display: block; color: #64748b; font-size: 11px; overflow-wrap: anywhere; margin-top: 3px; }
+.directory-tree-output { margin: 0; padding: 8px; min-height: 0; flex: 1; overflow: auto; color: #cbd5e1; font: 12px/1.55 Consolas, "Courier New", monospace; }
+.directory-tree-row { min-width: max-content; display: flex; align-items: center; gap: 6px; height: 26px; border-radius: 8px; cursor: default; user-select: none; }
+.directory-tree-row.dir { cursor: pointer; color: #dbeafe; }
+.directory-tree-row.file { color: #cbd5e1; cursor: grab; }
+.directory-tree-row.file:active { cursor: grabbing; }
+.directory-tree-row:hover { background: rgba(148,163,184,.12); }
+.directory-tree-row.omitted { color: #64748b; cursor: default; }
+.directory-tree-toggle { width: 14px; flex: 0 0 14px; color: #93c5fd; text-align: center; }
+.directory-tree-name { max-width: 230px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.directory-tree-row em { color: #fbbf24; font-style: normal; font-size: 11px; }
+.directory-tree-note { padding: 8px 10px; border-top: 1px solid rgba(148,163,184,.14); color: #fbbf24; font-size: 12px; }
+.danger-text { color: #fecaca; border-color: rgba(248,113,113,.30); }
+button:disabled { opacity: .55; cursor: not-allowed; }
 .row { display: flex; gap: 8px; align-items: center; }
 .row.buttons { margin-top: 12px; }
 .main { min-width: 0; min-height: 0; height: 100%; display: grid; grid-template-rows: auto minmax(0, 1fr) clamp(150px, 26vh, 220px); }
@@ -59,6 +81,13 @@ label { font-size: 12px; color: #94a3b8; display: block; margin: 10px 0 5px; }
 .terminal-scrollbar-thumb:active { cursor: grabbing; background: #fff; }
 .composer { min-width: 0; min-height: 0; border-top: 1px solid rgba(148,163,184,.18); padding: 12px 14px; display: flex; flex-direction: column; gap: 8px; background: rgba(2,6,23,.35); }
 .composer-toolbar, .composer-actions { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: #94a3b8; font-size: 12px; flex-wrap: wrap; }
+.attachment-bar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; max-height: 58px; overflow: auto; }
+.attachment-bar.inline { flex: 1; min-width: 0; max-height: 34px; flex-wrap: nowrap; }
+.attachment-placeholder { color: #64748b; font-size: 12px; }
+.attachment-chip { display: inline-flex; align-items: center; gap: 6px; max-width: 220px; padding: 5px 7px; border-radius: 999px; border: 1px solid rgba(96,165,250,.38); background: rgba(37,99,235,.16); color: #dbeafe; font-size: 12px; }
+.attachment-chip > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.attachment-remove { padding: 2px; border: 0; border-radius: 999px; background: transparent; color: #bfdbfe; }
+.attachment-remove:hover { background: rgba(96,165,250,.25); }
 .composer textarea { flex: 1; resize: none; min-height: 100px; line-height: 1.45; }
 .listbox { display: flex; flex-direction: column; gap: 8px; min-height: 0; flex: 1; }
 .scroll-list { overflow: auto; min-height: 0; display: flex; flex-direction: column; gap: 6px; padding-right: 3px; }
