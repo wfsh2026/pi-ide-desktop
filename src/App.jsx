@@ -3,16 +3,16 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { writeText as writeClipboardText } from "@tauri-apps/plugin-clipboard-manager";
-import { Play, Square, Send, FolderOpen, Trash2, History, GitBranch, Settings, Copy } from "lucide-react";
+import { Play, Square, Send, FolderOpen, Trash2, History, GitBranch, Copy, Plus, Folder } from "lucide-react";
 import PiTerminal from "./components/PiTerminal.jsx";
 import HistoryPanel from "./components/HistoryPanel.jsx";
 import SessionTree from "./components/SessionTree.jsx";
 
 const DEFAULT_COMMAND = "pi";
-
-function stripAnsi(text) {
-  return text.replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, "");
-}
+const PROJECTS_STORAGE_KEY = "piIdeProjects";
+const ACTIVE_PROJECT_STORAGE_KEY = "piIdeActiveProjectId";
+const ACTIVE_SESSION_STORAGE_KEY = "piIdeActiveProjectSessionId";
+const EXE_SESSION_STORAGE_KEY = "piIdeExeSessionId";
 
 function insertAtCursor(text, insert) {
   const start = text.selectionStart ?? 0;
@@ -24,36 +24,269 @@ function insertAtCursor(text, insert) {
   };
 }
 
+function makeId(prefix) {
+  return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function basename(path) {
+  return String(path || "项目").split(/[\\/]/).filter(Boolean).pop() || "项目";
+}
+
+function loadProjects() {
+  try {
+    const raw = localStorage.getItem(PROJECTS_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function relativeTime(value) {
+  if (!value) return "";
+  const diff = Date.now() - new Date(value).getTime();
+  if (!Number.isFinite(diff)) return "";
+  const min = Math.max(0, Math.floor(diff / 60000));
+  if (min < 1) return "刚刚";
+  if (min < 60) return `${min} 分`;
+  const hours = Math.floor(min / 60);
+  if (hours < 24) return `${hours} 时`;
+  const days = Math.floor(hours / 24);
+  if (days < 7) return `${days} 天`;
+  return `${Math.floor(days / 7)} 周`;
+}
+
+function ProjectPanel({ projects, activeProjectId, activeSessionId, onAddProject, onNewSession, onSelectSession, onToggleProject, onDeleteProject, onDeleteSession, onRenameSession }) {
+  const [menu, setMenu] = useState(null);
+  const [editing, setEditing] = useState(null);
+  const [draftTitle, setDraftTitle] = useState("");
+
+  useEffect(() => {
+    const close = () => setMenu(null);
+    window.addEventListener("click", close);
+    window.addEventListener("keydown", close);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("keydown", close);
+    };
+  }, []);
+
+  function openMenu(event, payload) {
+    event.preventDefault();
+    event.stopPropagation();
+    setMenu({ x: event.clientX, y: event.clientY, ...payload });
+  }
+
+  function startRename(projectId, session) {
+    setMenu(null);
+    setEditing({ projectId, sessionId: session.id, originalTitle: session.title });
+    setDraftTitle(session.title);
+  }
+
+  function cancelRename() {
+    setEditing(null);
+    setDraftTitle("");
+  }
+
+  function confirmRename() {
+    if (!editing) return;
+    const nextTitle = draftTitle.trim();
+    if (!nextTitle) {
+      cancelRename();
+      return;
+    }
+    try {
+      const ok = onRenameSession(editing.projectId, editing.sessionId, nextTitle);
+      if (ok === false) throw new Error("rename failed");
+      cancelRename();
+    } catch {
+      setDraftTitle(editing.originalTitle);
+      cancelRename();
+    }
+  }
+
+  return (
+    <section className="panel projects-panel">
+      <div className="panel-title-row">
+        <h3><FolderOpen size={16}/> 项目</h3>
+        <button className="icon" title="添加项目目录" onClick={onAddProject}><Plus size={15}/></button>
+      </div>
+      <div className="project-list">
+        {projects.length === 0 && <div className="empty">暂无项目。点击 + 选择一个目录。</div>}
+        {projects.map((project) => (
+          <div className="project-group" key={project.id}>
+            <div
+              className={`project-heading ${activeProjectId === project.id ? "active" : ""}`}
+              title={`${project.path}\n左键展开/收起，右键删除项目`}
+              onClick={() => onToggleProject(project.id)}
+              onContextMenu={(event) => openMenu(event, { type: "project", projectId: project.id })}
+            >
+              <Folder size={15}/>
+              <span>{project.collapsed ? "▸" : "▾"} {project.name}</span>
+              <button className="icon project-add-session" title="新建 Pi 会话" onClick={(event) => { event.stopPropagation(); onNewSession(project.id); }}><Plus size={13}/></button>
+            </div>
+            {!project.collapsed && (
+              <div className="project-sessions">
+                {(project.sessions || []).length === 0 && <div className="project-empty-session">暂无 Pi 会话</div>}
+                {(project.sessions || []).map((session) => {
+                  const isEditing = editing?.sessionId === session.id;
+                  return (
+                    <div
+                      key={session.id}
+                      className={`project-session ${activeSessionId === session.id ? "active" : ""}`}
+                      onClick={() => !isEditing && onSelectSession(project.id, session.id)}
+                      onContextMenu={(event) => openMenu(event, { type: "session", projectId: project.id, session })}
+                      title={`${session.title}\n右键重命名/删除`}
+                    >
+                      {isEditing ? (
+                        <input
+                          className="project-session-rename-input"
+                          value={draftTitle}
+                          autoFocus
+                          onClick={(event) => event.stopPropagation()}
+                          onChange={(event) => setDraftTitle(event.target.value)}
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter") {
+                              event.preventDefault();
+                              confirmRename();
+                            } else if (event.key === "Escape") {
+                              event.preventDefault();
+                              cancelRename();
+                            }
+                          }}
+                        />
+                      ) : (
+                        <>
+                          <span>{session.title}</span>
+                          <small>{relativeTime(session.updated_at || session.created_at)}</small>
+                        </>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+      {menu && (
+        <div className="project-context-menu" style={{ left: menu.x, top: menu.y }} onClick={(event) => event.stopPropagation()}>
+          {menu.type === "session" && <button onClick={() => startRename(menu.projectId, menu.session)}>重命名</button>}
+          <button className="danger" onClick={() => {
+            setMenu(null);
+            if (menu.type === "project") onDeleteProject(menu.projectId);
+            else onDeleteSession(menu.projectId, menu.session.id);
+          }}>删除</button>
+        </div>
+      )}
+    </section>
+  );
+}
+
 export default function App() {
   const [status, setStatus] = useState("未启动");
   const [clearTerminalSignal, setClearTerminalSignal] = useState(0);
+  const [terminalReplaySignal, setTerminalReplaySignal] = useState(0);
+  const [terminalReplayContent, setTerminalReplayContent] = useState("");
   const [isProcessing, setIsProcessing] = useState(false);
-  const [terminalInputEnabled, setTerminalInputEnabled] = useState(false);
+  const [terminalInputEnabled, setTerminalInputEnabled] = useState(true);
+  const [piStarted, setPiStarted] = useState(false);
+  const [openedFromContext, setOpenedFromContext] = useState(false);
   const [command, setCommand] = useState("");
   const [historyItems, setHistoryItems] = useState([]);
   const [sessionNodes, setSessionNodes] = useState([]);
   const [activeNodeId, setActiveNodeId] = useState(null);
   const [piCommand, setPiCommand] = useState(localStorage.getItem("piCommand") || DEFAULT_COMMAND);
   const [workdir, setWorkdir] = useState(localStorage.getItem("workdir") || "");
-  const [storagePaths, setStoragePaths] = useState(null);
+  const [projects, setProjects] = useState(() => loadProjects());
+  const [activeProjectId, setActiveProjectId] = useState(null);
+  const [activeProjectSessionId, setActiveProjectSessionId] = useState(null);
+
   const inputRef = useRef(null);
   const historyCursor = useRef(null);
+  const historyDraftRef = useRef("");
   const outputBufferRef = useRef("");
   const processingRef = useRef(false);
   const outputIdleTimerRef = useRef(null);
+  const persistOutputTimerRef = useRef(null);
+  const projectsRef = useRef(projects);
+  const activeProjectIdRef = useRef(activeProjectId);
+  const activeProjectSessionIdRef = useRef(activeProjectSessionId);
+  const launchHandledRef = useRef(false);
+
+  useEffect(() => { projectsRef.current = projects; }, [projects]);
+  useEffect(() => { activeProjectIdRef.current = activeProjectId; }, [activeProjectId]);
+  useEffect(() => { activeProjectSessionIdRef.current = activeProjectSessionId; }, [activeProjectSessionId]);
+
+  const activeNode = useMemo(() => sessionNodes.find((n) => n.id === activeNodeId), [sessionNodes, activeNodeId]);
+  const activeProject = useMemo(() => projects.find((p) => p.id === activeProjectId), [projects, activeProjectId]);
+  const activeProjectSession = useMemo(
+    () => activeProject?.sessions?.find((s) => s.id === activeProjectSessionId),
+    [activeProject, activeProjectSessionId]
+  );
+
+  function saveProjects(nextProjects) {
+    projectsRef.current = nextProjects;
+    setProjects(nextProjects);
+    localStorage.setItem(PROJECTS_STORAGE_KEY, JSON.stringify(nextProjects));
+  }
+
+  function persistCurrentSessionOutput() {
+    const projectId = activeProjectIdRef.current;
+    const sessionId = activeProjectSessionIdRef.current;
+    if (!projectId || !sessionId) return;
+    const nextProjects = projectsRef.current.map((project) => {
+      if (project.id !== projectId) return project;
+      return {
+        ...project,
+        sessions: (project.sessions || []).map((session) => session.id === sessionId
+          ? { ...session, output: outputBufferRef.current, updated_at: new Date().toISOString() }
+          : session)
+      };
+    });
+    saveProjects(nextProjects);
+  }
+
+  function schedulePersistCurrentSessionOutput() {
+    if (persistOutputTimerRef.current) clearTimeout(persistOutputTimerRef.current);
+    persistOutputTimerRef.current = setTimeout(() => persistCurrentSessionOutput(), 600);
+  }
 
   const loadLocalData = useCallback(async () => {
     setHistoryItems(await invoke("load_history"));
     const sessions = await invoke("load_sessions");
     setSessionNodes(sessions);
-    setStoragePaths(await invoke("get_storage_paths"));
     if (!activeNodeId && sessions.length > 0) setActiveNodeId(sessions[sessions.length - 1].id);
   }, [activeNodeId]);
 
   useEffect(() => {
+    setCommand("");
+    historyCursor.current = null;
+    historyDraftRef.current = "";
+    outputBufferRef.current = "";
+    setTerminalReplayContent("");
+    setTerminalReplaySignal((value) => value + 1);
+
+    invoke("get_launch_context").then((context) => {
+      if (launchHandledRef.current) return;
+      launchHandledRef.current = true;
+      if (context?.openedFromContext || context?.opened_from_context) setOpenedFromContext(true);
+      const projectPath = context?.projectPath || context?.project_path;
+      if (projectPath) {
+        const commandText = localStorage.getItem("piCommand") || DEFAULT_COMMAND;
+        createOrSelectProjectForPath(projectPath, { createNewSession: true, sessionTitle: `右键启动：${commandText}`, startCommand: commandText });
+        startPi({ piCommand: commandText, workdir: projectPath }).catch((e) => setStatus(String(e)));
+      }
+    }).catch(() => {});
+
     loadLocalData().catch((e) => setStatus(String(e)));
     const unsubs = [];
-    listen("pi-status", (event) => setStatus(String(event.payload))).then((f) => unsubs.push(f));
+    listen("pi-status", (event) => {
+      const text = String(event.payload);
+      setStatus(text);
+      if (text.includes("Pi 已启动") || text.includes("Pi 已经在运行")) setPiStarted(true);
+      if (text.includes("Pi 已停止")) setPiStarted(false);
+    }).then((f) => unsubs.push(f));
     listen("pi-output", (event) => {
       if (!processingRef.current) return;
       const payload = String(event.payload ?? "");
@@ -70,31 +303,266 @@ export default function App() {
     }).then((f) => unsubs.push(f));
     return () => {
       if (outputIdleTimerRef.current) clearTimeout(outputIdleTimerRef.current);
+      if (persistOutputTimerRef.current) clearTimeout(persistOutputTimerRef.current);
+      persistCurrentSessionOutput();
       unsubs.forEach((f) => f());
     };
   }, []);
 
-  const activeNode = useMemo(() => sessionNodes.find((n) => n.id === activeNodeId), [sessionNodes, activeNodeId]);
+  useEffect(() => {
+    const project = projects.find((p) => p.id === activeProjectId);
+    const session = project?.sessions?.find((s) => s.id === activeProjectSessionId);
+    if (project && session) {
+      setWorkdir(project.path);
+      localStorage.setItem("workdir", project.path);
+      localStorage.setItem(ACTIVE_PROJECT_STORAGE_KEY, project.id);
+      localStorage.setItem(ACTIVE_SESSION_STORAGE_KEY, session.id);
+    } else {
+      localStorage.removeItem(ACTIVE_PROJECT_STORAGE_KEY);
+      localStorage.removeItem(ACTIVE_SESSION_STORAGE_KEY);
+    }
+  }, [projects, activeProjectId, activeProjectSessionId]);
 
-  async function startPi() {
-    localStorage.setItem("piCommand", piCommand);
-    localStorage.setItem("workdir", workdir);
-    await invoke("start_pi", { piCommand, workdir });
+  function createOrSelectProjectForPath(path, { createNewSession = false, sessionTitle = "新 Pi 会话", startCommand = "" } = {}) {
+    persistCurrentSessionOutput();
+    const now = new Date().toISOString();
+    const existing = projectsRef.current.find((p) => p.path === path);
+    let projectId = existing?.id || makeId("project");
+    let sessionId = null;
+    let nextProjects;
+
+    if (existing) {
+      const sessions = existing.sessions || [];
+      if (createNewSession || sessions.length === 0) {
+        sessionId = makeId("pi-session");
+        nextProjects = projectsRef.current.map((project) => project.id === existing.id
+          ? {
+              ...project,
+              updated_at: now,
+              sessions: [...sessions, { id: sessionId, title: sessionTitle, created_at: now, updated_at: now, output: "", start_command: startCommand }]
+            }
+          : project);
+      } else {
+        sessionId = sessions[0].id;
+        nextProjects = projectsRef.current;
+      }
+    } else {
+      sessionId = makeId("pi-session");
+      nextProjects = [
+        ...projectsRef.current,
+        {
+          id: projectId,
+          name: basename(path),
+          path,
+          created_at: now,
+          updated_at: now,
+          sessions: [{ id: sessionId, title: sessionTitle, created_at: now, updated_at: now, output: "", start_command: startCommand }]
+        }
+      ];
+    }
+
+    saveProjects(nextProjects);
+    activeProjectIdRef.current = projectId;
+    activeProjectSessionIdRef.current = sessionId;
+    setActiveProjectId(projectId);
+    setActiveProjectSessionId(sessionId);
+    setWorkdir(path);
+    outputBufferRef.current = "";
+    setTerminalReplayContent("");
+    setTerminalReplaySignal((value) => value + 1);
+    return { projectId, sessionId, path };
+  }
+
+  async function addProject() {
+    const selected = await open({ directory: true, multiple: false, title: "选择项目目录" });
+    if (typeof selected !== "string") return;
+    const existing = projectsRef.current.find((p) => p.path === selected);
+    if (existing && (existing.sessions || []).length > 0) {
+      selectProjectSession(existing.id, existing.sessions[0].id);
+      return;
+    }
+    createOrSelectProjectForPath(selected);
+  }
+
+  function createProjectSession(projectId) {
+    persistCurrentSessionOutput();
+    const now = new Date().toISOString();
+    const sessionId = makeId("pi-session");
+    const nextProjects = projectsRef.current.map((project) => project.id === projectId
+      ? {
+          ...project,
+          collapsed: false,
+          updated_at: now,
+          sessions: [
+            ...(project.sessions || []),
+            { id: sessionId, title: "新 Pi 会话", created_at: now, updated_at: now, output: "" }
+          ]
+        }
+      : project);
+    saveProjects(nextProjects);
+    activeProjectIdRef.current = projectId;
+    activeProjectSessionIdRef.current = sessionId;
+    setActiveProjectId(projectId);
+    setActiveProjectSessionId(sessionId);
+    outputBufferRef.current = "";
+    setTerminalReplayContent("");
+    setTerminalReplaySignal((value) => value + 1);
+  }
+
+  function toggleProject(projectId) {
+    saveProjects(projectsRef.current.map((project) => project.id === projectId ? { ...project, collapsed: !project.collapsed } : project));
+  }
+
+  function deleteProject(projectId) {
+    const project = projectsRef.current.find((p) => p.id === projectId);
+    if (!project) return;
+    if (!window.confirm(`确定删除项目「${project.name}」及其所有会话记录吗？不会删除磁盘文件。`)) return;
+    const nextProjects = projectsRef.current.filter((p) => p.id !== projectId);
+    saveProjects(nextProjects);
+    if (activeProjectIdRef.current === projectId) {
+      const nextProject = nextProjects[0];
+      const nextSession = nextProject?.sessions?.[0];
+      if (nextProject && nextSession) selectProjectSession(nextProject.id, nextSession.id);
+      else {
+        activeProjectIdRef.current = null;
+        activeProjectSessionIdRef.current = null;
+        setActiveProjectId(null);
+        setActiveProjectSessionId(null);
+        outputBufferRef.current = "";
+        setTerminalReplayContent("");
+        setTerminalReplaySignal((value) => value + 1);
+      }
+    }
+  }
+
+  function deleteProjectSession(projectId, sessionId) {
+    const project = projectsRef.current.find((p) => p.id === projectId);
+    const session = project?.sessions?.find((s) => s.id === sessionId);
+    if (!project || !session) return;
+    if (!window.confirm(`确定删除会话「${session.title}」吗？`)) return;
+    const nextProjects = projectsRef.current.map((p) => p.id === projectId ? { ...p, sessions: (p.sessions || []).filter((s) => s.id !== sessionId) } : p);
+    saveProjects(nextProjects);
+    if (activeProjectSessionIdRef.current === sessionId) {
+      const nextProject = nextProjects.find((p) => p.id === projectId);
+      const nextSession = nextProject?.sessions?.[0];
+      if (nextSession) selectProjectSession(projectId, nextSession.id);
+      else {
+        activeProjectSessionIdRef.current = null;
+        setActiveProjectSessionId(null);
+        outputBufferRef.current = "";
+        setTerminalReplayContent("");
+        setTerminalReplaySignal((value) => value + 1);
+      }
+    }
+  }
+
+  function renameProjectSession(projectId, sessionId, nextTitle) {
+    const project = projectsRef.current.find((p) => p.id === projectId);
+    const session = project?.sessions?.find((s) => s.id === sessionId);
+    const title = String(nextTitle || "").trim();
+    if (!session || !title) return false;
+    try {
+      saveProjects(projectsRef.current.map((p) => p.id === projectId
+        ? { ...p, sessions: (p.sessions || []).map((s) => s.id === sessionId ? { ...s, title, user_renamed: true, updated_at: new Date().toISOString() } : s) }
+        : p));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function selectProjectSession(projectId, sessionId) {
+    persistCurrentSessionOutput();
+    const project = projectsRef.current.find((p) => p.id === projectId);
+    const session = project?.sessions?.find((s) => s.id === sessionId);
+    if (!project || !session) return;
+    activeProjectIdRef.current = projectId;
+    activeProjectSessionIdRef.current = sessionId;
+    setActiveProjectId(projectId);
+    setActiveProjectSessionId(sessionId);
+    setWorkdir(project.path);
+    outputBufferRef.current = session.output || "";
+    setTerminalReplayContent(session.output || "");
+    setTerminalReplaySignal((value) => value + 1);
+  }
+
+  function updateActiveProjectSessionAfterCommand(commandText) {
+    const projectId = activeProjectIdRef.current;
+    const sessionId = activeProjectSessionIdRef.current;
+    if (!projectId || !sessionId) return;
+    const now = new Date().toISOString();
+    const title = commandText.length > 28 ? `${commandText.slice(0, 28)}…` : commandText;
+    const nextProjects = projectsRef.current.map((project) => {
+      if (project.id !== projectId) return project;
+      return {
+        ...project,
+        updated_at: now,
+        sessions: (project.sessions || []).map((session) => session.id === sessionId
+          ? {
+              ...session,
+              title: !session.user_renamed && !session.first_prompt ? title : session.title,
+              first_prompt: session.first_prompt || commandText,
+              updated_at: now,
+              output: outputBufferRef.current
+            }
+          : session)
+      };
+    });
+    saveProjects(nextProjects);
+  }
+
+  function recordSessionStart(commandText, runWorkdir) {
+    const projectId = activeProjectIdRef.current;
+    const sessionId = activeProjectSessionIdRef.current;
+    if (!projectId || !sessionId) return;
+    const now = new Date().toISOString();
+    const nextProjects = projectsRef.current.map((project) => project.id === projectId
+      ? {
+          ...project,
+          updated_at: now,
+          sessions: (project.sessions || []).map((session) => session.id === sessionId
+            ? { ...session, start_command: commandText, workdir: runWorkdir, updated_at: now }
+            : session)
+        }
+      : project);
+    saveProjects(nextProjects);
+  }
+
+  async function startPi(options = {}) {
+    const commandText = options.piCommand || piCommand || DEFAULT_COMMAND;
+    let runWorkdir = options.workdir || activeProject?.path || workdir;
+    if (!runWorkdir) {
+      const selected = await open({ directory: true, multiple: false, title: "选择项目目录" });
+      if (typeof selected !== "string") return;
+      runWorkdir = selected;
+      createOrSelectProjectForPath(selected, { createNewSession: true, sessionTitle: `启动：${commandText}`, startCommand: commandText });
+    } else if (!activeProjectIdRef.current || !activeProjectSessionIdRef.current) {
+      createOrSelectProjectForPath(runWorkdir, { createNewSession: true, sessionTitle: `启动：${commandText}`, startCommand: commandText });
+    }
+    localStorage.setItem("piCommand", commandText);
+    if (runWorkdir) localStorage.setItem("workdir", runWorkdir);
+    recordSessionStart(commandText, runWorkdir);
+    await invoke("start_pi", { piCommand: commandText, workdir: runWorkdir });
+    setPiStarted(true);
   }
 
   async function stopPi() {
     await invoke("stop_pi");
+    setPiStarted(false);
     if (outputIdleTimerRef.current) clearTimeout(outputIdleTimerRef.current);
     processingRef.current = false;
     setIsProcessing(false);
+    persistCurrentSessionOutput();
   }
 
   function rememberOutput(data) {
     outputBufferRef.current += data;
+    schedulePersistCurrentSessionOutput();
   }
 
   function clearTerminal() {
     outputBufferRef.current = "";
+    persistCurrentSessionOutput();
     setClearTerminalSignal((value) => value + 1);
   }
 
@@ -130,20 +598,13 @@ export default function App() {
     const newHistory = await invoke("append_history", { command: trimmed });
     setHistoryItems(newHistory);
     const title = trimmed.length > 48 ? `${trimmed.slice(0, 48)}…` : trimmed;
-    const newSessions = await invoke("append_session_node", {
-      parentId: activeNodeId,
-      title,
-      command: trimmed
-    });
+    const newSessions = await invoke("append_session_node", { parentId: activeNodeId, title, command: trimmed });
     setSessionNodes(newSessions);
     setActiveNodeId(newSessions[newSessions.length - 1]?.id ?? null);
+    updateActiveProjectSessionAfterCommand(trimmed);
     setCommand("");
     historyCursor.current = null;
-  }
-
-  async function chooseWorkdir() {
-    const selected = await open({ directory: true, multiple: false, title: "选择 Pi 工作目录" });
-    if (typeof selected === "string") setWorkdir(selected);
+    historyDraftRef.current = "";
   }
 
   async function chooseFiles() {
@@ -172,10 +633,60 @@ export default function App() {
   }
 
   function handleComposerAction() {
-    if (isProcessing) {
-      stopCurrentRun().catch((err) => setStatus(String(err)));
+    if (isProcessing) stopCurrentRun().catch((err) => setStatus(String(err)));
+    else sendCommand().catch((err) => setStatus(String(err)));
+  }
+
+  function setComposerValueFromHistory(value) {
+    setCommand(value);
+    requestAnimationFrame(() => {
+      const el = inputRef.current;
+      if (!el) return;
+      el.focus();
+      const end = value.length;
+      el.setSelectionRange(end, end);
+    });
+  }
+
+  function isCursorOnFirstLine(el) {
+    const pos = el.selectionStart ?? 0;
+    return !el.value.slice(0, pos).includes("\n");
+  }
+
+  function isCursorOnLastLine(el) {
+    const pos = el.selectionEnd ?? 0;
+    return !el.value.slice(pos).includes("\n");
+  }
+
+  function browseHistory(direction) {
+    if (historyItems.length === 0) return false;
+    if (direction < 0) {
+      if (historyCursor.current === null) {
+        historyDraftRef.current = command;
+        historyCursor.current = historyItems.length - 1;
+      } else {
+        historyCursor.current = Math.max(0, historyCursor.current - 1);
+      }
+      setComposerValueFromHistory(historyItems[historyCursor.current].command);
+      return true;
+    }
+    if (historyCursor.current === null) return false;
+    if (historyCursor.current < historyItems.length - 1) {
+      historyCursor.current += 1;
+      setComposerValueFromHistory(historyItems[historyCursor.current].command);
     } else {
-      sendCommand().catch((err) => setStatus(String(err)));
+      historyCursor.current = null;
+      setComposerValueFromHistory(historyDraftRef.current);
+      historyDraftRef.current = "";
+    }
+    return true;
+  }
+
+  function handleCommandChange(e) {
+    setCommand(e.target.value);
+    if (historyCursor.current !== null) {
+      historyCursor.current = null;
+      historyDraftRef.current = "";
     }
   }
 
@@ -183,19 +694,13 @@ export default function App() {
     if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
       e.preventDefault();
       handleComposerAction();
+      return;
     }
-    if (e.key === "ArrowUp" && command.trim() === "" && historyItems.length > 0) {
-      e.preventDefault();
-      historyCursor.current = historyItems.length - 1;
-      setCommand(historyItems[historyCursor.current].command);
-    } else if (e.key === "ArrowUp" && historyCursor.current !== null) {
-      e.preventDefault();
-      historyCursor.current = Math.max(0, historyCursor.current - 1);
-      setCommand(historyItems[historyCursor.current].command);
-    } else if (e.key === "ArrowDown" && historyCursor.current !== null) {
-      e.preventDefault();
-      historyCursor.current = Math.min(historyItems.length - 1, historyCursor.current + 1);
-      setCommand(historyItems[historyCursor.current].command);
+    const el = e.currentTarget;
+    if (e.key === "ArrowUp" && (historyCursor.current !== null || isCursorOnFirstLine(el))) {
+      if (browseHistory(-1)) e.preventDefault();
+    } else if (e.key === "ArrowDown" && (historyCursor.current !== null || isCursorOnLastLine(el))) {
+      if (browseHistory(1)) e.preventDefault();
     }
   }
 
@@ -203,9 +708,7 @@ export default function App() {
     if (!window.confirm("确定删除该会话及其所有子会话吗？")) return;
     const nextNodes = await invoke("delete_session_node", { id });
     setSessionNodes(nextNodes);
-    if (!nextNodes.some((node) => node.id === activeNodeId)) {
-      setActiveNodeId(nextNodes[nextNodes.length - 1]?.id ?? null);
-    }
+    if (!nextNodes.some((node) => node.id === activeNodeId)) setActiveNodeId(nextNodes[nextNodes.length - 1]?.id ?? null);
   }
 
   async function clearAll() {
@@ -219,30 +722,31 @@ export default function App() {
     <div className="app" onDragOver={(e) => e.preventDefault()} onDrop={handleDrop}>
       <aside className="sidebar left">
         <div className="brand">Pi IDE</div>
-        <section className="panel">
-          <h3><Settings size={16}/> 运行设置</h3>
-          <label>Pi 命令</label>
-          <input value={piCommand} onChange={(e) => setPiCommand(e.target.value)} placeholder="pi 或完整路径" />
-          <label>工作目录</label>
-          <div className="row">
-            <input value={workdir} onChange={(e) => setWorkdir(e.target.value)} placeholder="可留空" />
-            <button title="选择目录" onClick={chooseWorkdir}><FolderOpen size={16}/></button>
-          </div>
-          <div className="row buttons">
-            <button className="primary" onClick={() => startPi().catch((e) => setStatus(String(e)))}><Play size={16}/> 启动</button>
-            <button onClick={() => stopPi().catch((e) => setStatus(String(e)))}><Square size={16}/> 停止</button>
-          </div>
-        </section>
-        <section className="panel small">
-          <h3>本地存储</h3>
-          <p>{storagePaths?.dir || "~/.pi-ide"}</p>
-          <button onClick={() => writeClipboardText(storagePaths?.dir || "").catch((e) => setStatus(`复制失败：${e}`))}><Copy size={14}/> 复制路径</button>
-        </section>
+        <ProjectPanel
+          projects={projects}
+          activeProjectId={activeProjectId}
+          activeSessionId={activeProjectSessionId}
+          onAddProject={() => addProject().catch((e) => setStatus(String(e)))}
+          onNewSession={createProjectSession}
+          onSelectSession={selectProjectSession}
+          onToggleProject={toggleProject}
+          onDeleteProject={deleteProject}
+          onDeleteSession={deleteProjectSession}
+          onRenameSession={renameProjectSession}
+        />
       </aside>
 
       <main className="main">
         <header className="topbar">
           <span className="status">{status}</span>
+          {!openedFromContext && !piStarted && (
+            <textarea className="pi-start-input" value={piCommand} onChange={(e) => setPiCommand(e.target.value)} placeholder={'Pi 启动命令，例如：\npi --thinking high\n\n或：\n@echo off\nset DEEPSEEK_API_KEY=sk-XXXXXXXXXXXX\npi -nc %*'} />
+          )}
+          {!openedFromContext && (
+            <button className={piStarted ? "" : "primary"} onClick={() => (piStarted ? stopPi() : startPi()).catch((e) => setStatus(String(e)))}>
+              {piStarted ? <Square size={15}/> : <Play size={15}/>} {piStarted ? "停止 Pi" : "启动 Pi"}
+            </button>
+          )}
           <button onClick={clearTerminal}>清空输出</button>
           <button onClick={() => copyOutput().catch((e) => setStatus(`复制失败：${e}`))}><Copy size={15}/> 复制输出</button>
           <button className={terminalInputEnabled ? "primary" : ""} onClick={() => setTerminalInputEnabled((value) => !value)}>
@@ -252,7 +756,13 @@ export default function App() {
           <button className="danger" onClick={() => clearAll().catch((e) => setStatus(String(e)))}><Trash2 size={15}/> 清空历史/会话</button>
         </header>
         <div className="terminal-wrap">
-          <PiTerminal clearSignal={clearTerminalSignal} onOutput={rememberOutput} terminalInputEnabled={terminalInputEnabled} />
+          <PiTerminal
+            clearSignal={clearTerminalSignal}
+            replaySignal={terminalReplaySignal}
+            replayContent={terminalReplayContent}
+            onOutput={rememberOutput}
+            terminalInputEnabled={terminalInputEnabled}
+          />
         </div>
         <div className="composer">
           <div className="composer-toolbar">
@@ -262,12 +772,12 @@ export default function App() {
           <textarea
             ref={inputRef}
             value={command}
-            onChange={(e) => setCommand(e.target.value)}
+            onChange={handleCommandChange}
             onKeyDown={handleKeyDown}
             placeholder={'输入 Pi 指令或自然语言任务。例如：帮我分析这个文件 "/path/to/file"'}
           />
           <div className="composer-actions">
-            <span>当前父节点：{activeNode?.title || "根节点"}</span>
+            <span>当前项目：{activeProject?.name || "未选择"} / 会话：{activeProjectSession?.title || "未选择"}</span>
             <button className={isProcessing ? "danger" : "primary"} onClick={handleComposerAction}>{isProcessing ? <Square size={16}/> : <Send size={16}/>} {isProcessing ? "停止" : "发送"}</button>
           </div>
         </div>

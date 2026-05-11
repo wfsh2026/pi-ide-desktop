@@ -20,3 +20,6 @@ chrono = { version = "0.4", features = ["serde"] }
 shell-words = "1.1"
 portable-pty = "0.8"
 tauri-plugin-clipboard-manager = "2.3.0"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
