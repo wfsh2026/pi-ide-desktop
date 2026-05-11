@@ -27,6 +27,8 @@ function insertAtCursor(text, insert) {
 export default function App() {
   const [status, setStatus] = useState("未启动");
   const [clearTerminalSignal, setClearTerminalSignal] = useState(0);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [terminalInputEnabled, setTerminalInputEnabled] = useState(false);
   const [command, setCommand] = useState("");
   const [historyItems, setHistoryItems] = useState([]);
   const [sessionNodes, setSessionNodes] = useState([]);
@@ -37,6 +39,8 @@ export default function App() {
   const inputRef = useRef(null);
   const historyCursor = useRef(null);
   const outputBufferRef = useRef("");
+  const processingRef = useRef(false);
+  const outputIdleTimerRef = useRef(null);
 
   const loadLocalData = useCallback(async () => {
     setHistoryItems(await invoke("load_history"));
@@ -50,7 +54,24 @@ export default function App() {
     loadLocalData().catch((e) => setStatus(String(e)));
     const unsubs = [];
     listen("pi-status", (event) => setStatus(String(event.payload))).then((f) => unsubs.push(f));
-    return () => unsubs.forEach((f) => f());
+    listen("pi-output", (event) => {
+      if (!processingRef.current) return;
+      const payload = String(event.payload ?? "");
+      if (outputIdleTimerRef.current) clearTimeout(outputIdleTimerRef.current);
+      if (payload.includes("[PTY 读取错误]") || payload.includes("Pi 已停止")) {
+        processingRef.current = false;
+        setIsProcessing(false);
+        return;
+      }
+      outputIdleTimerRef.current = setTimeout(() => {
+        processingRef.current = false;
+        setIsProcessing(false);
+      }, 2000);
+    }).then((f) => unsubs.push(f));
+    return () => {
+      if (outputIdleTimerRef.current) clearTimeout(outputIdleTimerRef.current);
+      unsubs.forEach((f) => f());
+    };
   }, []);
 
   const activeNode = useMemo(() => sessionNodes.find((n) => n.id === activeNodeId), [sessionNodes, activeNodeId]);
@@ -63,13 +84,13 @@ export default function App() {
 
   async function stopPi() {
     await invoke("stop_pi");
+    if (outputIdleTimerRef.current) clearTimeout(outputIdleTimerRef.current);
+    processingRef.current = false;
+    setIsProcessing(false);
   }
 
   function rememberOutput(data) {
     outputBufferRef.current += data;
-    if (outputBufferRef.current.length > 2_000_000) {
-      outputBufferRef.current = outputBufferRef.current.slice(-1_500_000);
-    }
   }
 
   function clearTerminal() {
@@ -83,14 +104,29 @@ export default function App() {
       setStatus("当前没有可复制的输出");
       return;
     }
-    await writeClipboardText(stripAnsi(output));
+    await writeClipboardText(output);
     setStatus("终端输出已复制到剪贴板");
+  }
+
+  async function stopCurrentRun() {
+    await invoke("send_pi_input", { input: "\x03" });
+    if (outputIdleTimerRef.current) clearTimeout(outputIdleTimerRef.current);
+    processingRef.current = false;
+    setIsProcessing(false);
   }
 
   async function sendCommand(raw = command) {
     const trimmed = raw.trim();
     if (!trimmed) return;
-    await invoke("send_pi_input", { input: `${trimmed}\r` });
+    processingRef.current = true;
+    setIsProcessing(true);
+    try {
+      await invoke("send_pi_input", { input: `${trimmed}\r` });
+    } catch (error) {
+      processingRef.current = false;
+      setIsProcessing(false);
+      throw error;
+    }
     const newHistory = await invoke("append_history", { command: trimmed });
     setHistoryItems(newHistory);
     const title = trimmed.length > 48 ? `${trimmed.slice(0, 48)}…` : trimmed;
@@ -135,10 +171,18 @@ export default function App() {
     if (paths.length) insertText(paths.map((p) => `"${p}"`).join(" "));
   }
 
+  function handleComposerAction() {
+    if (isProcessing) {
+      stopCurrentRun().catch((err) => setStatus(String(err)));
+    } else {
+      sendCommand().catch((err) => setStatus(String(err)));
+    }
+  }
+
   function handleKeyDown(e) {
     if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
       e.preventDefault();
-      sendCommand().catch((err) => setStatus(String(err)));
+      handleComposerAction();
     }
     if (e.key === "ArrowUp" && command.trim() === "" && historyItems.length > 0) {
       e.preventDefault();
@@ -152,6 +196,15 @@ export default function App() {
       e.preventDefault();
       historyCursor.current = Math.min(historyItems.length - 1, historyCursor.current + 1);
       setCommand(historyItems[historyCursor.current].command);
+    }
+  }
+
+  async function deleteSessionNode(id) {
+    if (!window.confirm("确定删除该会话及其所有子会话吗？")) return;
+    const nextNodes = await invoke("delete_session_node", { id });
+    setSessionNodes(nextNodes);
+    if (!nextNodes.some((node) => node.id === activeNodeId)) {
+      setActiveNodeId(nextNodes[nextNodes.length - 1]?.id ?? null);
     }
   }
 
@@ -192,15 +245,18 @@ export default function App() {
           <span className="status">{status}</span>
           <button onClick={clearTerminal}>清空输出</button>
           <button onClick={() => copyOutput().catch((e) => setStatus(`复制失败：${e}`))}><Copy size={15}/> 复制输出</button>
+          <button className={terminalInputEnabled ? "primary" : ""} onClick={() => setTerminalInputEnabled((value) => !value)}>
+            {terminalInputEnabled ? "原生终端：开" : "原生终端：关"}
+          </button>
           <button onClick={() => sendCommand('/tree').catch((e) => setStatus(String(e)))}><GitBranch size={15}/> 发送 /tree</button>
           <button className="danger" onClick={() => clearAll().catch((e) => setStatus(String(e)))}><Trash2 size={15}/> 清空历史/会话</button>
         </header>
         <div className="terminal-wrap">
-          <PiTerminal clearSignal={clearTerminalSignal} onOutput={rememberOutput} />
+          <PiTerminal clearSignal={clearTerminalSignal} onOutput={rememberOutput} terminalInputEnabled={terminalInputEnabled} />
         </div>
         <div className="composer">
           <div className="composer-toolbar">
-            <span>增强输入框：支持多行、鼠标定位、Ctrl/⌘ + Enter 执行、拖拽文件插入路径</span>
+            <span>{terminalInputEnabled ? "原生终端模式：可直接点击上方终端输入，快捷键交给 Pi；下方仍可批量发送。" : "增强输入模式：支持多行、鼠标定位、Ctrl/⌘ + Enter 执行、拖拽文件插入路径"}</span>
             <button onClick={chooseFiles}><FolderOpen size={15}/> 插入文件</button>
           </div>
           <textarea
@@ -212,7 +268,7 @@ export default function App() {
           />
           <div className="composer-actions">
             <span>当前父节点：{activeNode?.title || "根节点"}</span>
-            <button className="primary" onClick={() => sendCommand().catch((e) => setStatus(String(e)))}><Send size={16}/> 发送</button>
+            <button className={isProcessing ? "danger" : "primary"} onClick={handleComposerAction}>{isProcessing ? <Square size={16}/> : <Send size={16}/>} {isProcessing ? "停止" : "发送"}</button>
           </div>
         </div>
       </main>
@@ -224,7 +280,7 @@ export default function App() {
         </section>
         <section className="panel fill-half">
           <h3><GitBranch size={16}/> 本地会话树</h3>
-          <SessionTree nodes={sessionNodes} activeId={activeNodeId} onSelect={setActiveNodeId} />
+          <SessionTree nodes={sessionNodes} activeId={activeNodeId} onSelect={setActiveNodeId} onDelete={(id) => deleteSessionNode(id).catch((e) => setStatus(String(e)))} />
         </section>
       </aside>
     </div>
