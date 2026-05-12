@@ -25,6 +25,7 @@ export default function PiTerminal({ activeSessionId, clearSignal, replaySignal 
   const pendingRef = useRef("");
   const writingRef = useRef(false);
   const resizeFrameRef = useRef(null);
+  const replayTimeoutRef = useRef(null);
   const isReplayingRef = useRef(false);
   const activeSessionIdRef = useRef(activeSessionId);
   const terminalInputEnabledRef = useRef(terminalInputEnabled);
@@ -213,6 +214,7 @@ export default function PiTerminal({ activeSessionId, clearSignal, replaySignal 
 
     return () => {
       if (resizeFrameRef.current) cancelAnimationFrame(resizeFrameRef.current);
+      if (replayTimeoutRef.current) clearTimeout(replayTimeoutRef.current);
       resizeObserver.disconnect();
       host.removeEventListener("wheel", onWheel, { capture: true });
       host.removeEventListener("pointerdown", onHostPointerDown);
@@ -246,15 +248,21 @@ export default function PiTerminal({ activeSessionId, clearSignal, replaySignal 
     debugLog("terminal replay", { activeSessionId: activeSessionIdRef.current, replaySignal, bytes: String(replayContent || "").length });
     isReplayingRef.current = true;
     term.options.disableStdin = true;
-    const finishReplay = () => {
+    let finished = false;
+    const finishReplay = (reason = "callback") => {
+      if (finished) return;
+      finished = true;
+      if (replayTimeoutRef.current) clearTimeout(replayTimeoutRef.current);
+      replayTimeoutRef.current = null;
       isReplayingRef.current = false;
       term.options.disableStdin = !terminalInputEnabledRef.current;
-      debugLog("terminal replay end", { activeSessionId: activeSessionIdRef.current, replaySignal });
+      debugLog("terminal replay end", { activeSessionId: activeSessionIdRef.current, replaySignal, reason });
     };
+    replayTimeoutRef.current = setTimeout(() => finishReplay("timeout"), 5000);
     term.reset();
     const content = normalizeForScrollableTerminal(replayContent);
-    if (content) term.write(content, finishReplay);
-    else finishReplay();
+    if (content) term.write(content, () => finishReplay("callback"));
+    else finishReplay("empty");
   }, [replaySignal, replayContent]);
 
   return (

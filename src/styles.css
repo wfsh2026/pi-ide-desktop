@@ -172,6 +172,12 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 .codex-status-line { width: fit-content; display: inline-flex; align-items: center; gap: 5px; padding: 0; border: 0; background: transparent; color: #8e8e8e; font-size: 13px; line-height: 1.4; }
 .codex-status-line.interactive { cursor: pointer; }
 .codex-status-line.interactive:hover { color: #cfcfcf; background: transparent; }
+.codex-operation-list { display: flex; flex-direction: column; gap: 7px; color: #9a9a9a; font-size: 13px; }
+.codex-operation-row { width: fit-content; max-width: 100%; display: inline-flex; align-items: center; gap: 7px; min-height: 20px; }
+.codex-operation-row.running { color: #b8b8b8; }
+.codex-operation-row.failed { color: var(--danger); }
+.codex-operation-row span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.codex-operation-row small { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #777; }
 .codex-thinking { color: #8e8e8e; font-size: 13px; line-height: 1.5; }
 .codex-markdown { color: #f1f1f1; font-size: 14px; line-height: 1.65; overflow-wrap: anywhere; }
 .codex-markdown h4 { margin: 18px 0 7px; color: #f6f6f6; font-size: 15px; font-weight: 750; }

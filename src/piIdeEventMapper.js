@@ -38,16 +38,28 @@ function exitCode(event) {
     ?? (event?.isError ? 1 : 0);
 }
 
-function updateProgress(items, patch, now, makeId) {
+function progressKey(event, fallback) {
+  const eventType = event.eventType || event.type || fallback;
+  if (event.toolCallId) return `progress-${eventType}-${event.toolCallId}`;
+  return `progress-${eventType || fallback}`;
+}
+
+function toolProgressKey(event) {
+  return event.toolCallId ? `progress-tool-${event.toolCallId}` : `progress-tool-${commandText(event)}`;
+}
+
+function upsertProgress(items, key, patch, now, makeId) {
+  const id = key || makeId("progress");
   let updated = false;
   const next = items.map((item) => {
-    if (item.type !== "progress") return item;
+    if (item.type !== "progress" || item.key !== id) return item;
     updated = true;
     return { ...item, ...patch, updated_at: now };
   });
   if (updated) return next;
   return [...next, {
     id: makeId("item"),
+    key: id,
     type: "progress",
     title: patch.title || "处理中",
     detail: patch.detail || "",
@@ -149,24 +161,44 @@ function completeItems(items, status, now) {
   });
 }
 
+function toolTitle(event, done = false) {
+  const toolName = event.toolName || "工具";
+  const command = commandText(event);
+  if (toolName === "bash") return done ? `已运行 ${command}` : `正在运行 ${command}`;
+  if (toolName === "read") return done ? "已读取文件" : "正在读取文件";
+  if (toolName === "write") return done ? "已写入文件" : "正在写入文件";
+  if (toolName === "edit") return done ? "已编辑文件" : "正在编辑文件";
+  return done ? `已调用 ${toolName}` : `正在调用 ${toolName}`;
+}
+
+function commandEventFromItems(items, event) {
+  if (event.args?.command || event.args?.cmd || !event.toolCallId) return event;
+  const command = items.find((item) => item.type === "command" && item.id === `command-${event.toolCallId}`)?.command;
+  return command ? { ...event, args: { ...(event.args || {}), command } } : event;
+}
+
 function applyEventToItems(items, event, now, makeId) {
   const eventType = event.eventType || event.type;
   const failedEvent = eventType === "extension_error" || (eventType === "auto_retry_end" && event.success === false);
 
-  if (eventType === "agent_start" || eventType === "turn_start") {
-    return updateProgress(items, { title: "正在思考", detail: "", status: "running" }, now, makeId);
+  if (eventType === "agent_start") {
+    return upsertProgress(items, progressKey(event), { title: "AI 开始处理", detail: "", status: "running" }, now, makeId);
+  }
+
+  if (eventType === "turn_start") {
+    return upsertProgress(items, progressKey(event), { title: "开始一轮推理", detail: "", status: "running" }, now, makeId);
   }
 
   if (eventType === "message_update") {
     if (event.deltaType === "text_delta") {
-      return updateProgress(appendAssistantText(items, event.delta || "", now, makeId), {
+      return upsertProgress(appendAssistantText(items, event.delta || "", now, makeId), "progress-output", {
         title: "正在输出结果",
         detail: "",
         status: "running"
       }, now, makeId);
     }
     if (event.deltaType === "thinking_delta") {
-      return updateProgress(appendThinkingText(items, event.delta || "", now, makeId), {
+      return upsertProgress(appendThinkingText(items, event.delta || "", now, makeId), "progress-thinking", {
         title: "正在思考",
         detail: "",
         status: "running"
@@ -186,13 +218,13 @@ function applyEventToItems(items, event, now, makeId) {
 
   if (eventType === "tool_execution_start") {
     const command = commandText(event);
-    return updateProgress(upsertCommand(items, event, {
+    return upsertProgress(upsertCommand(items, event, {
       command,
       cwd: event.cwd || "",
       status: "running"
-    }, now, makeId), {
-      title: event.toolName === "bash" ? `正在运行 ${command}` : `正在调用 ${event.toolName || "工具"}`,
-      detail: "",
+    }, now, makeId), toolProgressKey(event), {
+      title: toolTitle(event, false),
+      detail: event.toolName === "bash" ? "" : command,
       status: "running"
     }, now, makeId);
   }
@@ -205,19 +237,24 @@ function applyEventToItems(items, event, now, makeId) {
   }
 
   if (eventType === "tool_execution_end") {
-    return updateProgress(upsertCommand(items, event, {
+    const commandEvent = commandEventFromItems(items, event);
+    return upsertProgress(upsertCommand(items, commandEvent, {
       output: resultText(event.result),
       exit_code: exitCode(event),
       status: event.isError ? "failed" : "completed"
-    }, now, makeId), {
-      title: event.isError ? "命令执行失败" : "命令执行完成",
+    }, now, makeId), toolProgressKey(commandEvent), {
+      title: event.isError ? `${toolTitle(commandEvent, true)}失败` : toolTitle(commandEvent, true),
       detail: "",
-      status: event.isError ? "failed" : "running"
+      status: event.isError ? "failed" : "completed"
     }, now, makeId);
   }
 
   if (eventType === "agent_end") {
-    return completeItems(items, "completed", now);
+    return upsertProgress(completeItems(items, "completed", now), progressKey(event), {
+      title: "AI 已完成本轮任务",
+      detail: "",
+      status: "completed"
+    }, now, makeId);
   }
 
   if (failedEvent) {
