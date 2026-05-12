@@ -1,5 +1,7 @@
 # Pi IDE Desktop
 
+<img width="1280" height="820" alt="image" src="https://github.com/user-attachments/assets/8a907852-a726-4537-aeb4-5c9cb49b3117" />
+
 这是一个给 https://pi.dev/ 的 Pi AI 开发工具准备的轻量桌面 IDE 容器。
 
 它不是替代 Pi CLI，而是把 Pi CLI 包进一个更方便的桌面界面里：
