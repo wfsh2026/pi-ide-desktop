@@ -252,8 +252,8 @@ function ProjectPanel({ projects, activeProjectId, activeSessionId, onAddProject
           {menu.type === "session" && <button onClick={() => startRename(menu.projectId, menu.session)}>重命名</button>}
           <button className="danger" onClick={() => {
             setMenu(null);
-            if (menu.type === "project") onDeleteProject(menu.projectId);
-            else onDeleteSession(menu.projectId, menu.session.id);
+            if (menu.type === "project") Promise.resolve(onDeleteProject(menu.projectId)).catch(() => {});
+            else Promise.resolve(onDeleteSession(menu.projectId, menu.session.id)).catch(() => {});
           }}>删除</button>
         </div>
       )}
@@ -609,6 +609,28 @@ export default function App() {
     localStorage.setItem(PROJECTS_STORAGE_KEY, JSON.stringify(nextProjects));
   }
 
+  function updateSessionById(sessionId, updater, { persist = true } = {}) {
+    if (!sessionId) return null;
+    let updatedSession = null;
+    let changed = false;
+    const nextProjects = projectsRef.current.map((project) => ({
+      ...project,
+      sessions: (project.sessions || []).map((session) => {
+        if (session.id !== sessionId) return session;
+        const nextSession = updater(session);
+        updatedSession = nextSession;
+        changed = nextSession !== session;
+        return nextSession;
+      })
+    }));
+    if (changed) {
+      projectsRef.current = nextProjects;
+      setProjects(nextProjects);
+      if (persist) localStorage.setItem(PROJECTS_STORAGE_KEY, JSON.stringify(nextProjects));
+    }
+    return updatedSession;
+  }
+
   function persistCurrentSessionOutput() {
     const projectId = activeProjectIdRef.current;
     const sessionId = activeProjectSessionIdRef.current;
@@ -662,12 +684,13 @@ export default function App() {
 
   function applyPiIdeFileEvents(events) {
     if (!Array.isArray(events) || events.length === 0) return;
-    const referenced = [];
-    const output = [];
+    const bySession = new Map();
 
     for (const event of events) {
       if (!event?.path || !event?.kind) continue;
-      const key = event.id || `${event.kind}:${event.source}:${event.toolCallId}:${event.path}:${event.timestamp}`;
+      const targetSessionId = event.ideSessionId || event.ide_session_id || activeProjectSessionIdRef.current;
+      if (!targetSessionId) continue;
+      const key = event.id || `${targetSessionId}:${event.kind}:${event.source}:${event.toolCallId}:${event.path}:${event.timestamp}`;
       if (fileEventSeenRef.current.has(key)) continue;
       fileEventSeenRef.current.add(key);
 
@@ -682,12 +705,16 @@ export default function App() {
         created_at: event.timestamp || new Date().toISOString()
       };
 
-      if (event.kind === "reference") referenced.push(record);
-      else if (event.kind === "output") output.push(record);
+      if (!bySession.has(targetSessionId)) bySession.set(targetSessionId, { referenced: [], output: [] });
+      const bucket = bySession.get(targetSessionId);
+      if (event.kind === "reference") bucket.referenced.push(record);
+      else if (event.kind === "output") bucket.output.push(record);
     }
 
-    if (referenced.length) addSessionFiles("referenced", referenced);
-    if (output.length) addSessionFiles("output", output);
+    for (const [sessionId, bucket] of bySession.entries()) {
+      if (bucket.referenced.length) addSessionFiles("referenced", bucket.referenced, sessionId);
+      if (bucket.output.length) addSessionFiles("output", bucket.output, sessionId);
+    }
   }
 
   function appendOutputToSession(sessionId, data) {
@@ -706,6 +733,7 @@ export default function App() {
     projectsRef.current = nextProjects;
     setProjects(nextProjects);
     if (sessionId === activeProjectSessionIdRef.current) outputBufferRef.current += data;
+    detectSessionFilesFromOutput(data, sessionId);
     if (persistOutputTimerRef.current) clearTimeout(persistOutputTimerRef.current);
     persistOutputTimerRef.current = setTimeout(() => {
       localStorage.setItem(PROJECTS_STORAGE_KEY, JSON.stringify(projectsRef.current));
@@ -823,7 +851,7 @@ export default function App() {
           ? {
               ...project,
               updated_at: now,
-              sessions: [...sessions, { id: sessionId, title: sessionTitle, created_at: now, updated_at: now, output: "", start_command: startCommand }]
+              sessions: [...sessions, { id: sessionId, title: sessionTitle, created_at: now, updated_at: now, output: "", start_command: startCommand, draft_command: "", attachments: [], referenced_files: [], output_files: [] }]
             }
           : project);
       } else {
@@ -840,7 +868,7 @@ export default function App() {
           path,
           created_at: now,
           updated_at: now,
-          sessions: [{ id: sessionId, title: sessionTitle, created_at: now, updated_at: now, output: "", start_command: startCommand }]
+          sessions: [{ id: sessionId, title: sessionTitle, created_at: now, updated_at: now, output: "", start_command: startCommand, draft_command: "", attachments: [], referenced_files: [], output_files: [] }]
         }
       ];
     }
@@ -879,7 +907,7 @@ export default function App() {
           updated_at: now,
           sessions: [
             ...(project.sessions || []),
-            { id: sessionId, title: "新 Pi 会话", created_at: now, updated_at: now, output: "" }
+            { id: sessionId, title: "新 Pi 会话", created_at: now, updated_at: now, output: "", draft_command: "", attachments: [], referenced_files: [], output_files: [] }
           ]
         }
       : project);
@@ -904,10 +932,16 @@ export default function App() {
     setStatus(`已在资源管理器打开：${project.name}`);
   }
 
-  function deleteProject(projectId) {
+  async function deleteProject(projectId) {
     const project = projectsRef.current.find((p) => p.id === projectId);
     if (!project) return;
     if (!window.confirm(`确定删除项目「${project.name}」及其所有会话记录吗？不会删除磁盘文件。`)) return;
+    await Promise.all((project.sessions || []).map((session) => invoke("stop_pi_session", { sessionId: session.id }).catch(() => {})));
+    setPiSessionStatus((prev) => {
+      const next = { ...prev };
+      for (const session of project.sessions || []) delete next[session.id];
+      return next;
+    });
     const nextProjects = projectsRef.current.filter((p) => p.id !== projectId);
     saveProjects(nextProjects);
     if (activeProjectIdRef.current === projectId) {
@@ -926,11 +960,17 @@ export default function App() {
     }
   }
 
-  function deleteProjectSession(projectId, sessionId) {
+  async function deleteProjectSession(projectId, sessionId) {
     const project = projectsRef.current.find((p) => p.id === projectId);
     const session = project?.sessions?.find((s) => s.id === sessionId);
     if (!project || !session) return;
     if (!window.confirm(`确定删除会话「${session.title}」吗？`)) return;
+    await invoke("stop_pi_session", { sessionId }).catch(() => {});
+    setPiSessionStatus((prev) => {
+      const next = { ...prev };
+      delete next[sessionId];
+      return next;
+    });
     const nextProjects = projectsRef.current.map((p) => p.id === projectId ? { ...p, sessions: (p.sessions || []).filter((s) => s.id !== sessionId) } : p);
     saveProjects(nextProjects);
     if (activeProjectSessionIdRef.current === sessionId) {
@@ -974,6 +1014,8 @@ export default function App() {
     setWorkdir(project.path);
     outputBufferRef.current = session.output || "";
     setTerminalReplayContent(session.output || "");
+    setCommand(session.draft_command || "");
+    setAttachments(session.attachments || []);
     setTerminalReplaySignal((value) => value + 1);
   }
 
@@ -1051,19 +1093,17 @@ export default function App() {
     persistCurrentSessionOutput();
   }
 
-  function rememberOutput(data) {
-    outputBufferRef.current += data;
-    schedulePersistCurrentSessionOutput();
-  }
-
   function clearTerminal() {
+    const sessionId = activeProjectSessionIdRef.current;
+    if (sessionId) {
+      updateSessionById(sessionId, (session) => ({ ...session, output: "", updated_at: new Date().toISOString() }));
+    }
     outputBufferRef.current = "";
-    persistCurrentSessionOutput();
     setClearTerminalSignal((value) => value + 1);
   }
 
   async function copyOutput() {
-    const output = outputBufferRef.current;
+    const output = activeProjectSession?.output || outputBufferRef.current;
     if (!output) {
       setStatus("当前没有可复制的输出");
       return;
@@ -1104,6 +1144,10 @@ export default function App() {
     updateActiveProjectSessionAfterCommand(titleSource);
     setCommand("");
     setAttachments([]);
+    const sessionId = activeProjectSessionIdRef.current;
+    if (sessionId) {
+      updateSessionById(sessionId, (session) => ({ ...session, draft_command: "", attachments: [], updated_at: new Date().toISOString() }));
+    }
   }
 
   function insertFileAttachments(paths) {
@@ -1128,14 +1172,22 @@ export default function App() {
 
     setAttachments((prev) => {
       const prevPaths = new Set(prev.map((item) => item.path));
-      return [...prev, ...additions.filter((item) => !prevPaths.has(item.path))];
+      const next = [...prev, ...additions.filter((item) => !prevPaths.has(item.path))];
+      const sessionId = activeProjectSessionIdRef.current;
+      if (sessionId) updateSessionById(sessionId, (session) => ({ ...session, attachments: next, updated_at: new Date().toISOString() }));
+      return next;
     });
     setStatus(additions.length === 1 ? `已加入会话文件：${additions[0].name}` : `已加入 ${additions.length} 个会话文件`);
     requestAnimationFrame(() => inputRef.current?.focus());
   }
 
   function removeAttachment(id) {
-    setAttachments((items) => items.filter((attachment) => attachment.id !== id));
+    setAttachments((items) => {
+      const next = items.filter((attachment) => attachment.id !== id);
+      const sessionId = activeProjectSessionIdRef.current;
+      if (sessionId) updateSessionById(sessionId, (session) => ({ ...session, attachments: next, updated_at: new Date().toISOString() }));
+      return next;
+    });
     requestAnimationFrame(() => inputRef.current?.focus());
   }
 
@@ -1186,7 +1238,10 @@ export default function App() {
   }
 
   function handleCommandChange(e) {
-    setCommand(e.target.value);
+    const nextValue = e.target.value;
+    setCommand(nextValue);
+    const sessionId = activeProjectSessionIdRef.current;
+    if (sessionId) updateSessionById(sessionId, (session) => ({ ...session, draft_command: nextValue, updated_at: new Date().toISOString() }), { persist: false });
   }
 
   function handleKeyDown(e) {
