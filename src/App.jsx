@@ -642,6 +642,7 @@ export default function App() {
   const [terminalReplayContent, setTerminalReplayContent] = useState("");
   const [terminalInputEnabled, setTerminalInputEnabled] = useState(true);
   const [centerView, setCenterView] = useState(() => normalizeCenterView(localStorage.getItem(CENTER_VIEW_STORAGE_KEY)));
+  const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [piSessionStatus, setPiSessionStatus] = useState({});
   const [command, setCommand] = useState("");
   const [attachments, setAttachments] = useState([]);
@@ -911,6 +912,18 @@ export default function App() {
     }));
   }
 
+  function updateSessionModels(sessionId, models, currentModel) {
+    const normalizedModels = (Array.isArray(models) ? models : []).map(normalizeModelInfo).filter(Boolean);
+    const normalizedCurrent = normalizeModelInfo(currentModel);
+    updateSessionById(sessionId, (session) => ({
+      ...session,
+      available_models: normalizedModels,
+      current_model: normalizedCurrent || session.current_model,
+      updated_at: new Date().toISOString()
+    }));
+    if (normalizedCurrent) setSessionRuntimeStatus(sessionId, { model: normalizedCurrent });
+  }
+
   function applyPiIdeEvents(events) {
     if (!Array.isArray(events) || events.length === 0) return;
     const bySession = new Map();
@@ -928,6 +941,28 @@ export default function App() {
 
       if (event.kind === "model") {
         updateSessionModel(targetSessionId, event.model);
+        continue;
+      }
+
+      if (event.kind === "models") {
+        updateSessionModels(targetSessionId, event.models, event.currentModel || event.current_model);
+        continue;
+      }
+
+      if (event.kind === "model_switch_result") {
+        if (event.success) {
+          updateSessionModel(targetSessionId, event.model);
+          setStatus(`已切换模型：${formatModelInfo(event.model)}`);
+        } else {
+          setStatus(`模型切换失败：${event.error || "未知错误"}`);
+          debugLog("model switch failed", { targetSessionId, error: event.error, requested: event.requested });
+        }
+        continue;
+      }
+
+      if (event.kind === "model_error") {
+        setStatus(`模型列表获取失败：${event.error || "未知错误"}`);
+        debugLog("model list failed", { targetSessionId, error: event.error });
         continue;
       }
 
@@ -1456,16 +1491,48 @@ export default function App() {
     });
   }
 
+  async function sendToActivePi(input) {
+    const sessionId = activeProjectSessionIdRef.current;
+    await ensureActivePiRunning();
+    await invoke("send_pi_input", { sessionId, input });
+  }
+
   async function handleTerminalInput(data) {
     const sessionId = activeProjectSessionIdRef.current;
     try {
-      await ensureActivePiRunning();
-      await invoke("send_pi_input", { sessionId, input: data });
+      await sendToActivePi(data);
     } catch (error) {
       debugLog("terminal input failed", { sessionId, error: String(error) });
       setStatus(String(error));
       if (sessionId) setSessionRuntimeStatus(sessionId, { starting: false, processing: false, status: String(error) });
     }
+  }
+
+  async function refreshModels() {
+    try {
+      await sendToActivePi("/pi-ide-list-models\r");
+      setStatus("正在刷新模型列表...");
+    } catch (error) {
+      setStatus(`刷新模型列表失败：${String(error)}`);
+    }
+  }
+
+  async function switchModel(model) {
+    const label = formatModelInfo(model);
+    try {
+      const payload = JSON.stringify({ provider: model.provider, id: model.id });
+      setStatus(`正在切换模型：${label}`);
+      await sendToActivePi(`/pi-ide-switch-model ${payload}\r`);
+      setModelMenuOpen(false);
+    } catch (error) {
+      setStatus(`模型切换失败：${String(error)}`);
+    }
+  }
+
+  async function toggleModelMenu() {
+    const next = !modelMenuOpen;
+    setModelMenuOpen(next);
+    if (next) await refreshModels();
   }
 
   async function stopAllPi() {
@@ -1727,8 +1794,30 @@ export default function App() {
             placeholder={'输入 Pi 指令或自然语言任务。例如：帮我分析这个文件 "/path/to/file"'}
           />
           <div className="composer-actions">
-            <span>当前项目：{activeProject?.name || "未选择"} / 当前模型：{activeModelLabel || "未获取"} / 会话：{activeProjectSession?.title || "未选择"}</span>
-            <button className={isProcessing ? "danger" : "primary"} onClick={handleComposerAction}>{isProcessing ? <Square size={16}/> : <Send size={16}/>} {isProcessing ? "停止" : "发送"}</button>
+            <span>当前项目：{activeProject?.name || "未选择"} / 会话：{activeProjectSession?.title || "未选择"}</span>
+            <div className="composer-action-buttons">
+              <div className="model-picker">
+                <button className="model-picker-button" onClick={() => toggleModelMenu().catch((e) => setStatus(String(e)))} title="切换当前 Pi 会话模型">
+                  模型：{activeModelLabel || "未获取"} <ChevronDown size={13}/>
+                </button>
+                {modelMenuOpen && (
+                  <div className="model-menu">
+                    <button className="model-menu-refresh" onClick={() => refreshModels().catch((e) => setStatus(String(e)))}><RefreshCw size={13}/> 刷新模型列表</button>
+                    {(activeProjectSession?.available_models || []).length === 0 && <div className="model-menu-empty">暂无可用模型</div>}
+                    {(activeProjectSession?.available_models || []).map((model) => {
+                      const selected = model.id === (piSessionStatus[activeProjectSessionId]?.model || activeProjectSession?.current_model)?.id && model.provider === (piSessionStatus[activeProjectSessionId]?.model || activeProjectSession?.current_model)?.provider;
+                      return (
+                        <button key={`${model.provider}:${model.id}`} className={`model-menu-item ${selected ? "active" : ""}`} onClick={() => switchModel(model)}>
+                          <span>{formatModelInfo(model)}</span>
+                          {selected && <small>当前</small>}
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+              <button className={isProcessing ? "danger" : "primary"} onClick={handleComposerAction}>{isProcessing ? <Square size={16}/> : <Send size={16}/>} {isProcessing ? "停止" : "发送"}</button>
+            </div>
           </div>
         </div>
       </main>

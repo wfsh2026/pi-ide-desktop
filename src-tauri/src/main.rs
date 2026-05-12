@@ -279,6 +279,28 @@ function modelInfo(model) {
   };
 }
 
+function modelList(ctx) {
+  try {
+    return (ctx?.modelRegistry?.getAvailable?.() || []).map(modelInfo).filter(Boolean);
+  } catch (error) {
+    appendEvent(ctx, {
+      kind: "model_error",
+      source: "model-list",
+      error: String(error?.message || error),
+    });
+    return [];
+  }
+}
+
+function emitModels(ctx, source = "unknown") {
+  appendEvent(ctx, {
+    kind: "models",
+    source,
+    models: modelList(ctx),
+    currentModel: modelInfo(ctx?.model),
+  });
+}
+
 function appendTimeline(ctx, eventType, payload = {}) {
   appendEvent(ctx, {
     kind: "timeline",
@@ -316,9 +338,53 @@ function gitChangedFiles(cwd) {
 }
 
 export default function(pi) {
+  pi.registerCommand("pi-ide-list-models", {
+    description: "Emit available models for Pi IDE Desktop",
+    handler: async (_args, ctx) => {
+      emitModels(ctx, "command");
+    },
+  });
+
+  pi.registerCommand("pi-ide-switch-model", {
+    description: "Switch model from Pi IDE Desktop. Args: JSON { provider, id }",
+    handler: async (args, ctx) => {
+      let payload;
+      try {
+        payload = JSON.parse(args || "{}");
+      } catch (error) {
+        appendEvent(ctx, { kind: "model_switch_result", success: false, error: `Invalid JSON: ${String(error?.message || error)}` });
+        return;
+      }
+
+      const provider = String(payload.provider || "").trim();
+      const modelId = String(payload.id || payload.model || "").trim();
+      const model = provider && modelId ? ctx.modelRegistry.find(provider, modelId) : undefined;
+      if (!model) {
+        appendEvent(ctx, {
+          kind: "model_switch_result",
+          success: false,
+          error: `Model not found: ${provider}/${modelId}`,
+          requested: { provider, id: modelId },
+        });
+        ctx.ui.notify(`Model not found: ${provider}/${modelId}`, "error");
+        return;
+      }
+
+      const ok = await pi.setModel(model);
+      appendEvent(ctx, {
+        kind: "model_switch_result",
+        success: Boolean(ok),
+        model: modelInfo(model),
+        error: ok ? "" : "No API key or auth unavailable",
+      });
+      if (!ok) ctx.ui.notify(`Cannot switch model: ${provider}/${modelId}`, "error");
+    },
+  });
+
   pi.on("session_start", async (_event, ctx) => {
     appendEvent(ctx, { kind: "session", source: "session-start", model: modelInfo(ctx?.model) });
     appendEvent(ctx, { kind: "model", source: "session-start", model: modelInfo(ctx?.model) });
+    emitModels(ctx, "session-start");
   });
 
   pi.on("model_select", async (event, ctx) => {
