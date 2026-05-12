@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
-import { Play, Square, Send, FolderOpen, Plus, Folder, X, File, FolderTree, ChevronDown, ChevronRight, RefreshCw, MessageSquare, TerminalSquare } from "lucide-react";
+import { Square, Send, FolderOpen, Plus, Folder, X, File, FileText, FolderTree, ChevronDown, ChevronRight, RefreshCw, MessageSquare, TerminalSquare } from "lucide-react";
 import PiTerminal from "./components/PiTerminal.jsx";
 import SessionTimeline from "./components/SessionTimeline.jsx";
 import { applyPiIdeTimelineEvent } from "./piIdeEventMapper.js";
@@ -643,7 +643,6 @@ export default function App() {
   const [terminalInputEnabled, setTerminalInputEnabled] = useState(true);
   const [centerView, setCenterView] = useState(() => normalizeCenterView(localStorage.getItem(CENTER_VIEW_STORAGE_KEY)));
   const [piSessionStatus, setPiSessionStatus] = useState({});
-  const [openedFromContext, setOpenedFromContext] = useState(false);
   const [command, setCommand] = useState("");
   const [attachments, setAttachments] = useState([]);
   const [toolListCollapsed, setToolListCollapsed] = useState(false);
@@ -654,7 +653,6 @@ export default function App() {
   const [directoryTreeSearch, setDirectoryTreeSearch] = useState("");
   const [directoryTreeLoading, setDirectoryTreeLoading] = useState(false);
   const [directoryTreeError, setDirectoryTreeError] = useState("");
-  const [piCommand, setPiCommand] = useState(localStorage.getItem("piCommand") || DEFAULT_COMMAND);
   const [workdir, setWorkdir] = useState(localStorage.getItem("workdir") || "");
   const [projects, setProjects] = useState(() => loadProjects());
   const [activeProjectId, setActiveProjectId] = useState(null);
@@ -672,6 +670,7 @@ export default function App() {
   const activeProjectSessionIdRef = useRef(activeProjectSessionId);
   const piSessionStatusRef = useRef(piSessionStatus);
   const launchHandledRef = useRef(false);
+  const legacyPiCommandRef = useRef(localStorage.getItem("piCommand") || DEFAULT_COMMAND);
 
   useEffect(() => { projectsRef.current = projects; }, [projects]);
   useEffect(() => { activeProjectIdRef.current = activeProjectId; }, [activeProjectId]);
@@ -683,8 +682,6 @@ export default function App() {
     () => activeProject?.sessions?.find((s) => s.id === activeProjectSessionId),
     [activeProject, activeProjectSessionId]
   );
-  const piStarted = Boolean(activeProjectSessionId && piSessionStatus[activeProjectSessionId]?.running);
-  const piStarting = Boolean(activeProjectSessionId && piSessionStatus[activeProjectSessionId]?.starting);
   const isProcessing = Boolean(activeProjectSessionId && piSessionStatus[activeProjectSessionId]?.processing);
   const activeModelLabel = useMemo(
     () => formatModelInfo(piSessionStatus[activeProjectSessionId]?.model || activeProjectSession?.current_model),
@@ -750,6 +747,18 @@ export default function App() {
   async function openSessionFileDirectory(file) {
     await invoke("open_path_in_file_manager", { path: file.path });
     setStatus(`已打开所在目录：${file.name || basename(file.path)}`);
+  }
+
+  async function openDebugLog() {
+    try {
+      const path = await invoke("get_debug_log_path");
+      debugLog("open debug log", { path });
+      await invoke("open_path_in_file_manager", { path });
+      setStatus(`已打开调试日志目录：${path}`);
+    } catch (error) {
+      debugLog("open debug log failed", { error: String(error) });
+      setStatus(`打开调试日志失败：${String(error)}`);
+    }
   }
 
   function saveProjects(nextProjects) {
@@ -1032,12 +1041,11 @@ export default function App() {
     invoke("get_launch_context").then((context) => {
       if (launchHandledRef.current) return;
       launchHandledRef.current = true;
-      if (context?.openedFromContext || context?.opened_from_context) setOpenedFromContext(true);
       const projectPath = context?.projectPath || context?.project_path;
       if (projectPath) {
-        const commandText = localStorage.getItem("piCommand") || DEFAULT_COMMAND;
-        const created = createOrSelectProjectForPath(projectPath, { createNewSession: true, sessionTitle: `右键启动：${commandText}`, startCommand: commandText });
-        startPi({ sessionId: created.sessionId, piCommand: commandText, workdir: projectPath }).catch((e) => setStatus(String(e)));
+        createOrSelectProjectForPath(projectPath, { createNewSession: true, sessionTitle: "右键启动" });
+        invoke("ensure_pi_ide_config", { workdir: projectPath, legacyCommand: legacyPiCommandRef.current }).catch(() => {});
+        setStatus(`已载入项目：${basename(projectPath)}`);
       }
     }).catch(() => {});
 
@@ -1175,9 +1183,11 @@ export default function App() {
     const existing = projectsRef.current.find((p) => p.path === selected);
     if (existing && (existing.sessions || []).length > 0) {
       selectProjectSession(existing.id, existing.sessions[0].id);
+      invoke("ensure_pi_ide_config", { workdir: selected, legacyCommand: legacyPiCommandRef.current }).catch(() => {});
       return;
     }
     createOrSelectProjectForPath(selected);
+    invoke("ensure_pi_ide_config", { workdir: selected, legacyCommand: legacyPiCommandRef.current }).catch(() => {});
   }
 
   function createProjectSession(projectId) {
@@ -1211,9 +1221,7 @@ export default function App() {
 
   async function createAndStartProjectSession(projectId) {
     const created = createProjectSession(projectId);
-    if (created?.path) {
-      await startPi({ sessionId: created.sessionId, workdir: created.path, piCommand, continueSession: false });
-    }
+    if (created?.path) invoke("ensure_pi_ide_config", { workdir: created.path, legacyCommand: legacyPiCommandRef.current }).catch(() => {});
   }
 
   function toggleProject(projectId) {
@@ -1315,7 +1323,6 @@ export default function App() {
     outputBufferRef.current = session.output || "";
     setCommand(session.draft_command || "");
     setAttachments(session.attachments || []);
-    setPiCommand(session.start_command || localStorage.getItem("piCommand") || DEFAULT_COMMAND);
     if (!sameSession && !options.skipReplay) {
       setTerminalReplayContent(session.output || "");
       setTerminalReplaySignal((value) => value + 1);
@@ -1344,7 +1351,6 @@ export default function App() {
     await startPi({
       sessionId,
       workdir: selected.project.path,
-      piCommand: selected.session.start_command || piCommand || DEFAULT_COMMAND,
       continueSession: shouldContinueSession(selected.session)
     });
   }
@@ -1373,7 +1379,7 @@ export default function App() {
     saveProjects(nextProjects);
   }
 
-  function recordSessionStart(commandText, runWorkdir) {
+  function recordSessionStart(runWorkdir) {
     const projectId = activeProjectIdRef.current;
     const sessionId = activeProjectSessionIdRef.current;
     if (!projectId || !sessionId) return;
@@ -1383,7 +1389,7 @@ export default function App() {
           ...project,
           updated_at: now,
           sessions: (project.sessions || []).map((session) => session.id === sessionId
-            ? { ...session, start_command: commandText, workdir: runWorkdir, updated_at: now }
+            ? { ...session, workdir: runWorkdir, updated_at: now }
             : session)
         }
       : project);
@@ -1392,7 +1398,6 @@ export default function App() {
 
   async function startPi(options = {}) {
     debugLog("startPi enter", { options, active: activeProjectSessionIdRef.current, status: piSessionStatusRef.current[options.sessionId || activeProjectSessionIdRef.current] });
-    const commandText = options.piCommand || piCommand || DEFAULT_COMMAND;
     let runWorkdir = options.workdir || activeProject?.path || workdir;
     let sessionId = options.sessionId || activeProjectSessionIdRef.current;
 
@@ -1400,10 +1405,10 @@ export default function App() {
       const selected = await open({ directory: true, multiple: false, title: "选择项目目录" });
       if (typeof selected !== "string") return;
       runWorkdir = selected;
-      const created = createOrSelectProjectForPath(selected, { createNewSession: true, sessionTitle: `启动：${commandText}`, startCommand: commandText });
+      const created = createOrSelectProjectForPath(selected, { createNewSession: true, sessionTitle: "新 Pi 会话" });
       sessionId = created.sessionId;
     } else if (!sessionId) {
-      const created = createOrSelectProjectForPath(runWorkdir, { createNewSession: true, sessionTitle: `启动：${commandText}`, startCommand: commandText });
+      const created = createOrSelectProjectForPath(runWorkdir, { createNewSession: true, sessionTitle: "新 Pi 会话" });
       sessionId = created.sessionId;
     }
 
@@ -1419,14 +1424,13 @@ export default function App() {
     const { session } = getSessionById(sessionId);
     const continueSession = options.continueSession ?? shouldContinueSession(session);
 
-    localStorage.setItem("piCommand", commandText);
     if (runWorkdir) localStorage.setItem("workdir", runWorkdir);
-    recordSessionStart(commandText, runWorkdir);
+    recordSessionStart(runWorkdir);
     startingSessionsRef.current.add(sessionId);
     setSessionRuntimeStatus(sessionId, { starting: true, runId: null, status: "Pi 启动中" });
     try {
-      debugLog("startPi invoke", { sessionId, workdir: runWorkdir, commandLen: commandText.length, continueSession });
-      await invoke("start_pi_session", { sessionId, piCommand: commandText, workdir: runWorkdir, continueSession });
+      debugLog("startPi invoke", { sessionId, workdir: runWorkdir, continueSession });
+      await invoke("start_pi_session", { sessionId, piCommand: legacyPiCommandRef.current, workdir: runWorkdir, continueSession });
       debugLog("startPi done", { sessionId });
       setSessionRuntimeStatus(sessionId, { running: true, starting: false, processing: false, status: "Pi 已启动" });
     } catch (error) {
@@ -1447,7 +1451,6 @@ export default function App() {
     if (!project || !session) throw new Error("当前会话不存在");
     await startPi({
       sessionId,
-      piCommand: session.start_command || piCommand || DEFAULT_COMMAND,
       workdir: project.path,
       continueSession: shouldContinueSession(session)
     });
@@ -1463,16 +1466,6 @@ export default function App() {
       setStatus(String(error));
       if (sessionId) setSessionRuntimeStatus(sessionId, { starting: false, processing: false, status: String(error) });
     }
-  }
-
-  async function stopPi() {
-    const sessionId = activeProjectSessionIdRef.current;
-    if (!sessionId) return;
-    await invoke("stop_pi_session", { sessionId });
-    clearSessionIdleTimer(sessionId);
-    setSessionRuntimeStatus(sessionId, { running: false, processing: false, status: "Pi 已停止" });
-    markLatestTurnStatus(sessionId, "cancelled");
-    persistCurrentSessionOutput();
   }
 
   async function stopAllPi() {
@@ -1685,22 +1678,10 @@ export default function App() {
               <TerminalSquare size={15}/> 终端视图
             </button>
           </div>
-          {!openedFromContext && !piStarted && (
-            <textarea className="pi-start-input" value={piCommand} onChange={(e) => {
-              const value = e.target.value;
-              setPiCommand(value);
-              const sessionId = activeProjectSessionIdRef.current;
-              if (sessionId) updateSessionById(sessionId, (session) => ({ ...session, start_command: value, updated_at: new Date().toISOString() }));
-            }} placeholder={'Pi 启动命令，例如：\npi --thinking high\n\n或：\n@echo off\nset DEEPSEEK_API_KEY=sk-XXXXXXXXXXXX\npi -nc %*'} />
-          )}
-          {!openedFromContext && (
-            <button disabled={piStarting} className={piStarted ? "" : "primary"} onClick={() => (piStarted ? stopPi() : startPi()).catch((e) => setStatus(String(e)))}>
-              {piStarted ? <Square size={15}/> : <Play size={15}/>} {piStarting ? "启动中..." : piStarted ? "停止 Pi" : "启动 Pi"}
-            </button>
-          )}
           <button className={terminalInputEnabled ? "primary" : ""} onClick={() => setTerminalInputEnabled((value) => !value)}>
             {terminalInputEnabled ? "原生终端：开" : "原生终端：关"}
           </button>
+          <button onClick={openDebugLog} title="打开调试日志所在目录"><FileText size={15}/> 调试日志</button>
           <button className="danger" onClick={() => stopAllPi().catch((e) => setStatus(String(e)))}>停止全部 Pi</button>
         </header>
         <div className="center-view-wrap">
