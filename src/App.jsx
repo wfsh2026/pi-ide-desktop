@@ -109,6 +109,11 @@ function fileRecordsFromPaths(paths, source) {
   }));
 }
 
+function debugLog(message, data = undefined) {
+  const suffix = data === undefined ? "" : ` ${JSON.stringify(data, (_key, value) => typeof value === "string" && value.length > 300 ? `${value.slice(0, 300)}…` : value)}`;
+  invoke("append_debug_log", { source: "frontend", message: `${message}${suffix}` }).catch(() => {});
+}
+
 function loadProjects() {
   try {
     const raw = localStorage.getItem(PROJECTS_STORAGE_KEY);
@@ -536,6 +541,7 @@ export default function App() {
   const inputRef = useRef(null);
   const outputBufferRef = useRef("");
   const outputIdleTimersRef = useRef({});
+  const startingSessionsRef = useRef(new Set());
   const persistOutputTimerRef = useRef(null);
   const projectsRenderTimerRef = useRef(null);
   const fileEventSeenRef = useRef(new Set());
@@ -556,6 +562,7 @@ export default function App() {
     [activeProject, activeProjectSessionId]
   );
   const piStarted = Boolean(activeProjectSessionId && piSessionStatus[activeProjectSessionId]?.running);
+  const piStarting = Boolean(activeProjectSessionId && piSessionStatus[activeProjectSessionId]?.starting);
   const isProcessing = Boolean(activeProjectSessionId && piSessionStatus[activeProjectSessionId]?.processing);
 
   const loadDirectoryTree = useCallback(async (projectPath = activeProject?.path) => {
@@ -625,6 +632,7 @@ export default function App() {
 
   function setSessionRuntimeStatus(sessionId, patch) {
     if (!sessionId) return;
+    debugLog("setSessionRuntimeStatus", { sessionId, patch });
     const next = {
       ...piSessionStatusRef.current,
       [sessionId]: { ...(piSessionStatusRef.current[sessionId] || {}), ...patch }
@@ -769,6 +777,7 @@ export default function App() {
 
   function appendOutputToSession(sessionId, data) {
     if (!sessionId || !data) return;
+    debugLog("appendOutputToSession", { sessionId, bytes: data.length, active: activeProjectSessionIdRef.current });
     const now = new Date().toISOString();
     let changed = false;
     const nextProjects = projectsRef.current.map((project) => ({
@@ -830,7 +839,10 @@ export default function App() {
     }).catch(() => {});
 
     const unsubs = [];
+    debugLog("app mounted");
+    invoke("get_debug_log_path").then((path) => setStatus(`调试日志：${path}`)).catch(() => {});
     listen("pi-status", (event) => {
+      debugLog("pi-status event", event.payload);
       const payload = event.payload;
       const sessionId = payload && typeof payload === "object" ? (payload.sessionId || payload.session_id) : null;
       const text = payload && typeof payload === "object" ? String(payload.status || "") : String(payload || "");
@@ -841,6 +853,7 @@ export default function App() {
         const previous = piSessionStatusRef.current[sessionId] || {};
         setSessionRuntimeStatus(sessionId, {
           running: stopped ? false : running || previous.running || false,
+          starting: false,
           processing: stopped ? false : previous.processing || false,
           status: text
         });
@@ -848,6 +861,7 @@ export default function App() {
     }).then((f) => unsubs.push(f));
     listen("pi-output", (event) => {
       const payload = event.payload || {};
+      debugLog("pi-output event", { sessionId: payload.sessionId || payload.session_id, bytes: String(payload.data ?? "").length, active: activeProjectSessionIdRef.current });
       const sessionId = payload.sessionId || payload.session_id;
       const data = String(payload.data ?? "");
       if (sessionId && data) appendOutputToSession(sessionId, data);
@@ -1071,29 +1085,50 @@ export default function App() {
     }
   }
 
-  function selectProjectSession(projectId, sessionId) {
+  function selectProjectSession(projectId, sessionId, options = {}) {
+    debugLog("selectProjectSession enter", { projectId, sessionId, current: activeProjectSessionIdRef.current, options });
     persistCurrentSessionOutput();
     const project = projectsRef.current.find((p) => p.id === projectId);
     const session = project?.sessions?.find((s) => s.id === sessionId);
-    if (!project || !session) return null;
+    if (!project || !session) {
+      debugLog("selectProjectSession missing", { projectId, sessionId });
+      return null;
+    }
+    const sameSession = sessionId === activeProjectSessionIdRef.current;
     activeProjectIdRef.current = projectId;
     activeProjectSessionIdRef.current = sessionId;
     setActiveProjectId(projectId);
     setActiveProjectSessionId(sessionId);
     setWorkdir(project.path);
     outputBufferRef.current = session.output || "";
-    setTerminalReplayContent(session.output || "");
     setCommand(session.draft_command || "");
     setAttachments(session.attachments || []);
     setPiCommand(session.start_command || localStorage.getItem("piCommand") || DEFAULT_COMMAND);
-    setTerminalReplaySignal((value) => value + 1);
+    if (!sameSession && !options.skipReplay) {
+      setTerminalReplayContent(session.output || "");
+      setTerminalReplaySignal((value) => value + 1);
+      debugLog("selectProjectSession replay", { sessionId, outputBytes: (session.output || "").length });
+    } else if (!sameSession && options.skipReplay) {
+      setTerminalReplayContent("");
+      setTerminalReplaySignal((value) => value + 1);
+      debugLog("selectProjectSession skip replay", { sessionId, outputBytes: (session.output || "").length });
+    } else {
+      debugLog("selectProjectSession same session no replay", { sessionId });
+    }
     return { project, session };
   }
 
   async function activateProjectSession(projectId, sessionId) {
-    const selected = selectProjectSession(projectId, sessionId);
+    debugLog("activateProjectSession enter", { projectId, sessionId, status: piSessionStatusRef.current[sessionId] });
+    const willStartWithContinue = !piSessionStatusRef.current[sessionId]?.running && shouldContinueSession(
+      projectsRef.current.find((p) => p.id === projectId)?.sessions?.find((s) => s.id === sessionId)
+    );
+    const selected = selectProjectSession(projectId, sessionId, { skipReplay: willStartWithContinue });
     if (!selected) return;
-    if (piSessionStatusRef.current[sessionId]?.running) return;
+    if (piSessionStatusRef.current[sessionId]?.running) {
+      debugLog("activateProjectSession already running", { sessionId });
+      return;
+    }
     await startPi({
       sessionId,
       workdir: selected.project.path,
@@ -1144,6 +1179,7 @@ export default function App() {
   }
 
   async function startPi(options = {}) {
+    debugLog("startPi enter", { options, active: activeProjectSessionIdRef.current, status: piSessionStatusRef.current[options.sessionId || activeProjectSessionIdRef.current] });
     const commandText = options.piCommand || piCommand || DEFAULT_COMMAND;
     let runWorkdir = options.workdir || activeProject?.path || workdir;
     let sessionId = options.sessionId || activeProjectSessionIdRef.current;
@@ -1160,18 +1196,35 @@ export default function App() {
     }
 
     if (!sessionId) throw new Error("请先选择或创建一个会话");
+    if (piSessionStatusRef.current[sessionId]?.running) {
+      debugLog("startPi skip running", { sessionId });
+      return;
+    }
+    if (startingSessionsRef.current.has(sessionId)) {
+      debugLog("startPi skip starting", { sessionId });
+      return;
+    }
     const { session } = getSessionById(sessionId);
     const continueSession = options.continueSession ?? shouldContinueSession(session);
 
     localStorage.setItem("piCommand", commandText);
     if (runWorkdir) localStorage.setItem("workdir", runWorkdir);
     recordSessionStart(commandText, runWorkdir);
-    await invoke("start_pi_session", { sessionId, piCommand: commandText, workdir: runWorkdir, continueSession });
-    setSessionRuntimeStatus(sessionId, { running: true, processing: false, status: "Pi 已启动" });
+    startingSessionsRef.current.add(sessionId);
+    setSessionRuntimeStatus(sessionId, { starting: true, status: "Pi 启动中" });
+    try {
+      debugLog("startPi invoke", { sessionId, workdir: runWorkdir, commandLen: commandText.length, continueSession });
+      await invoke("start_pi_session", { sessionId, piCommand: commandText, workdir: runWorkdir, continueSession });
+      debugLog("startPi done", { sessionId });
+      setSessionRuntimeStatus(sessionId, { running: true, starting: false, processing: false, status: "Pi 已启动" });
+    } finally {
+      startingSessionsRef.current.delete(sessionId);
+    }
   }
 
   async function ensureActivePiRunning() {
     const sessionId = activeProjectSessionIdRef.current;
+    debugLog("ensureActivePiRunning", { sessionId, status: piSessionStatusRef.current[sessionId] });
     if (!sessionId) throw new Error("请先选择或创建一个会话");
     if (piSessionStatusRef.current[sessionId]?.running) return;
     const { project, session } = getSessionById(sessionId);
@@ -1389,8 +1442,8 @@ export default function App() {
             }} placeholder={'Pi 启动命令，例如：\npi --thinking high\n\n或：\n@echo off\nset DEEPSEEK_API_KEY=sk-XXXXXXXXXXXX\npi -nc %*'} />
           )}
           {!openedFromContext && (
-            <button className={piStarted ? "" : "primary"} onClick={() => (piStarted ? stopPi() : startPi()).catch((e) => setStatus(String(e)))}>
-              {piStarted ? <Square size={15}/> : <Play size={15}/>} {piStarted ? "停止 Pi" : "启动 Pi"}
+            <button disabled={piStarting} className={piStarted ? "" : "primary"} onClick={() => (piStarted ? stopPi() : startPi()).catch((e) => setStatus(String(e)))}>
+              {piStarted ? <Square size={15}/> : <Play size={15}/>} {piStarting ? "启动中..." : piStarted ? "停止 Pi" : "启动 Pi"}
             </button>
           )}
           <button className={terminalInputEnabled ? "primary" : ""} onClick={() => setTerminalInputEnabled((value) => !value)}>
