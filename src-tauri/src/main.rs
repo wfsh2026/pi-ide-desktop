@@ -63,6 +63,8 @@ fn storage_dir() -> Result<PathBuf, String> {
 fn history_path() -> Result<PathBuf, String> { Ok(storage_dir()?.join("history.json")) }
 fn sessions_path() -> Result<PathBuf, String> { Ok(storage_dir()?.join("sessions.json")) }
 fn debug_log_path() -> Result<PathBuf, String> { Ok(storage_dir()?.join("debug.log")) }
+fn global_config_path() -> Result<PathBuf, String> { Ok(storage_dir()?.join("config.json")) }
+fn project_config_path(workdir: &Path) -> PathBuf { workdir.join(".pi.ide").join("config.json") }
 
 fn append_debug_line(line: &str) {
   if let Ok(path) = debug_log_path() {
@@ -81,6 +83,131 @@ fn append_debug_log(source: String, message: String) -> Result<(), String> {
 #[tauri::command]
 fn get_debug_log_path() -> Result<String, String> {
   Ok(debug_log_path()?.to_string_lossy().to_string())
+}
+
+fn default_global_config(command: &str) -> serde_json::Value {
+  serde_json::json!({
+    "version": 1,
+    "pi": {
+      "command": command,
+      "env": {}
+    }
+  })
+}
+
+fn default_project_config() -> serde_json::Value {
+  serde_json::json!({
+    "version": 1,
+    "pi": {
+      "command": "",
+      "env": {}
+    }
+  })
+}
+
+fn read_json_value(path: &Path) -> Result<Option<serde_json::Value>, String> {
+  if !path.exists() { return Ok(None); }
+  let raw = fs::read_to_string(path).map_err(|e| format!("读取配置失败 {:?}: {e}", path))?;
+  if raw.trim().is_empty() { return Ok(None); }
+  let value = serde_json::from_str::<serde_json::Value>(&raw)
+    .map_err(|e| format!("解析配置失败 {:?}: {e}", path))?;
+  Ok(Some(value))
+}
+
+fn write_json_value(path: &Path, value: &serde_json::Value) -> Result<(), String> {
+  if let Some(parent) = path.parent() {
+    fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败 {:?}: {e}", parent))?;
+  }
+  let raw = serde_json::to_string_pretty(value).map_err(|e| format!("配置序列化失败: {e}"))?;
+  fs::write(path, format!("{raw}\n")).map_err(|e| format!("写入配置失败 {:?}: {e}", path))
+}
+
+fn ensure_pi_ide_config_files(workdir: Option<&Path>, legacy_command: Option<&str>) -> Result<(PathBuf, Option<PathBuf>), String> {
+  let global_path = global_config_path()?;
+  if !global_path.exists() {
+    let fallback_command = std::env::var("PI_IDE_PI_BIN").unwrap_or_else(|_| "pi".to_string());
+    let command = legacy_command
+      .map(str::trim)
+      .filter(|s| !s.is_empty())
+      .map(ToString::to_string)
+      .unwrap_or(fallback_command);
+    write_json_value(&global_path, &default_global_config(&command))?;
+  }
+
+  let project_path = if let Some(dir) = workdir.filter(|p| p.exists() && p.is_dir()) {
+    let path = project_config_path(dir);
+    if !path.exists() {
+      write_json_value(&path, &default_project_config())?;
+    }
+    Some(path)
+  } else {
+    None
+  };
+
+  Ok((global_path, project_path))
+}
+
+fn config_command(value: Option<&serde_json::Value>) -> Option<String> {
+  value
+    .and_then(|v| v.get("pi"))
+    .and_then(|pi| pi.get("command"))
+    .and_then(|command| command.as_str())
+    .map(str::trim)
+    .filter(|command| !command.is_empty())
+    .map(ToString::to_string)
+}
+
+fn config_env(value: Option<&serde_json::Value>) -> HashMap<String, String> {
+  let mut envs = HashMap::new();
+  if let Some(map) = value
+    .and_then(|v| v.get("pi"))
+    .and_then(|pi| pi.get("env"))
+    .and_then(|env| env.as_object())
+  {
+    for (key, value) in map {
+      if let Some(text) = value.as_str() {
+        envs.insert(key.clone(), text.to_string());
+      }
+    }
+  }
+  envs
+}
+
+fn resolve_pi_launch_config(workdir: Option<&Path>, legacy_command: Option<&str>) -> Result<(String, HashMap<String, String>, serde_json::Value), String> {
+  let (global_path, project_path) = ensure_pi_ide_config_files(workdir, legacy_command)?;
+  let global_config = read_json_value(&global_path)?;
+  let project_config = match &project_path {
+    Some(path) => read_json_value(path)?,
+    None => None,
+  };
+
+  let command = config_command(project_config.as_ref())
+    .or_else(|| config_command(global_config.as_ref()))
+    .or_else(|| legacy_command.map(str::trim).filter(|s| !s.is_empty()).map(ToString::to_string))
+    .or_else(|| std::env::var("PI_IDE_PI_BIN").ok())
+    .unwrap_or_else(|| "pi".to_string());
+
+  let mut envs = config_env(global_config.as_ref());
+  envs.extend(config_env(project_config.as_ref()));
+
+  Ok((command, envs, serde_json::json!({
+    "globalConfig": global_path.to_string_lossy(),
+    "projectConfig": project_path.map(|path| path.to_string_lossy().to_string())
+  })))
+}
+
+#[tauri::command]
+fn ensure_pi_ide_config(workdir: Option<String>, legacy_command: Option<String>) -> Result<serde_json::Value, String> {
+  let workdir_path = workdir
+    .as_deref()
+    .map(str::trim)
+    .filter(|s| !s.is_empty())
+    .map(PathBuf::from);
+  let (global_path, project_path) = ensure_pi_ide_config_files(workdir_path.as_deref(), legacy_command.as_deref())?;
+  Ok(serde_json::json!({
+    "globalConfig": global_path.to_string_lossy(),
+    "projectConfig": project_path.map(|path| path.to_string_lossy().to_string())
+  }))
 }
 
 const PI_IDE_BRIDGE_EXTENSION: &str = r#"import * as fs from "node:fs";
@@ -862,27 +989,31 @@ async fn start_pi_session(app: tauri::AppHandle, session_id: String, pi_command:
     }
   }
 
-  let raw = pi_command
-    .filter(|s| !s.trim().is_empty())
-    .or_else(|| std::env::var("PI_IDE_PI_BIN").ok())
-    .unwrap_or_else(|| "pi".to_string());
+  let workdir_path = workdir
+    .as_deref()
+    .map(str::trim)
+    .filter(|s| !s.is_empty())
+    .map(PathBuf::from);
+  let (raw, config_envs, config_info) = resolve_pi_launch_config(workdir_path.as_deref(), pi_command.as_deref())?;
   let extra_args = if continue_session.unwrap_or(false) && !command_has_resume_flag(&raw) {
     vec!["--continue".to_string()]
   } else {
     vec![]
   };
-  append_debug_line(&format!("[backend] start_pi_session build command session_id={session_id} command_len={} extra_args={:?}", raw.len(), extra_args));
+  append_debug_line(&format!("[backend] start_pi_session build command session_id={session_id} command_len={} extra_args={:?} config={}", raw.len(), extra_args, config_info));
   let mut cmd = build_pi_command(&raw, &extra_args)?;
   let session_dir = session_dir(&session_id)?;
   let run_id = format!("pi-run-{}-{}", chrono::Utc::now().timestamp_millis(), session_id);
   cmd.env("PI_CODING_AGENT_SESSION_DIR", session_dir.to_string_lossy().to_string());
   cmd.env("PI_IDE_SESSION_ID", session_id.clone());
   cmd.env("PI_IDE_RUN_ID", run_id.clone());
+  for (key, value) in config_envs {
+    cmd.env(key, value);
+  }
 
-  if let Some(dir) = workdir.filter(|s| !s.trim().is_empty()) {
-    let dir_path = PathBuf::from(&dir);
+  if let Some(dir_path) = workdir_path {
     ensure_pi_ide_file_tracker(&dir_path)?;
-    cmd.cwd(dir);
+    cmd.cwd(dir_path);
   }
 
   let pty_system = native_pty_system();
@@ -1055,7 +1186,8 @@ fn get_storage_paths() -> Result<serde_json::Value, String> {
   Ok(serde_json::json!({
     "dir": storage_dir()?.to_string_lossy(),
     "history": history_path()?.to_string_lossy(),
-    "sessions": sessions_path()?.to_string_lossy()
+    "sessions": sessions_path()?.to_string_lossy(),
+    "config": global_config_path()?.to_string_lossy()
   }))
 }
 
@@ -1097,6 +1229,7 @@ fn main() {
     .plugin(tauri_plugin_clipboard_manager::init())
     .invoke_handler(tauri::generate_handler![
       get_launch_context,
+      ensure_pi_ide_config,
       append_debug_log,
       get_debug_log_path,
       open_path_in_file_manager,

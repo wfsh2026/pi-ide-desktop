@@ -113,7 +113,6 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 .view-switch { display: inline-flex; gap: 6px; padding: 3px; border: 1px solid var(--border-subtle); border-radius: 12px; background: var(--bg-panel); }
 .view-switch button { padding: 6px 9px; border-radius: 9px; border-color: transparent; background: transparent; }
 .view-switch button.primary { background: var(--bg-active); border-color: var(--border-default); }
-.pi-start-input { width: min(420px, 30vw); min-width: 220px; height: 38px; min-height: 38px; max-height: 38px; padding: 7px 9px; border-radius: 9px; resize: none; line-height: 1.35; overflow: auto; white-space: pre-wrap; }
 .terminal-wrap, .center-view-wrap { min-width: 0; min-height: 0; padding: 14px; overflow: hidden; display: flex; }
 .xterm-frame { position: relative; width: 100%; height: 100%; min-width: 0; min-height: 0; border-radius: 18px; overflow: hidden; border: 1px solid var(--border-subtle); background: var(--terminal-bg); }
 .xterm-frame.terminal-native { border-color: var(--border-strong); box-shadow: 0 0 0 2px rgba(255,255,255,.04) inset; }
