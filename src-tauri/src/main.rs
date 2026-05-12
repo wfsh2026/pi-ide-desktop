@@ -594,8 +594,12 @@ fn pi_cli_js_from_wrapper(wrapper: &PathBuf) -> Option<PathBuf> {
   cli.exists().then_some(cli)
 }
 
+fn command_has_resume_flag(raw: &str) -> bool {
+  raw.split_whitespace().any(|part| matches!(part, "--continue" | "-c" | "--resume" | "-r" | "--session" | "--fork"))
+}
+
 #[cfg(windows)]
-fn build_pi_command(raw: &str) -> Result<CommandBuilder, String> {
+fn build_pi_command(raw: &str, extra_args: &[String]) -> Result<CommandBuilder, String> {
   let raw = raw.trim();
   if raw.is_empty() {
     return Err("Pi 命令为空".to_string());
@@ -618,6 +622,7 @@ fn build_pi_command(raw: &str) -> Result<CommandBuilder, String> {
     // “不是内部或外部命令”。直接把脚本路径作为 /C 的命令参数交给
     // CommandBuilder 处理一次转义即可，含空格的用户目录也能正常启动。
     cmd.arg(script_path);
+    cmd.args(extra_args);
     if let Some(path) = windows_augmented_path() {
       cmd.env("PATH", path);
     }
@@ -640,15 +645,18 @@ fn build_pi_command(raw: &str) -> Result<CommandBuilder, String> {
       let mut cmd = CommandBuilder::new(node);
       cmd.arg(cli_js);
       cmd.args(args);
+      cmd.args(extra_args);
       cmd
     } else {
       let mut cmd = CommandBuilder::new(&resolved_program);
       cmd.args(args);
+      cmd.args(extra_args);
       cmd
     }
   } else {
     let mut cmd = CommandBuilder::new(&resolved_program);
     cmd.args(args);
+    cmd.args(extra_args);
     cmd
   };
 
@@ -660,11 +668,12 @@ fn build_pi_command(raw: &str) -> Result<CommandBuilder, String> {
 }
 
 #[cfg(not(windows))]
-fn build_pi_command(raw: &str) -> Result<CommandBuilder, String> {
+fn build_pi_command(raw: &str, extra_args: &[String]) -> Result<CommandBuilder, String> {
   let parts = shell_words::split(raw).map_err(|e| format!("Pi 命令解析失败: {e}"))?;
   let (program, args) = parts.split_first().ok_or("Pi 命令为空")?;
   let mut cmd = CommandBuilder::new(program);
   cmd.args(args);
+  cmd.args(extra_args);
   Ok(cmd)
 }
 
@@ -679,7 +688,7 @@ fn session_dir(session_id: &str) -> Result<PathBuf, String> {
 }
 
 #[tauri::command]
-async fn start_pi_session(app: tauri::AppHandle, session_id: String, pi_command: Option<String>, workdir: Option<String>) -> Result<(), String> {
+async fn start_pi_session(app: tauri::AppHandle, session_id: String, pi_command: Option<String>, workdir: Option<String>, continue_session: Option<bool>) -> Result<(), String> {
   if session_id.trim().is_empty() {
     return Err("sessionId 为空".to_string());
   }
@@ -703,7 +712,12 @@ async fn start_pi_session(app: tauri::AppHandle, session_id: String, pi_command:
     .filter(|s| !s.trim().is_empty())
     .or_else(|| std::env::var("PI_IDE_PI_BIN").ok())
     .unwrap_or_else(|| "pi".to_string());
-  let mut cmd = build_pi_command(&raw)?;
+  let extra_args = if continue_session.unwrap_or(false) && !command_has_resume_flag(&raw) {
+    vec!["--continue".to_string()]
+  } else {
+    vec![]
+  };
+  let mut cmd = build_pi_command(&raw, &extra_args)?;
   let session_dir = session_dir(&session_id)?;
   cmd.env("PI_CODING_AGENT_SESSION_DIR", session_dir.to_string_lossy().to_string());
   cmd.env("PI_IDE_SESSION_ID", session_id.clone());
