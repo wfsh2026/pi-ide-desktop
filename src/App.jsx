@@ -130,7 +130,7 @@ function relativeTime(value) {
   return `${Math.floor(days / 7)} 周`;
 }
 
-function ProjectPanel({ projects, activeProjectId, activeSessionId, onAddProject, onNewSession, onSelectSession, onToggleProject, onDeleteProject, onDeleteSession, onRenameSession, onOpenProjectInExplorer }) {
+function ProjectPanel({ projects, activeProjectId, activeSessionId, piSessionStatus, onAddProject, onNewSession, onSelectSession, onToggleProject, onDeleteProject, onDeleteSession, onRenameSession, onOpenProjectInExplorer }) {
   const [menu, setMenu] = useState(null);
   const [editing, setEditing] = useState(null);
   const [draftTitle, setDraftTitle] = useState("");
@@ -231,6 +231,7 @@ function ProjectPanel({ projects, activeProjectId, activeSessionId, onAddProject
                         />
                       ) : (
                         <>
+                          <i className={`session-state-dot ${piSessionStatus?.[session.id]?.processing ? "processing" : piSessionStatus?.[session.id]?.running ? "running" : "stopped"}`} />
                           <span>{session.title}</span>
                           <small>{relativeTime(session.updated_at || session.created_at)}</small>
                         </>
@@ -533,6 +534,7 @@ export default function App() {
   const outputBufferRef = useRef("");
   const outputIdleTimersRef = useRef({});
   const persistOutputTimerRef = useRef(null);
+  const projectsRenderTimerRef = useRef(null);
   const fileEventSeenRef = useRef(new Set());
   const projectsRef = useRef(projects);
   const activeProjectIdRef = useRef(activeProjectId);
@@ -665,6 +667,16 @@ export default function App() {
     persistOutputTimerRef.current = setTimeout(() => persistCurrentSessionOutput(), 600);
   }
 
+  function scheduleProjectsRenderAndPersist() {
+    if (!projectsRenderTimerRef.current) {
+      projectsRenderTimerRef.current = setTimeout(() => {
+        projectsRenderTimerRef.current = null;
+        setProjects(projectsRef.current);
+      }, 300);
+    }
+    schedulePersistCurrentSessionOutput();
+  }
+
   function findProjectBySessionId(sessionId) {
     return projectsRef.current.find((project) => (project.sessions || []).some((session) => session.id === sessionId));
   }
@@ -744,13 +756,9 @@ export default function App() {
     }));
     if (!changed) return;
     projectsRef.current = nextProjects;
-    setProjects(nextProjects);
     if (sessionId === activeProjectSessionIdRef.current) outputBufferRef.current += data;
     detectSessionFilesFromOutput(data, sessionId);
-    if (persistOutputTimerRef.current) clearTimeout(persistOutputTimerRef.current);
-    persistOutputTimerRef.current = setTimeout(() => {
-      localStorage.setItem(PROJECTS_STORAGE_KEY, JSON.stringify(projectsRef.current));
-    }, 600);
+    scheduleProjectsRenderAndPersist();
   }
 
   useEffect(() => {
@@ -839,6 +847,8 @@ export default function App() {
       Object.values(outputIdleTimersRef.current).forEach((timer) => clearTimeout(timer));
       outputIdleTimersRef.current = {};
       if (persistOutputTimerRef.current) clearTimeout(persistOutputTimerRef.current);
+      if (projectsRenderTimerRef.current) clearTimeout(projectsRenderTimerRef.current);
+      setProjects(projectsRef.current);
       persistCurrentSessionOutput();
       unsubs.forEach((f) => f());
     };
@@ -1059,8 +1069,7 @@ export default function App() {
               ...session,
               title: !session.user_renamed && !session.first_prompt ? title : session.title,
               first_prompt: session.first_prompt || commandText,
-              updated_at: now,
-              output: outputBufferRef.current
+              updated_at: now
             }
           : session)
       };
@@ -1111,6 +1120,19 @@ export default function App() {
     await invoke("stop_pi_session", { sessionId });
     clearSessionIdleTimer(sessionId);
     setSessionRuntimeStatus(sessionId, { running: false, processing: false, status: "Pi 已停止" });
+    persistCurrentSessionOutput();
+  }
+
+  async function stopAllPi() {
+    await invoke("stop_all_pi_sessions");
+    Object.keys(outputIdleTimersRef.current).forEach(clearSessionIdleTimer);
+    const next = {};
+    for (const sessionId of Object.keys(piSessionStatusRef.current)) {
+      next[sessionId] = { ...(piSessionStatusRef.current[sessionId] || {}), running: false, processing: false, status: "Pi 已停止" };
+    }
+    piSessionStatusRef.current = next;
+    setPiSessionStatus(next);
+    setStatus("所有 Pi 已停止");
     persistCurrentSessionOutput();
   }
 
@@ -1276,6 +1298,7 @@ export default function App() {
           projects={projects}
           activeProjectId={activeProjectId}
           activeSessionId={activeProjectSessionId}
+          piSessionStatus={piSessionStatus}
           onAddProject={() => addProject().catch((e) => setStatus(String(e)))}
           onNewSession={createProjectSession}
           onSelectSession={selectProjectSession}
@@ -1309,6 +1332,7 @@ export default function App() {
             {terminalInputEnabled ? "原生终端：开" : "原生终端：关"}
           </button>
           <button onClick={() => sendCommand('/tree').catch((e) => setStatus(String(e)))}><GitBranch size={15}/> 发送 /tree</button>
+          <button className="danger" onClick={() => stopAllPi().catch((e) => setStatus(String(e)))}>停止全部 Pi</button>
         </header>
         <div className="terminal-wrap">
           <PiTerminal
