@@ -4,6 +4,11 @@ import { listen } from "@tauri-apps/api/event";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 
+function debugLog(message, data = undefined) {
+  const suffix = data === undefined ? "" : ` ${JSON.stringify(data)}`;
+  invoke("append_debug_log", { source: "terminal", message: `${message}${suffix}` }).catch(() => {});
+}
+
 function normalizeForScrollableTerminal(data) {
   return String(data || "")
     .replace(/\x1b\[\?(?:1000|1002|1003|1005|1006|1015|1007|2004)[hl]/g, "")
@@ -20,11 +25,13 @@ export default function PiTerminal({ activeSessionId, clearSignal, replaySignal 
   const pendingRef = useRef("");
   const writingRef = useRef(false);
   const resizeFrameRef = useRef(null);
+  const isReplayingRef = useRef(false);
   const activeSessionIdRef = useRef(activeSessionId);
   const terminalInputEnabledRef = useRef(terminalInputEnabled);
   const onTerminalInputRef = useRef(onTerminalInput);
 
   useEffect(() => {
+    debugLog("activeSession changed", { from: activeSessionIdRef.current, to: activeSessionId });
     activeSessionIdRef.current = activeSessionId;
   }, [activeSessionId]);
 
@@ -47,6 +54,7 @@ export default function PiTerminal({ activeSessionId, clearSignal, replaySignal 
     const thumb = thumbRef.current;
     if (!host || !scrollbar || !thumb) return;
 
+    debugLog("PiTerminal mount", { activeSessionId: activeSessionIdRef.current });
     const term = new Terminal({
       cursorBlink: true,
       convertEol: false,
@@ -173,6 +181,10 @@ export default function PiTerminal({ activeSessionId, clearSignal, replaySignal 
     };
 
     const dataDisposable = term.onData((data) => {
+      if (isReplayingRef.current) {
+        debugLog("terminal onData ignored during replay", { activeSessionId: activeSessionIdRef.current, bytes: data.length });
+        return;
+      }
       if (!terminalInputEnabledRef.current) return;
       const sessionId = activeSessionIdRef.current;
       if (!sessionId) return;
@@ -191,8 +203,9 @@ export default function PiTerminal({ activeSessionId, clearSignal, replaySignal 
     listen("pi-output", (event) => {
       const payload = event.payload || {};
       const sessionId = payload.sessionId || payload.session_id;
-      if (!sessionId || sessionId !== activeSessionIdRef.current) return;
       const data = String(payload.data ?? "");
+      debugLog("terminal pi-output", { sessionId, active: activeSessionIdRef.current, bytes: data.length, accepted: Boolean(sessionId && sessionId === activeSessionIdRef.current) });
+      if (!sessionId || sessionId !== activeSessionIdRef.current) return;
       writeTerminal(data);
     }).then((unsubscribe) => {
       unsubscribeOutput = unsubscribe;
@@ -207,6 +220,7 @@ export default function PiTerminal({ activeSessionId, clearSignal, replaySignal 
       dataDisposable.dispose();
       scrollDisposable.dispose();
       window.removeEventListener("resize", fitAndNotify);
+      debugLog("PiTerminal unmount", { activeSessionId: activeSessionIdRef.current });
       unsubscribeOutput?.();
       term.dispose();
       terminalRef.current = null;
@@ -229,9 +243,18 @@ export default function PiTerminal({ activeSessionId, clearSignal, replaySignal 
     if (!term) return;
     pendingRef.current = "";
     writingRef.current = false;
+    debugLog("terminal replay", { activeSessionId: activeSessionIdRef.current, replaySignal, bytes: String(replayContent || "").length });
+    isReplayingRef.current = true;
+    term.options.disableStdin = true;
+    const finishReplay = () => {
+      isReplayingRef.current = false;
+      term.options.disableStdin = !terminalInputEnabledRef.current;
+      debugLog("terminal replay end", { activeSessionId: activeSessionIdRef.current, replaySignal });
+    };
     term.reset();
     const content = normalizeForScrollableTerminal(replayContent);
-    if (content) term.write(content);
+    if (content) term.write(content, finishReplay);
+    else finishReplay();
   }, [replaySignal, replayContent]);
 
   return (

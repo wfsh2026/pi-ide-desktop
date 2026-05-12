@@ -62,6 +62,26 @@ fn storage_dir() -> Result<PathBuf, String> {
 
 fn history_path() -> Result<PathBuf, String> { Ok(storage_dir()?.join("history.json")) }
 fn sessions_path() -> Result<PathBuf, String> { Ok(storage_dir()?.join("sessions.json")) }
+fn debug_log_path() -> Result<PathBuf, String> { Ok(storage_dir()?.join("debug.log")) }
+
+fn append_debug_line(line: &str) {
+  if let Ok(path) = debug_log_path() {
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+      let _ = writeln!(file, "{} {}", now_iso(), line);
+    }
+  }
+}
+
+#[tauri::command]
+fn append_debug_log(source: String, message: String) -> Result<(), String> {
+  append_debug_line(&format!("[{source}] {message}"));
+  Ok(())
+}
+
+#[tauri::command]
+fn get_debug_log_path() -> Result<String, String> {
+  Ok(debug_log_path()?.to_string_lossy().to_string())
+}
 
 const PI_IDE_FILE_TRACKER_EXTENSION: &str = r#"import * as fs from "node:fs";
 import * as path from "node:path";
@@ -689,6 +709,7 @@ fn session_dir(session_id: &str) -> Result<PathBuf, String> {
 
 #[tauri::command]
 async fn start_pi_session(app: tauri::AppHandle, session_id: String, pi_command: Option<String>, workdir: Option<String>, continue_session: Option<bool>) -> Result<(), String> {
+  append_debug_line(&format!("[backend] start_pi_session request session_id={session_id} workdir={:?} continue={:?}", workdir, continue_session));
   if session_id.trim().is_empty() {
     return Err("sessionId 为空".to_string());
   }
@@ -698,10 +719,16 @@ async fn start_pi_session(app: tauri::AppHandle, session_id: String, pi_command:
     if let Some(runtime) = sessions.get_mut(&session_id) {
       match runtime.child.try_wait() {
         Ok(None) => {
+          append_debug_line(&format!("[backend] start_pi_session already_running session_id={session_id}"));
           let _ = app.emit("pi-status", serde_json::json!({ "sessionId": session_id, "status": "Pi 已经在运行" }));
           return Ok(());
         }
-        Ok(Some(_)) | Err(_) => {
+        Ok(Some(status)) => {
+          append_debug_line(&format!("[backend] start_pi_session stale_child session_id={session_id} status={status}"));
+          sessions.remove(&session_id);
+        }
+        Err(e) => {
+          append_debug_line(&format!("[backend] start_pi_session try_wait_error session_id={session_id} error={e}"));
           sessions.remove(&session_id);
         }
       }
@@ -717,6 +744,7 @@ async fn start_pi_session(app: tauri::AppHandle, session_id: String, pi_command:
   } else {
     vec![]
   };
+  append_debug_line(&format!("[backend] start_pi_session build command session_id={session_id} command_len={} extra_args={:?}", raw.len(), extra_args));
   let mut cmd = build_pi_command(&raw, &extra_args)?;
   let session_dir = session_dir(&session_id)?;
   cmd.env("PI_CODING_AGENT_SESSION_DIR", session_dir.to_string_lossy().to_string());
@@ -742,6 +770,7 @@ async fn start_pi_session(app: tauri::AppHandle, session_id: String, pi_command:
   let writer = pair.master.take_writer().map_err(|e| format!("无法打开 Pi PTY writer: {e}"))?;
 
   PI_SESSIONS.lock().await.insert(session_id.clone(), PiRuntime { writer, child, master: pair.master });
+  append_debug_line(&format!("[backend] start_pi_session spawned session_id={session_id}"));
   let _ = app.emit("pi-status", serde_json::json!({ "sessionId": session_id, "status": format!("Pi 已启动：{}", raw) }));
 
   let out_app = app.clone();
@@ -752,6 +781,7 @@ async fn start_pi_session(app: tauri::AppHandle, session_id: String, pi_command:
       match reader.read(&mut buf) {
         Ok(0) => break,
         Ok(n) => {
+          append_debug_line(&format!("[backend] pi-output session_id={} bytes={}", out_session_id, n));
           let _ = out_app.emit("pi-output", serde_json::json!({
             "sessionId": out_session_id,
             "data": String::from_utf8_lossy(&buf[..n]).to_string()
@@ -773,6 +803,7 @@ async fn start_pi_session(app: tauri::AppHandle, session_id: String, pi_command:
 
 #[tauri::command]
 async fn send_pi_input(session_id: String, input: String) -> Result<(), String> {
+  append_debug_line(&format!("[backend] send_pi_input session_id={session_id} bytes={}", input.len()));
   let mut sessions = PI_SESSIONS.lock().await;
   let runtime = sessions.get_mut(&session_id).ok_or("当前会话 Pi 尚未启动")?;
   runtime.writer.write_all(input.as_bytes()).map_err(|e| format!("写入 Pi PTY 失败: {e}"))?;
@@ -780,6 +811,7 @@ async fn send_pi_input(session_id: String, input: String) -> Result<(), String> 
 }
 
 async fn stop_pi_session_runtime(session_id: &str) {
+  append_debug_line(&format!("[backend] stop_pi_session_runtime session_id={session_id}"));
   let mut sessions = PI_SESSIONS.lock().await;
   if let Some(mut runtime) = sessions.remove(session_id) {
     let _ = runtime.child.kill();
@@ -787,6 +819,7 @@ async fn stop_pi_session_runtime(session_id: &str) {
 }
 
 async fn stop_all_pi_sessions_runtime() {
+  append_debug_line("[backend] stop_all_pi_sessions_runtime");
   let mut sessions = PI_SESSIONS.lock().await;
   for (_, mut runtime) in sessions.drain() {
     let _ = runtime.child.kill();
@@ -911,6 +944,8 @@ fn main() {
     .plugin(tauri_plugin_clipboard_manager::init())
     .invoke_handler(tauri::generate_handler![
       get_launch_context,
+      append_debug_log,
+      get_debug_log_path,
       open_path_in_file_manager,
       open_file_with_default_app,
       get_directory_tree,
