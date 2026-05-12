@@ -3,8 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
-import { writeText as writeClipboardText } from "@tauri-apps/plugin-clipboard-manager";
-import { Play, Square, Send, FolderOpen, GitBranch, Copy, Plus, Folder, X, File, FolderTree, ChevronDown, ChevronRight, RefreshCw } from "lucide-react";
+import { Play, Square, Send, FolderOpen, Plus, Folder, X, File, FolderTree, ChevronDown, ChevronRight, RefreshCw } from "lucide-react";
 import PiTerminal from "./components/PiTerminal.jsx";
 
 const DEFAULT_COMMAND = "pi";
@@ -1145,16 +1144,6 @@ export default function App() {
     setClearTerminalSignal((value) => value + 1);
   }
 
-  async function copyOutput() {
-    const output = activeProjectSession?.output || outputBufferRef.current;
-    if (!output) {
-      setStatus("当前没有可复制的输出");
-      return;
-    }
-    await writeClipboardText(output);
-    setStatus("终端输出已复制到剪贴板");
-  }
-
   async function stopCurrentRun() {
     const sessionId = activeProjectSessionIdRef.current;
     if (!sessionId) return;
@@ -1326,12 +1315,9 @@ export default function App() {
               {piStarted ? <Square size={15}/> : <Play size={15}/>} {piStarted ? "停止 Pi" : "启动 Pi"}
             </button>
           )}
-          <button onClick={clearTerminal}>清空输出</button>
-          <button onClick={() => copyOutput().catch((e) => setStatus(`复制失败：${e}`))}><Copy size={15}/> 复制输出</button>
           <button className={terminalInputEnabled ? "primary" : ""} onClick={() => setTerminalInputEnabled((value) => !value)}>
             {terminalInputEnabled ? "原生终端：开" : "原生终端：关"}
           </button>
-          <button onClick={() => sendCommand('/tree').catch((e) => setStatus(String(e)))}><GitBranch size={15}/> 发送 /tree</button>
           <button className="danger" onClick={() => stopAllPi().catch((e) => setStatus(String(e)))}>停止全部 Pi</button>
         </header>
         <div className="terminal-wrap">
