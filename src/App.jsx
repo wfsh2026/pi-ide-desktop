@@ -535,7 +535,7 @@ export default function App() {
   const processingRef = useRef(false);
   const outputIdleTimerRef = useRef(null);
   const persistOutputTimerRef = useRef(null);
-  const fileDetectionContextRef = useRef({ outputLines: 0, referenceLines: 0 });
+  const fileEventSeenRef = useRef(new Set());
   const projectsRef = useRef(projects);
   const activeProjectIdRef = useRef(activeProjectId);
   const activeProjectSessionIdRef = useRef(activeProjectSessionId);
@@ -654,39 +654,54 @@ export default function App() {
     if (changed) saveProjects(nextProjects);
   }
 
-  function detectSessionFilesFromOutput(data) {
-    const projectPath = activeProject?.path || workdir;
-    const clean = stripAnsiForDetection(data);
+  function applyPiIdeFileEvents(events) {
+    if (!Array.isArray(events) || events.length === 0) return;
     const referenced = [];
     const output = [];
-    const referenceKeywords = /(read|reading|cat |open file|读取|查看|参考|打开文件|读取文件|已读取)/i;
-    const outputKeywords = /(write|wrote|written|created|saved|edited|modified|replaced|output|生成|写入|创建|保存|修改|编辑|替换|输出|创建文本文件|已创建)/i;
-    const context = fileDetectionContextRef.current;
 
-    for (const line of clean.split(/\r?\n/)) {
-      const hasOutputKeyword = outputKeywords.test(line);
-      const hasReferenceKeyword = referenceKeywords.test(line);
-      if (hasOutputKeyword) context.outputLines = 4;
-      if (hasReferenceKeyword) context.referenceLines = 3;
+    for (const event of events) {
+      if (!event?.path || !event?.kind) continue;
+      const key = event.id || `${event.kind}:${event.source}:${event.toolCallId}:${event.path}:${event.timestamp}`;
+      if (fileEventSeenRef.current.has(key)) continue;
+      fileEventSeenRef.current.add(key);
 
-      const paths = extractFilePathsFromText(line, projectPath, hasOutputKeyword || context.outputLines > 0 || hasReferenceKeyword || context.referenceLines > 0);
-      if (paths.length > 0) {
-        if (hasOutputKeyword || context.outputLines > 0) {
-          output.push(...fileRecordsFromPaths(paths, "ai-output"));
-          context.outputLines = 0;
-        } else if (hasReferenceKeyword || context.referenceLines > 0) {
-          referenced.push(...fileRecordsFromPaths(paths, "ai-reference"));
-          context.referenceLines = 0;
-        }
-      }
+      const record = {
+        id: makeId("session-file"),
+        name: event.name || basename(event.path),
+        path: event.path,
+        source: event.source || "pi-tool",
+        confidence: event.confidence || "precise",
+        tool_name: event.toolName,
+        tool_call_id: event.toolCallId,
+        created_at: event.timestamp || new Date().toISOString()
+      };
 
-      if (!hasOutputKeyword && context.outputLines > 0) context.outputLines -= 1;
-      if (!hasReferenceKeyword && context.referenceLines > 0) context.referenceLines -= 1;
+      if (event.kind === "reference") referenced.push(record);
+      else if (event.kind === "output") output.push(record);
     }
 
     if (referenced.length) addSessionFiles("referenced", referenced);
     if (output.length) addSessionFiles("output", output);
   }
+
+  useEffect(() => {
+    if (!piStarted || !activeProject?.path) return;
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const events = await invoke("load_pi_ide_file_events", { workdir: activeProject.path });
+        if (!cancelled) applyPiIdeFileEvents(events);
+      } catch (_) {
+        // 文件跟踪扩展尚未生成或 Pi 未写入事件时忽略。
+      }
+    };
+    poll();
+    const timer = window.setInterval(poll, 1200);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [piStarted, activeProject?.path]);
 
   useEffect(() => {
     setCommand("");
@@ -980,6 +995,7 @@ export default function App() {
     localStorage.setItem("piCommand", commandText);
     if (runWorkdir) localStorage.setItem("workdir", runWorkdir);
     recordSessionStart(commandText, runWorkdir);
+    fileEventSeenRef.current = new Set();
     await invoke("start_pi", { piCommand: commandText, workdir: runWorkdir });
     setPiStarted(true);
   }
@@ -995,7 +1011,6 @@ export default function App() {
 
   function rememberOutput(data) {
     outputBufferRef.current += data;
-    detectSessionFilesFromOutput(data);
     schedulePersistCurrentSessionOutput();
   }
 
