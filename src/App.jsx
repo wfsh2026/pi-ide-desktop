@@ -620,10 +620,12 @@ export default function App() {
 
   function setSessionRuntimeStatus(sessionId, patch) {
     if (!sessionId) return;
-    setPiSessionStatus((prev) => ({
-      ...prev,
-      [sessionId]: { ...(prev[sessionId] || {}), ...patch }
-    }));
+    const next = {
+      ...piSessionStatusRef.current,
+      [sessionId]: { ...(piSessionStatusRef.current[sessionId] || {}), ...patch }
+    };
+    piSessionStatusRef.current = next;
+    setPiSessionStatus(next);
   }
 
   function clearSessionIdleTimer(sessionId) {
@@ -789,8 +791,8 @@ export default function App() {
       const projectPath = context?.projectPath || context?.project_path;
       if (projectPath) {
         const commandText = localStorage.getItem("piCommand") || DEFAULT_COMMAND;
-        createOrSelectProjectForPath(projectPath, { createNewSession: true, sessionTitle: `右键启动：${commandText}`, startCommand: commandText });
-        startPi({ piCommand: commandText, workdir: projectPath }).catch((e) => setStatus(String(e)));
+        const created = createOrSelectProjectForPath(projectPath, { createNewSession: true, sessionTitle: `右键启动：${commandText}`, startCommand: commandText });
+        startPi({ sessionId: created.sessionId, piCommand: commandText, workdir: projectPath }).catch((e) => setStatus(String(e)));
       }
     }).catch(() => {});
 
@@ -803,10 +805,12 @@ export default function App() {
       if (sessionId) {
         const running = text.includes("Pi 已启动") || text.includes("Pi 已经在运行");
         const stopped = text.includes("Pi 已停止");
-        setPiSessionStatus((prev) => ({
-          ...prev,
-          [sessionId]: { ...(prev[sessionId] || {}), running: stopped ? false : running || prev[sessionId]?.running || false, processing: stopped ? false : prev[sessionId]?.processing || false, status: text }
-        }));
+        const previous = piSessionStatusRef.current[sessionId] || {};
+        setSessionRuntimeStatus(sessionId, {
+          running: stopped ? false : running || previous.running || false,
+          processing: stopped ? false : previous.processing || false,
+          status: text
+        });
       }
     }).then((f) => unsubs.push(f));
     listen("pi-output", (event) => {
@@ -1035,6 +1039,7 @@ export default function App() {
     setTerminalReplayContent(session.output || "");
     setCommand(session.draft_command || "");
     setAttachments(session.attachments || []);
+    setPiCommand(session.start_command || localStorage.getItem("piCommand") || DEFAULT_COMMAND);
     setTerminalReplaySignal((value) => value + 1);
   }
 
@@ -1094,21 +1099,18 @@ export default function App() {
     localStorage.setItem("piCommand", commandText);
     if (runWorkdir) localStorage.setItem("workdir", runWorkdir);
     recordSessionStart(commandText, runWorkdir);
-    fileEventSeenRef.current = new Set();
-    const sessionId = activeProjectSessionIdRef.current;
+    const sessionId = options.sessionId || activeProjectSessionIdRef.current;
     if (!sessionId) throw new Error("请先选择或创建一个会话");
     await invoke("start_pi_session", { sessionId, piCommand: commandText, workdir: runWorkdir });
-    setPiSessionStatus((prev) => ({ ...prev, [sessionId]: { running: true, status: "Pi 已启动" } }));
+    setSessionRuntimeStatus(sessionId, { running: true, processing: false, status: "Pi 已启动" });
   }
 
   async function stopPi() {
     const sessionId = activeProjectSessionIdRef.current;
     if (!sessionId) return;
     await invoke("stop_pi_session", { sessionId });
-    setPiSessionStatus((prev) => ({ ...prev, [sessionId]: { running: false, status: "Pi 已停止" } }));
-    if (outputIdleTimerRef.current) clearTimeout(outputIdleTimerRef.current);
-    processingRef.current = false;
-    setIsProcessing(false);
+    clearSessionIdleTimer(sessionId);
+    setSessionRuntimeStatus(sessionId, { running: false, processing: false, status: "Pi 已停止" });
     persistCurrentSessionOutput();
   }
 
@@ -1135,9 +1137,8 @@ export default function App() {
     const sessionId = activeProjectSessionIdRef.current;
     if (!sessionId) return;
     await invoke("send_pi_input", { sessionId, input: "\x03" });
-    if (outputIdleTimerRef.current) clearTimeout(outputIdleTimerRef.current);
-    processingRef.current = false;
-    setIsProcessing(false);
+    clearSessionIdleTimer(sessionId);
+    setSessionRuntimeStatus(sessionId, { processing: false });
   }
 
   async function sendCommand(raw = command) {
@@ -1149,21 +1150,18 @@ export default function App() {
     const attachmentFiles = fileRecordsFromPaths(attachments.map((item) => item.path), "user-attachment");
     const inputPathFiles = fileRecordsFromPaths(extractFilePathsFromText(userText, projectPath), "user-input");
     addSessionFiles("referenced", [...attachmentFiles, ...inputPathFiles]);
-    processingRef.current = true;
-    setIsProcessing(true);
+    const sessionId = activeProjectSessionIdRef.current;
+    if (!sessionId) throw new Error("请先选择或创建一个会话");
+    setSessionRuntimeStatus(sessionId, { processing: true });
     try {
-      const sessionId = activeProjectSessionIdRef.current;
-      if (!sessionId) throw new Error("请先选择或创建一个会话");
       await invoke("send_pi_input", { sessionId, input: `${finalPrompt}\r` });
     } catch (error) {
-      processingRef.current = false;
-      setIsProcessing(false);
+      setSessionRuntimeStatus(sessionId, { processing: false });
       throw error;
     }
     updateActiveProjectSessionAfterCommand(titleSource);
     setCommand("");
     setAttachments([]);
-    const sessionId = activeProjectSessionIdRef.current;
     if (sessionId) {
       updateSessionById(sessionId, (session) => ({ ...session, draft_command: "", attachments: [], updated_at: new Date().toISOString() }));
     }
@@ -1260,7 +1258,7 @@ export default function App() {
     const nextValue = e.target.value;
     setCommand(nextValue);
     const sessionId = activeProjectSessionIdRef.current;
-    if (sessionId) updateSessionById(sessionId, (session) => ({ ...session, draft_command: nextValue, updated_at: new Date().toISOString() }), { persist: false });
+    if (sessionId) updateSessionById(sessionId, (session) => ({ ...session, draft_command: nextValue, updated_at: new Date().toISOString() }));
   }
 
   function handleKeyDown(e) {
@@ -1293,7 +1291,12 @@ export default function App() {
         <header className="topbar">
           <span className="status">{status}</span>
           {!openedFromContext && !piStarted && (
-            <textarea className="pi-start-input" value={piCommand} onChange={(e) => setPiCommand(e.target.value)} placeholder={'Pi 启动命令，例如：\npi --thinking high\n\n或：\n@echo off\nset DEEPSEEK_API_KEY=sk-XXXXXXXXXXXX\npi -nc %*'} />
+            <textarea className="pi-start-input" value={piCommand} onChange={(e) => {
+              const value = e.target.value;
+              setPiCommand(value);
+              const sessionId = activeProjectSessionIdRef.current;
+              if (sessionId) updateSessionById(sessionId, (session) => ({ ...session, start_command: value, updated_at: new Date().toISOString() }));
+            }} placeholder={'Pi 启动命令，例如：\npi --thinking high\n\n或：\n@echo off\nset DEEPSEEK_API_KEY=sk-XXXXXXXXXXXX\npi -nc %*'} />
           )}
           {!openedFromContext && (
             <button className={piStarted ? "" : "primary"} onClick={() => (piStarted ? stopPi() : startPi()).catch((e) => setStatus(String(e)))}>
