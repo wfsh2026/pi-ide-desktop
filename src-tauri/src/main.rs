@@ -57,6 +57,134 @@ fn storage_dir() -> Result<PathBuf, String> {
 fn history_path() -> Result<PathBuf, String> { Ok(storage_dir()?.join("history.json")) }
 fn sessions_path() -> Result<PathBuf, String> { Ok(storage_dir()?.join("sessions.json")) }
 
+const PI_IDE_FILE_TRACKER_EXTENSION: &str = r#"import * as fs from "node:fs";
+import * as path from "node:path";
+import { execFileSync } from "node:child_process";
+
+const bashBefore = new Map();
+
+function eventFile(cwd) {
+  return path.join(cwd, ".pi", "pi-ide-file-events.jsonl");
+}
+
+function normalizeFilePath(cwd, raw) {
+  if (!raw) return "";
+  const value = String(raw).trim();
+  if (!value) return "";
+  return path.normalize(path.isAbsolute(value) ? value : path.join(cwd, value));
+}
+
+function sessionInfo(ctx) {
+  const manager = ctx?.sessionManager;
+  return {
+    sessionId: manager?.getSessionId?.(),
+    sessionFile: manager?.getSessionFile?.(),
+    leafId: manager?.getLeafId?.(),
+  };
+}
+
+function appendEvent(ctx, payload) {
+  const cwd = ctx?.cwd || process.cwd();
+  const file = eventFile(cwd);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.appendFileSync(file, JSON.stringify({
+    schema: 1,
+    timestamp: new Date().toISOString(),
+    cwd,
+    ...sessionInfo(ctx),
+    ...payload,
+  }) + "\n", "utf8");
+}
+
+function recordPath(ctx, kind, source, toolCallId, toolName, rawPath, extra = {}) {
+  const normalized = normalizeFilePath(ctx?.cwd || process.cwd(), rawPath);
+  if (!normalized) return;
+  appendEvent(ctx, {
+    id: `${kind}:${source}:${toolCallId || "manual"}:${normalized}`,
+    kind,
+    source,
+    toolCallId,
+    toolName,
+    path: normalized,
+    name: path.basename(normalized),
+    ...extra,
+  });
+}
+
+function gitChangedFiles(cwd) {
+  try {
+    const output = execFileSync("git", ["status", "--porcelain", "-z"], {
+      cwd,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return new Set(output.split("\0").filter(Boolean).map((entry) => normalizeFilePath(cwd, entry.slice(3))));
+  } catch {
+    return new Set();
+  }
+}
+
+export default function(pi) {
+  pi.on("session_start", async (_event, ctx) => {
+    appendEvent(ctx, { kind: "session", source: "session-start" });
+  });
+
+  pi.on("tool_call", async (event, ctx) => {
+    if (event.toolName === "bash") {
+      bashBefore.set(event.toolCallId, gitChangedFiles(ctx.cwd));
+    }
+  });
+
+  pi.on("tool_result", async (event, ctx) => {
+    if (event.isError) return;
+    const input = event.input || {};
+    const toolName = event.toolName;
+    const toolCallId = event.toolCallId;
+
+    if (toolName === "read") {
+      recordPath(ctx, "reference", "pi-tool-read", toolCallId, toolName, input.path);
+      return;
+    }
+
+    if (toolName === "write") {
+      recordPath(ctx, "output", "pi-tool-write", toolCallId, toolName, input.path);
+      return;
+    }
+
+    if (toolName === "edit") {
+      recordPath(ctx, "output", "pi-tool-edit", toolCallId, toolName, input.path);
+      return;
+    }
+
+    if (toolName === "bash") {
+      const before = bashBefore.get(toolCallId) || new Set();
+      bashBefore.delete(toolCallId);
+      const after = gitChangedFiles(ctx.cwd);
+      for (const filePath of after) {
+        if (!before.has(filePath)) {
+          recordPath(ctx, "output", "pi-tool-bash-diff", toolCallId, toolName, filePath, { confidence: "detected" });
+        }
+      }
+    }
+  });
+}
+"#;
+
+fn pi_ide_file_events_path(workdir: &Path) -> PathBuf {
+  workdir.join(".pi").join("pi-ide-file-events.jsonl")
+}
+
+fn ensure_pi_ide_file_tracker(workdir: &Path) -> Result<(), String> {
+  let pi_dir = workdir.join(".pi");
+  let extensions_dir = pi_dir.join("extensions");
+  fs::create_dir_all(&extensions_dir).map_err(|e| format!("创建 Pi IDE 扩展目录失败: {e}"))?;
+  fs::write(extensions_dir.join("pi-ide-file-tracker.ts"), PI_IDE_FILE_TRACKER_EXTENSION)
+    .map_err(|e| format!("写入 Pi IDE 文件跟踪扩展失败: {e}"))?;
+  fs::write(pi_ide_file_events_path(workdir), "")
+    .map_err(|e| format!("初始化 Pi IDE 文件事件失败: {e}"))?;
+  Ok(())
+}
+
 fn now_iso() -> String { chrono::Utc::now().to_rfc3339() }
 
 fn read_json_array<T: for<'de> Deserialize<'de>>(path: PathBuf) -> Result<Vec<T>, String> {
@@ -557,6 +685,8 @@ async fn start_pi(app: tauri::AppHandle, pi_command: Option<String>, workdir: Op
   let mut cmd = build_pi_command(&raw)?;
 
   if let Some(dir) = workdir.filter(|s| !s.trim().is_empty()) {
+    let dir_path = PathBuf::from(&dir);
+    ensure_pi_ide_file_tracker(&dir_path)?;
     cmd.cwd(dir);
   }
 
@@ -701,6 +831,26 @@ fn get_storage_paths() -> Result<serde_json::Value, String> {
   }))
 }
 
+#[tauri::command]
+fn load_pi_ide_file_events(workdir: String) -> Result<Vec<serde_json::Value>, String> {
+  let dir = PathBuf::from(workdir.trim());
+  if !dir.exists() || !dir.is_dir() {
+    return Ok(vec![]);
+  }
+  let path = pi_ide_file_events_path(&dir);
+  if !path.exists() {
+    return Ok(vec![]);
+  }
+  let raw = fs::read_to_string(&path).map_err(|e| format!("读取 Pi IDE 文件事件失败 {:?}: {e}", path))?;
+  let mut events = Vec::new();
+  for line in raw.lines().filter(|line| !line.trim().is_empty()) {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+      events.push(value);
+    }
+  }
+  Ok(events)
+}
+
 fn main() {
   tauri::Builder::default()
     .plugin(tauri_plugin_dialog::init())
@@ -721,7 +871,8 @@ fn main() {
       append_session_node,
       delete_session_node,
       clear_sessions,
-      get_storage_paths
+      get_storage_paths,
+      load_pi_ide_file_events
     ])
     .setup(|app| {
       if let Err(e) = register_windows_context_menu() {
