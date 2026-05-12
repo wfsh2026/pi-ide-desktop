@@ -84,6 +84,7 @@ function sessionInfo(ctx) {
     sessionId: manager?.getSessionId?.(),
     sessionFile: manager?.getSessionFile?.(),
     leafId: manager?.getLeafId?.(),
+    ideSessionId: process.env.PI_IDE_SESSION_ID,
   };
 }
 
@@ -701,6 +702,7 @@ async fn start_pi_session(app: tauri::AppHandle, session_id: String, pi_command:
   let mut cmd = build_pi_command(&raw)?;
   let session_dir = session_dir(&session_id)?;
   cmd.env("PI_CODING_AGENT_SESSION_DIR", session_dir.to_string_lossy().to_string());
+  cmd.env("PI_IDE_SESSION_ID", session_id.clone());
 
   if let Some(dir) = workdir.filter(|s| !s.trim().is_empty()) {
     let dir_path = PathBuf::from(&dir);
