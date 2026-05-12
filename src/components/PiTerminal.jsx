@@ -11,7 +11,7 @@ function normalizeForScrollableTerminal(data) {
     .replace(/\x1b\[3J/g, "");
 }
 
-export default function PiTerminal({ clearSignal, replaySignal = 0, replayContent = "", onOutput, terminalInputEnabled = true }) {
+export default function PiTerminal({ activeSessionId, clearSignal, replaySignal = 0, replayContent = "", terminalInputEnabled = true }) {
   const hostRef = useRef(null);
   const scrollbarRef = useRef(null);
   const thumbRef = useRef(null);
@@ -20,12 +20,12 @@ export default function PiTerminal({ clearSignal, replaySignal = 0, replayConten
   const pendingRef = useRef("");
   const writingRef = useRef(false);
   const resizeFrameRef = useRef(null);
-  const onOutputRef = useRef(onOutput);
+  const activeSessionIdRef = useRef(activeSessionId);
   const terminalInputEnabledRef = useRef(terminalInputEnabled);
 
   useEffect(() => {
-    onOutputRef.current = onOutput;
-  }, [onOutput]);
+    activeSessionIdRef.current = activeSessionId;
+  }, [activeSessionId]);
 
   useEffect(() => {
     terminalInputEnabledRef.current = terminalInputEnabled;
@@ -107,7 +107,8 @@ export default function PiTerminal({ clearSignal, replaySignal = 0, replayConten
           // 右侧为自定义滚动条和边距预留约 4 列，真正缩小终端列数。
           const safeCols = Math.max(1, term.cols - 4);
           if (safeCols !== term.cols) term.resize(safeCols, term.rows);
-          invoke("resize_pi", { cols: term.cols, rows: term.rows }).catch(() => {});
+          const sessionId = activeSessionIdRef.current;
+          if (sessionId) invoke("resize_pi", { sessionId, cols: term.cols, rows: term.rows }).catch(() => {});
           updateCustomScrollbar();
         } catch (_) {
           // 布局尚未稳定时忽略，下一次 ResizeObserver 会重试。
@@ -168,7 +169,9 @@ export default function PiTerminal({ clearSignal, replaySignal = 0, replayConten
 
     const dataDisposable = term.onData((data) => {
       if (!terminalInputEnabledRef.current) return;
-      invoke("send_pi_input", { input: data }).catch(() => {});
+      const sessionId = activeSessionIdRef.current;
+      if (!sessionId) return;
+      invoke("send_pi_input", { sessionId, input: data }).catch(() => {});
     });
     const resizeObserver = new ResizeObserver(fitAndNotify);
     resizeObserver.observe(host);
@@ -180,8 +183,10 @@ export default function PiTerminal({ clearSignal, replaySignal = 0, replayConten
 
     let unsubscribeOutput = null;
     listen("pi-output", (event) => {
-      const data = String(event.payload ?? "");
-      onOutputRef.current?.(data);
+      const payload = event.payload || {};
+      const sessionId = payload.sessionId || payload.session_id;
+      if (!sessionId || sessionId !== activeSessionIdRef.current) return;
+      const data = String(payload.data ?? "");
       writeTerminal(data);
     }).then((unsubscribe) => {
       unsubscribeOutput = unsubscribe;

@@ -1,13 +1,17 @@
 use once_cell::sync::Lazy;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
-use std::{env, fs, io::{Read, Write}, path::{Path, PathBuf}, process::Command};
+use std::{collections::HashMap, env, fs, io::{Read, Write}, path::{Path, PathBuf}, process::Command};
 use tauri::Emitter;
 use tokio::sync::Mutex;
 
-static PI_WRITER: Lazy<Mutex<Option<Box<dyn Write + Send>>>> = Lazy::new(|| Mutex::new(None));
-static PI_CHILD: Lazy<Mutex<Option<Box<dyn Child + Send + Sync>>>> = Lazy::new(|| Mutex::new(None));
-static PI_MASTER: Lazy<Mutex<Option<Box<dyn MasterPty + Send>>>> = Lazy::new(|| Mutex::new(None));
+struct PiRuntime {
+  writer: Box<dyn Write + Send>,
+  child: Box<dyn Child + Send + Sync>,
+  master: Box<dyn MasterPty + Send>,
+}
+
+static PI_SESSIONS: Lazy<Mutex<HashMap<String, PiRuntime>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct HistoryItem {
@@ -659,20 +663,32 @@ fn build_pi_command(raw: &str) -> Result<CommandBuilder, String> {
   Ok(cmd)
 }
 
+fn session_dir(session_id: &str) -> Result<PathBuf, String> {
+  let safe = session_id
+    .chars()
+    .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+    .collect::<String>();
+  let dir = storage_dir()?.join("pi-sessions").join(safe);
+  fs::create_dir_all(&dir).map_err(|e| format!("创建 Pi 会话目录失败: {e}"))?;
+  Ok(dir)
+}
+
 #[tauri::command]
-async fn start_pi(app: tauri::AppHandle, pi_command: Option<String>, workdir: Option<String>) -> Result<(), String> {
+async fn start_pi_session(app: tauri::AppHandle, session_id: String, pi_command: Option<String>, workdir: Option<String>) -> Result<(), String> {
+  if session_id.trim().is_empty() {
+    return Err("sessionId 为空".to_string());
+  }
+
   {
-    let mut child_guard = PI_CHILD.lock().await;
-    if let Some(child) = child_guard.as_mut() {
-      match child.try_wait() {
+    let mut sessions = PI_SESSIONS.lock().await;
+    if let Some(runtime) = sessions.get_mut(&session_id) {
+      match runtime.child.try_wait() {
         Ok(None) => {
-          let _ = app.emit("pi-status", "Pi 已经在运行");
+          let _ = app.emit("pi-status", serde_json::json!({ "sessionId": session_id, "status": "Pi 已经在运行" }));
           return Ok(());
         }
         Ok(Some(_)) | Err(_) => {
-          *child_guard = None;
-          *PI_WRITER.lock().await = None;
-          *PI_MASTER.lock().await = None;
+          sessions.remove(&session_id);
         }
       }
     }
@@ -683,6 +699,8 @@ async fn start_pi(app: tauri::AppHandle, pi_command: Option<String>, workdir: Op
     .or_else(|| std::env::var("PI_IDE_PI_BIN").ok())
     .unwrap_or_else(|| "pi".to_string());
   let mut cmd = build_pi_command(&raw)?;
+  let session_dir = session_dir(&session_id)?;
+  cmd.env("PI_CODING_AGENT_SESSION_DIR", session_dir.to_string_lossy().to_string());
 
   if let Some(dir) = workdir.filter(|s| !s.trim().is_empty()) {
     let dir_path = PathBuf::from(&dir);
@@ -703,22 +721,27 @@ async fn start_pi(app: tauri::AppHandle, pi_command: Option<String>, workdir: Op
   let mut reader = pair.master.try_clone_reader().map_err(|e| format!("无法打开 Pi PTY reader: {e}"))?;
   let writer = pair.master.take_writer().map_err(|e| format!("无法打开 Pi PTY writer: {e}"))?;
 
-  *PI_WRITER.lock().await = Some(writer);
-  *PI_CHILD.lock().await = Some(child);
-  *PI_MASTER.lock().await = Some(pair.master);
-  let _ = app.emit("pi-status", format!("Pi 已启动：{}", raw));
+  PI_SESSIONS.lock().await.insert(session_id.clone(), PiRuntime { writer, child, master: pair.master });
+  let _ = app.emit("pi-status", serde_json::json!({ "sessionId": session_id, "status": format!("Pi 已启动：{}", raw) }));
 
   let out_app = app.clone();
+  let out_session_id = session_id.clone();
   std::thread::spawn(move || {
     let mut buf = vec![0u8; 8192];
     loop {
       match reader.read(&mut buf) {
         Ok(0) => break,
         Ok(n) => {
-          let _ = out_app.emit("pi-output", String::from_utf8_lossy(&buf[..n]).to_string());
+          let _ = out_app.emit("pi-output", serde_json::json!({
+            "sessionId": out_session_id,
+            "data": String::from_utf8_lossy(&buf[..n]).to_string()
+          }));
         }
         Err(e) => {
-          let _ = out_app.emit("pi-output", format!("\r\n[PTY 读取错误] {e}\r\n"));
+          let _ = out_app.emit("pi-output", serde_json::json!({
+            "sessionId": out_session_id,
+            "data": format!("\r\n[PTY 读取错误] {e}\r\n")
+          }));
           break;
         }
       }
@@ -729,35 +752,46 @@ async fn start_pi(app: tauri::AppHandle, pi_command: Option<String>, workdir: Op
 }
 
 #[tauri::command]
-async fn send_pi_input(input: String) -> Result<(), String> {
-  let mut guard = PI_WRITER.lock().await;
-  let writer = guard.as_mut().ok_or("Pi 尚未启动")?;
-  writer.write_all(input.as_bytes()).map_err(|e| format!("写入 Pi PTY 失败: {e}"))?;
-  writer.flush().map_err(|e| format!("刷新 Pi PTY 失败: {e}"))
+async fn send_pi_input(session_id: String, input: String) -> Result<(), String> {
+  let mut sessions = PI_SESSIONS.lock().await;
+  let runtime = sessions.get_mut(&session_id).ok_or("当前会话 Pi 尚未启动")?;
+  runtime.writer.write_all(input.as_bytes()).map_err(|e| format!("写入 Pi PTY 失败: {e}"))?;
+  runtime.writer.flush().map_err(|e| format!("刷新 Pi PTY 失败: {e}"))
 }
 
-async fn stop_pi_runtime() {
-  *PI_WRITER.lock().await = None;
-  *PI_MASTER.lock().await = None;
-  let mut guard = PI_CHILD.lock().await;
-  if let Some(child) = guard.as_mut() {
-    let _ = child.kill();
+async fn stop_pi_session_runtime(session_id: &str) {
+  let mut sessions = PI_SESSIONS.lock().await;
+  if let Some(mut runtime) = sessions.remove(session_id) {
+    let _ = runtime.child.kill();
   }
-  *guard = None;
+}
+
+async fn stop_all_pi_sessions_runtime() {
+  let mut sessions = PI_SESSIONS.lock().await;
+  for (_, mut runtime) in sessions.drain() {
+    let _ = runtime.child.kill();
+  }
 }
 
 #[tauri::command]
-async fn stop_pi(app: tauri::AppHandle) -> Result<(), String> {
-  stop_pi_runtime().await;
-  let _ = app.emit("pi-status", "Pi 已停止");
+async fn stop_pi_session(app: tauri::AppHandle, session_id: String) -> Result<(), String> {
+  stop_pi_session_runtime(&session_id).await;
+  let _ = app.emit("pi-status", serde_json::json!({ "sessionId": session_id, "status": "Pi 已停止" }));
   Ok(())
 }
 
 #[tauri::command]
-async fn resize_pi(cols: u16, rows: u16) -> Result<(), String> {
-  let guard = PI_MASTER.lock().await;
-  if let Some(master) = guard.as_ref() {
-    master.resize(PtySize {
+async fn stop_all_pi_sessions(app: tauri::AppHandle) -> Result<(), String> {
+  stop_all_pi_sessions_runtime().await;
+  let _ = app.emit("pi-status", serde_json::json!({ "sessionId": serde_json::Value::Null, "status": "所有 Pi 已停止" }));
+  Ok(())
+}
+
+#[tauri::command]
+async fn resize_pi(session_id: String, cols: u16, rows: u16) -> Result<(), String> {
+  let sessions = PI_SESSIONS.lock().await;
+  if let Some(runtime) = sessions.get(&session_id) {
+    runtime.master.resize(PtySize {
       rows: rows.max(1),
       cols: cols.max(1),
       pixel_width: 0,
@@ -860,9 +894,10 @@ fn main() {
       open_path_in_file_manager,
       open_file_with_default_app,
       get_directory_tree,
-      start_pi,
+      start_pi_session,
       send_pi_input,
-      stop_pi,
+      stop_pi_session,
+      stop_all_pi_sessions,
       resize_pi,
       load_history,
       append_history,
@@ -887,7 +922,7 @@ fn main() {
     .on_window_event(|_window, event| {
       if let tauri::WindowEvent::CloseRequested { .. } = event {
         tauri::async_runtime::block_on(async {
-          stop_pi_runtime().await;
+          stop_all_pi_sessions_runtime().await;
         });
       }
     })

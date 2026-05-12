@@ -512,7 +512,7 @@ export default function App() {
   const [terminalReplayContent, setTerminalReplayContent] = useState("");
   const [isProcessing, setIsProcessing] = useState(false);
   const [terminalInputEnabled, setTerminalInputEnabled] = useState(true);
-  const [piStarted, setPiStarted] = useState(false);
+  const [piSessionStatus, setPiSessionStatus] = useState({});
   const [openedFromContext, setOpenedFromContext] = useState(false);
   const [command, setCommand] = useState("");
   const [attachments, setAttachments] = useState([]);
@@ -550,6 +550,7 @@ export default function App() {
     () => activeProject?.sessions?.find((s) => s.id === activeProjectSessionId),
     [activeProject, activeProjectSessionId]
   );
+  const piStarted = Boolean(activeProjectSessionId && piSessionStatus[activeProjectSessionId]?.running);
 
   const loadDirectoryTree = useCallback(async (projectPath = activeProject?.path) => {
     if (!projectPath) {
@@ -629,9 +630,14 @@ export default function App() {
     persistOutputTimerRef.current = setTimeout(() => persistCurrentSessionOutput(), 600);
   }
 
-  function addSessionFiles(kind, files) {
-    const projectId = activeProjectIdRef.current;
-    const sessionId = activeProjectSessionIdRef.current;
+  function findProjectBySessionId(sessionId) {
+    return projectsRef.current.find((project) => (project.sessions || []).some((session) => session.id === sessionId));
+  }
+
+  function addSessionFiles(kind, files, targetSessionId = activeProjectSessionIdRef.current) {
+    const sessionId = targetSessionId;
+    const project = findProjectBySessionId(sessionId);
+    const projectId = project?.id;
     if (!projectId || !sessionId || !Array.isArray(files) || files.length === 0) return;
     const field = kind === "output" ? "output_files" : "referenced_files";
     const now = new Date().toISOString();
@@ -684,6 +690,28 @@ export default function App() {
     if (output.length) addSessionFiles("output", output);
   }
 
+  function appendOutputToSession(sessionId, data) {
+    if (!sessionId || !data) return;
+    const now = new Date().toISOString();
+    let changed = false;
+    const nextProjects = projectsRef.current.map((project) => ({
+      ...project,
+      sessions: (project.sessions || []).map((session) => {
+        if (session.id !== sessionId) return session;
+        changed = true;
+        return { ...session, output: `${session.output || ""}${data}`, updated_at: now };
+      })
+    }));
+    if (!changed) return;
+    projectsRef.current = nextProjects;
+    setProjects(nextProjects);
+    if (sessionId === activeProjectSessionIdRef.current) outputBufferRef.current += data;
+    if (persistOutputTimerRef.current) clearTimeout(persistOutputTimerRef.current);
+    persistOutputTimerRef.current = setTimeout(() => {
+      localStorage.setItem(PROJECTS_STORAGE_KEY, JSON.stringify(projectsRef.current));
+    }, 600);
+  }
+
   useEffect(() => {
     if (!piStarted || !activeProject?.path) return;
     let cancelled = false;
@@ -723,16 +751,26 @@ export default function App() {
 
     const unsubs = [];
     listen("pi-status", (event) => {
-      const text = String(event.payload);
+      const payload = event.payload;
+      const sessionId = payload && typeof payload === "object" ? (payload.sessionId || payload.session_id) : null;
+      const text = payload && typeof payload === "object" ? String(payload.status || "") : String(payload || "");
       setStatus(text);
-      if (text.includes("Pi 已启动") || text.includes("Pi 已经在运行")) setPiStarted(true);
-      if (text.includes("Pi 已停止")) setPiStarted(false);
+      if (sessionId) {
+        setPiSessionStatus((prev) => ({
+          ...prev,
+          [sessionId]: { running: text.includes("Pi 已启动") || text.includes("Pi 已经在运行"), status: text }
+        }));
+      }
     }).then((f) => unsubs.push(f));
     listen("pi-output", (event) => {
-      if (!processingRef.current) return;
-      const payload = String(event.payload ?? "");
+      const payload = event.payload || {};
+      const sessionId = payload.sessionId || payload.session_id;
+      const data = String(payload.data ?? "");
+      if (sessionId && data) appendOutputToSession(sessionId, data);
+
+      if (sessionId !== activeProjectSessionIdRef.current || !processingRef.current) return;
       if (outputIdleTimerRef.current) clearTimeout(outputIdleTimerRef.current);
-      if (payload.includes("[PTY 读取错误]") || payload.includes("Pi 已停止")) {
+      if (data.includes("[PTY 读取错误]") || data.includes("Pi 已停止")) {
         processingRef.current = false;
         setIsProcessing(false);
         return;
@@ -996,13 +1034,17 @@ export default function App() {
     if (runWorkdir) localStorage.setItem("workdir", runWorkdir);
     recordSessionStart(commandText, runWorkdir);
     fileEventSeenRef.current = new Set();
-    await invoke("start_pi", { piCommand: commandText, workdir: runWorkdir });
-    setPiStarted(true);
+    const sessionId = activeProjectSessionIdRef.current;
+    if (!sessionId) throw new Error("请先选择或创建一个会话");
+    await invoke("start_pi_session", { sessionId, piCommand: commandText, workdir: runWorkdir });
+    setPiSessionStatus((prev) => ({ ...prev, [sessionId]: { running: true, status: "Pi 已启动" } }));
   }
 
   async function stopPi() {
-    await invoke("stop_pi");
-    setPiStarted(false);
+    const sessionId = activeProjectSessionIdRef.current;
+    if (!sessionId) return;
+    await invoke("stop_pi_session", { sessionId });
+    setPiSessionStatus((prev) => ({ ...prev, [sessionId]: { running: false, status: "Pi 已停止" } }));
     if (outputIdleTimerRef.current) clearTimeout(outputIdleTimerRef.current);
     processingRef.current = false;
     setIsProcessing(false);
@@ -1031,7 +1073,9 @@ export default function App() {
   }
 
   async function stopCurrentRun() {
-    await invoke("send_pi_input", { input: "\x03" });
+    const sessionId = activeProjectSessionIdRef.current;
+    if (!sessionId) return;
+    await invoke("send_pi_input", { sessionId, input: "\x03" });
     if (outputIdleTimerRef.current) clearTimeout(outputIdleTimerRef.current);
     processingRef.current = false;
     setIsProcessing(false);
@@ -1049,7 +1093,9 @@ export default function App() {
     processingRef.current = true;
     setIsProcessing(true);
     try {
-      await invoke("send_pi_input", { input: `${finalPrompt}\r` });
+      const sessionId = activeProjectSessionIdRef.current;
+      if (!sessionId) throw new Error("请先选择或创建一个会话");
+      await invoke("send_pi_input", { sessionId, input: `${finalPrompt}\r` });
     } catch (error) {
       processingRef.current = false;
       setIsProcessing(false);
@@ -1189,10 +1235,10 @@ export default function App() {
         </header>
         <div className="terminal-wrap">
           <PiTerminal
+            activeSessionId={activeProjectSessionId}
             clearSignal={clearTerminalSignal}
             replaySignal={terminalReplaySignal}
             replayContent={terminalReplayContent}
-            onOutput={rememberOutput}
             terminalInputEnabled={terminalInputEnabled}
           />
         </div>
