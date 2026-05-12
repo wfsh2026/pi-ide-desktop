@@ -50,6 +50,10 @@ function titleFromPromptAndAttachments(text, attachments) {
   return "新 Pi 会话";
 }
 
+function shouldContinueSession(session) {
+  return Boolean(session?.first_prompt || String(session?.output || "").trim());
+}
+
 function stripAnsiForDetection(text) {
   return String(text || "").replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, "");
 }
@@ -741,6 +745,28 @@ export default function App() {
     }
   }
 
+  function detectSessionFilesFromOutput(data, targetSessionId = activeProjectSessionIdRef.current) {
+    const { project } = getSessionById(targetSessionId);
+    const projectPath = project?.path || activeProject?.path || workdir;
+    const clean = stripAnsiForDetection(data);
+    const referenced = [];
+    const output = [];
+    const referenceKeywords = /(read|reading|cat |open file|读取|查看|参考|打开文件|读取文件|已读取)/i;
+    const outputKeywords = /(write|wrote|written|created|saved|edited|modified|replaced|output|生成|写入|创建|保存|修改|编辑|替换|输出|创建文本文件|已创建)/i;
+
+    for (const line of clean.split(/\r?\n/)) {
+      const hasOutputKeyword = outputKeywords.test(line);
+      const hasReferenceKeyword = referenceKeywords.test(line);
+      const paths = extractFilePathsFromText(line, projectPath, hasOutputKeyword || hasReferenceKeyword);
+      if (paths.length === 0) continue;
+      if (hasOutputKeyword) output.push(...fileRecordsFromPaths(paths, "ai-output-detected"));
+      else if (hasReferenceKeyword) referenced.push(...fileRecordsFromPaths(paths, "ai-reference-detected"));
+    }
+
+    if (referenced.length) addSessionFiles("referenced", referenced, targetSessionId);
+    if (output.length) addSessionFiles("output", output, targetSessionId);
+  }
+
   function appendOutputToSession(sessionId, data) {
     if (!sessionId || !data) return;
     const now = new Date().toISOString();
@@ -950,7 +976,18 @@ export default function App() {
     setActiveProjectSessionId(sessionId);
     outputBufferRef.current = "";
     setTerminalReplayContent("");
+    setCommand("");
+    setAttachments([]);
     setTerminalReplaySignal((value) => value + 1);
+    const project = nextProjects.find((item) => item.id === projectId);
+    return { projectId, sessionId, path: project?.path };
+  }
+
+  async function createAndStartProjectSession(projectId) {
+    const created = createProjectSession(projectId);
+    if (created?.path) {
+      await startPi({ sessionId: created.sessionId, workdir: created.path, piCommand, continueSession: false });
+    }
   }
 
   function toggleProject(projectId) {
@@ -1038,7 +1075,7 @@ export default function App() {
     persistCurrentSessionOutput();
     const project = projectsRef.current.find((p) => p.id === projectId);
     const session = project?.sessions?.find((s) => s.id === sessionId);
-    if (!project || !session) return;
+    if (!project || !session) return null;
     activeProjectIdRef.current = projectId;
     activeProjectSessionIdRef.current = sessionId;
     setActiveProjectId(projectId);
@@ -1050,6 +1087,19 @@ export default function App() {
     setAttachments(session.attachments || []);
     setPiCommand(session.start_command || localStorage.getItem("piCommand") || DEFAULT_COMMAND);
     setTerminalReplaySignal((value) => value + 1);
+    return { project, session };
+  }
+
+  async function activateProjectSession(projectId, sessionId) {
+    const selected = selectProjectSession(projectId, sessionId);
+    if (!selected) return;
+    if (piSessionStatusRef.current[sessionId]?.running) return;
+    await startPi({
+      sessionId,
+      workdir: selected.project.path,
+      piCommand: selected.session.start_command || piCommand || DEFAULT_COMMAND,
+      continueSession: shouldContinueSession(selected.session)
+    });
   }
 
   function updateActiveProjectSessionAfterCommand(commandText) {
@@ -1096,21 +1146,48 @@ export default function App() {
   async function startPi(options = {}) {
     const commandText = options.piCommand || piCommand || DEFAULT_COMMAND;
     let runWorkdir = options.workdir || activeProject?.path || workdir;
+    let sessionId = options.sessionId || activeProjectSessionIdRef.current;
+
     if (!runWorkdir) {
       const selected = await open({ directory: true, multiple: false, title: "选择项目目录" });
       if (typeof selected !== "string") return;
       runWorkdir = selected;
-      createOrSelectProjectForPath(selected, { createNewSession: true, sessionTitle: `启动：${commandText}`, startCommand: commandText });
-    } else if (!activeProjectIdRef.current || !activeProjectSessionIdRef.current) {
-      createOrSelectProjectForPath(runWorkdir, { createNewSession: true, sessionTitle: `启动：${commandText}`, startCommand: commandText });
+      const created = createOrSelectProjectForPath(selected, { createNewSession: true, sessionTitle: `启动：${commandText}`, startCommand: commandText });
+      sessionId = created.sessionId;
+    } else if (!sessionId) {
+      const created = createOrSelectProjectForPath(runWorkdir, { createNewSession: true, sessionTitle: `启动：${commandText}`, startCommand: commandText });
+      sessionId = created.sessionId;
     }
+
+    if (!sessionId) throw new Error("请先选择或创建一个会话");
+    const { session } = getSessionById(sessionId);
+    const continueSession = options.continueSession ?? shouldContinueSession(session);
+
     localStorage.setItem("piCommand", commandText);
     if (runWorkdir) localStorage.setItem("workdir", runWorkdir);
     recordSessionStart(commandText, runWorkdir);
-    const sessionId = options.sessionId || activeProjectSessionIdRef.current;
-    if (!sessionId) throw new Error("请先选择或创建一个会话");
-    await invoke("start_pi_session", { sessionId, piCommand: commandText, workdir: runWorkdir });
+    await invoke("start_pi_session", { sessionId, piCommand: commandText, workdir: runWorkdir, continueSession });
     setSessionRuntimeStatus(sessionId, { running: true, processing: false, status: "Pi 已启动" });
+  }
+
+  async function ensureActivePiRunning() {
+    const sessionId = activeProjectSessionIdRef.current;
+    if (!sessionId) throw new Error("请先选择或创建一个会话");
+    if (piSessionStatusRef.current[sessionId]?.running) return;
+    const { project, session } = getSessionById(sessionId);
+    if (!project || !session) throw new Error("当前会话不存在");
+    await startPi({
+      sessionId,
+      piCommand: session.start_command || piCommand || DEFAULT_COMMAND,
+      workdir: project.path,
+      continueSession: shouldContinueSession(session)
+    });
+  }
+
+  async function handleTerminalInput(data) {
+    await ensureActivePiRunning();
+    const sessionId = activeProjectSessionIdRef.current;
+    await invoke("send_pi_input", { sessionId, input: data });
   }
 
   async function stopPi() {
@@ -1161,6 +1238,7 @@ export default function App() {
     const attachmentFiles = fileRecordsFromPaths(attachments.map((item) => item.path), "user-attachment");
     const inputPathFiles = fileRecordsFromPaths(extractFilePathsFromText(userText, projectPath), "user-input");
     addSessionFiles("referenced", [...attachmentFiles, ...inputPathFiles]);
+    await ensureActivePiRunning();
     const sessionId = activeProjectSessionIdRef.current;
     if (!sessionId) throw new Error("请先选择或创建一个会话");
     setSessionRuntimeStatus(sessionId, { processing: true });
@@ -1289,8 +1367,8 @@ export default function App() {
           activeSessionId={activeProjectSessionId}
           piSessionStatus={piSessionStatus}
           onAddProject={() => addProject().catch((e) => setStatus(String(e)))}
-          onNewSession={createProjectSession}
-          onSelectSession={selectProjectSession}
+          onNewSession={(projectId) => createAndStartProjectSession(projectId).catch((e) => setStatus(String(e)))}
+          onSelectSession={(projectId, sessionId) => activateProjectSession(projectId, sessionId).catch((e) => setStatus(String(e)))}
           onToggleProject={toggleProject}
           onDeleteProject={deleteProject}
           onDeleteSession={deleteProjectSession}
@@ -1327,6 +1405,7 @@ export default function App() {
             replaySignal={terminalReplaySignal}
             replayContent={terminalReplayContent}
             terminalInputEnabled={terminalInputEnabled}
+            onTerminalInput={handleTerminalInput}
           />
         </div>
         <div className="composer" onDragOver={handleComposerDragOver} onDrop={handleDrop}>
