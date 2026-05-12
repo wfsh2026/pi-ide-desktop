@@ -112,6 +112,14 @@ function fileRecordsFromPaths(paths, source) {
   }));
 }
 
+function formatModelInfo(model) {
+  if (!model) return "";
+  const name = String(model.name || model.id || model.model || "").trim();
+  const provider = String(model.provider || "").trim();
+  if (!name && !provider) return "";
+  return provider ? `${name} via ${provider}` : name;
+}
+
 function normalizeCenterView(value) {
   return value === "terminal" ? "terminal" : "session";
 }
@@ -678,6 +686,10 @@ export default function App() {
   const piStarted = Boolean(activeProjectSessionId && piSessionStatus[activeProjectSessionId]?.running);
   const piStarting = Boolean(activeProjectSessionId && piSessionStatus[activeProjectSessionId]?.starting);
   const isProcessing = Boolean(activeProjectSessionId && piSessionStatus[activeProjectSessionId]?.processing);
+  const activeModelLabel = useMemo(
+    () => formatModelInfo(piSessionStatus[activeProjectSessionId]?.model || activeProjectSession?.current_model),
+    [activeProjectSessionId, activeProjectSession?.current_model, piSessionStatus]
+  );
 
   useEffect(() => {
     localStorage.setItem(CENTER_VIEW_STORAGE_KEY, centerView);
@@ -1578,9 +1590,19 @@ export default function App() {
 
   function insertText(text) {
     const el = inputRef.current;
-    if (!el) { setCommand((prev) => `${prev}${text}`); return; }
+    if (!el) {
+      setCommand((prev) => {
+        const nextValue = `${prev}${text}`;
+        const sessionId = activeProjectSessionIdRef.current;
+        if (sessionId) updateSessionById(sessionId, (session) => ({ ...session, draft_command: nextValue, updated_at: new Date().toISOString() }));
+        return nextValue;
+      });
+      return;
+    }
     const { nextValue, nextCursor } = insertAtCursor(el, text);
     setCommand(nextValue);
+    const sessionId = activeProjectSessionIdRef.current;
+    if (sessionId) updateSessionById(sessionId, (session) => ({ ...session, draft_command: nextValue, updated_at: new Date().toISOString() }));
     requestAnimationFrame(() => {
       el.focus();
       el.setSelectionRange(nextCursor, nextCursor);
@@ -1623,8 +1645,11 @@ export default function App() {
   }
 
   function handleKeyDown(e) {
-    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
-      e.preventDefault();
+    if (e.key !== "Enter" || e.nativeEvent?.isComposing) return;
+    e.preventDefault();
+    if (e.ctrlKey || e.metaKey) {
+      insertText("\n");
+    } else {
       handleComposerAction();
     }
   }
@@ -1721,7 +1746,7 @@ export default function App() {
             placeholder={'输入 Pi 指令或自然语言任务。例如：帮我分析这个文件 "/path/to/file"'}
           />
           <div className="composer-actions">
-            <span>当前项目：{activeProject?.name || "未选择"} / 会话：{activeProjectSession?.title || "未选择"}</span>
+            <span>当前项目：{activeProject?.name || "未选择"} / 当前模型：{activeModelLabel || "未获取"} / 会话：{activeProjectSession?.title || "未选择"}</span>
             <button className={isProcessing ? "danger" : "primary"} onClick={handleComposerAction}>{isProcessing ? <Square size={16}/> : <Send size={16}/>} {isProcessing ? "停止" : "发送"}</button>
           </div>
         </div>
