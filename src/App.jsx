@@ -51,6 +51,61 @@ function titleFromPromptAndAttachments(text, attachments) {
   return "新 Pi 会话";
 }
 
+function stripAnsiForDetection(text) {
+  return String(text || "").replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, "");
+}
+
+function normalizeDetectedPath(rawPath, projectPath = "") {
+  let path = String(rawPath || "").trim().replace(/^[-*•]\s*/, "").replace(/^['\"]|['\"]$/g, "");
+  path = path.replace(/[),.;，。；：:]+$/g, "");
+  if (!path) return "";
+  if (/^[a-z]+:\/\//i.test(path)) return "";
+  const absolute = /^[A-Za-z]:[\\/]/.test(path) || path.startsWith("/") || path.startsWith("\\\\");
+  if (!absolute && projectPath) {
+    const sep = projectPath.includes("\\") ? "\\" : "/";
+    path = `${projectPath.replace(/[\\/]$/, "")}${sep}${path.replace(/^[\\/]/, "")}`;
+  }
+  return path;
+}
+
+function extractFilePathsFromText(text, projectPath = "", allowExtensionless = false) {
+  const clean = stripAnsiForDetection(text);
+  const found = new Set();
+  const patterns = [
+    /"([^"\r\n]+\.[A-Za-z0-9]{1,12})"/g,
+    /'([^'\r\n]+\.[A-Za-z0-9]{1,12})'/g,
+    /[A-Za-z]:[\\/][^\r\n"'<>|]+?\.[A-Za-z0-9]{1,12}/g,
+    /(?:\.{1,2}[\\/])?[\w\u4e00-\u9fa5 .@()\-]+(?:[\\/][\w\u4e00-\u9fa5 .@()\-]+)+\.[A-Za-z0-9]{1,12}/g
+  ];
+
+  if (allowExtensionless) {
+    patterns.push(
+      /"([A-Za-z]:[\\/][^"\r\n<>|]+)"/g,
+      /'([A-Za-z]:[\\/][^'\r\n<>|]+)'/g,
+      /^[ \t]*([A-Za-z]:[\\/][^\r\n"'<>|]+)[ \t]*$/gm,
+      /[：:]\s*([A-Za-z]:[\\/][^\r\n"'<>|]+)/g
+    );
+  }
+
+  for (const pattern of patterns) {
+    for (const match of clean.matchAll(pattern)) {
+      const value = normalizeDetectedPath(match[1] || match[0], projectPath);
+      if (value) found.add(value);
+    }
+  }
+  return [...found];
+}
+
+function fileRecordsFromPaths(paths, source) {
+  return [...new Set(paths.filter(Boolean).map(String))].map((path) => ({
+    id: makeId("session-file"),
+    name: basename(path),
+    path,
+    source,
+    created_at: new Date().toISOString()
+  }));
+}
+
 function loadProjects() {
   try {
     const raw = localStorage.getItem(PROJECTS_STORAGE_KEY);
@@ -206,9 +261,57 @@ function ProjectPanel({ projects, activeProjectId, activeSessionId, onAddProject
   );
 }
 
-function DirectoryTreeNodeView({ node, depth = 0, expandedPaths, onToggleDirectory, onOpenFile }) {
+function isDirectoryNode(node) {
+  return Boolean(node?.is_dir ?? node?.isDir);
+}
+
+function nodeMatchesDirectorySearch(node, query) {
+  const keyword = String(query || "").trim().toLowerCase();
+  if (!keyword) return true;
+  return [node?.name, node?.path].some((value) => String(value || "").toLowerCase().includes(keyword));
+}
+
+function filterDirectoryTreeNode(node, query) {
+  const keyword = String(query || "").trim().toLowerCase();
+  if (!node) return { node: null, matchCount: 0 };
+  if (!keyword) return { node, matchCount: 0 };
+
+  let matchCount = 0;
+  function walk(current) {
+    const children = Array.isArray(current.children) ? current.children : [];
+    const filteredChildren = children.map(walk).filter(Boolean);
+    const selfMatch = nodeMatchesDirectorySearch(current, keyword);
+    if (!selfMatch && filteredChildren.length === 0) return null;
+    if (selfMatch && !current.omitted) matchCount += 1;
+    return { ...current, children: filteredChildren };
+  }
+
+  return { node: walk(node), matchCount };
+}
+
+function collectDirectorySearchExpandedPaths(node) {
+  const paths = new Set();
+  function walk(current) {
+    if (!current) return;
+    if (isDirectoryNode(current)) paths.add(current.path);
+    (current.children || []).forEach(walk);
+  }
+  walk(node);
+  return paths;
+}
+
+function HighlightText({ text, query }) {
+  const value = String(text || "");
+  const keyword = String(query || "").trim();
+  if (!keyword) return value;
+  const index = value.toLowerCase().indexOf(keyword.toLowerCase());
+  if (index < 0) return value;
+  return <>{value.slice(0, index)}<mark>{value.slice(index, index + keyword.length)}</mark>{value.slice(index + keyword.length)}</>;
+}
+
+function DirectoryTreeNodeView({ node, depth = 0, expandedPaths, searchText = "", onToggleDirectory, onOpenFile }) {
   if (!node) return null;
-  const isDir = Boolean(node.is_dir ?? node.isDir);
+  const isDir = isDirectoryNode(node);
   const children = Array.isArray(node.children) ? node.children : [];
   const expanded = expandedPaths.has(node.path);
   const canExpand = isDir && !node.omitted && children.length > 0;
@@ -242,7 +345,7 @@ function DirectoryTreeNodeView({ node, depth = 0, expandedPaths, onToggleDirecto
       >
         <span className="directory-tree-toggle">{isDir ? (canExpand ? (expanded ? "▾" : "▸") : "•") : ""}</span>
         {isDir ? <Folder size={14}/> : <File size={14}/>}
-        <span className="directory-tree-name">{node.name}{isDir ? "/" : ""}</span>
+        <span className="directory-tree-name"><HighlightText text={node.name} query={searchText}/>{isDir ? "/" : ""}</span>
         {node.omitted && <em>已省略</em>}
       </div>
       {isDir && expanded && children.map((child) => (
@@ -251,6 +354,7 @@ function DirectoryTreeNodeView({ node, depth = 0, expandedPaths, onToggleDirecto
           node={child}
           depth={depth + 1}
           expandedPaths={expandedPaths}
+          searchText={searchText}
           onToggleDirectory={onToggleDirectory}
           onOpenFile={onOpenFile}
         />
@@ -259,20 +363,58 @@ function DirectoryTreeNodeView({ node, depth = 0, expandedPaths, onToggleDirecto
   );
 }
 
+function SessionFilesSection({ title, files, emptyText, onOpenFile, onOpenDirectory }) {
+  return (
+    <div className="session-files-section">
+      <h4>{title}</h4>
+      {(!files || files.length === 0) && <div className="session-files-empty">{emptyText}</div>}
+      {(files || []).map((file) => (
+        <button
+          key={`${file.path}-${file.source}`}
+          className="session-file-item"
+          title={`${file.path}\n左键打开文件，右键打开所在目录`}
+          onClick={() => onOpenFile(file)}
+          onContextMenu={(event) => {
+            event.preventDefault();
+            onOpenDirectory(file);
+          }}
+        >
+          <File size={14}/>
+          <span>{file.name || basename(file.path)}</span>
+          <small>{file.source || ""}</small>
+        </button>
+      ))}
+    </div>
+  );
+}
+
 function RightToolPanel({
   activeProject,
+  activeSession,
   toolListCollapsed,
   directoryTreeOpen,
+  sessionFilesOpen,
   directoryTree,
   directoryTreeLoading,
   directoryTreeError,
   expandedDirectoryPaths,
+  directoryTreeSearch,
+  onDirectoryTreeSearchChange,
   onToggleToolList,
   onToggleDirectoryTree,
+  onToggleSessionFiles,
   onRefreshDirectoryTree,
   onToggleDirectoryNode,
-  onOpenDirectoryFile
+  onOpenDirectoryFile,
+  onOpenSessionFile,
+  onOpenSessionFileDirectory
 }) {
+  const searchText = String(directoryTreeSearch || "");
+  const filteredTree = filterDirectoryTreeNode(directoryTree?.tree, searchText);
+  const effectiveExpandedPaths = searchText.trim()
+    ? collectDirectorySearchExpandedPaths(filteredTree.node)
+    : expandedDirectoryPaths;
+
   return (
     <section className="panel tool-panel">
       <div className="panel-title-row tool-panel-title">
@@ -286,8 +428,33 @@ function RightToolPanel({
           <button className={directoryTreeOpen ? "primary" : ""} onClick={onToggleDirectoryTree}>
             <FolderTree size={15}/> 目录树
           </button>
+          <button className={sessionFilesOpen ? "primary" : ""} onClick={onToggleSessionFiles}>
+            <File size={15}/> 会话文件
+          </button>
         </div>
       )}
+      {sessionFilesOpen && <div className="tool-content session-files-card">
+        <div className="directory-tree-header">
+          <div>
+            <strong>当前会话文件</strong>
+            <small>{activeSession?.title || "未选择会话"}</small>
+          </div>
+        </div>
+        <SessionFilesSection
+          title="AI 参考文件"
+          files={activeSession?.referenced_files || []}
+          emptyText="暂无参考文件。拖入文件、输入路径或 AI 读取文件后会显示。"
+          onOpenFile={onOpenSessionFile}
+          onOpenDirectory={onOpenSessionFileDirectory}
+        />
+        <SessionFilesSection
+          title="AI 输出文件"
+          files={activeSession?.output_files || []}
+          emptyText="暂无输出文件。AI 写入/修改文件后会自动识别。"
+          onOpenFile={onOpenSessionFile}
+          onOpenDirectory={onOpenSessionFileDirectory}
+        />
+      </div>}
       {directoryTreeOpen && (
         <div className="tool-content directory-tree-card">
           <div className="directory-tree-header">
@@ -299,17 +466,35 @@ function RightToolPanel({
               <RefreshCw size={14}/>
             </button>
           </div>
+          <div className="directory-tree-search">
+            <div className="directory-tree-search-row">
+              <input
+                value={searchText}
+                onChange={(event) => onDirectoryTreeSearchChange(event.target.value)}
+                placeholder="搜索文件或目录..."
+                disabled={!directoryTree?.tree || directoryTreeLoading}
+              />
+              {searchText && <button type="button" onClick={() => onDirectoryTreeSearchChange("")}>清空</button>}
+            </div>
+            <div className="directory-tree-search-meta">
+              {searchText.trim() ? `找到 ${filteredTree.matchCount} 项` : "输入关键词可按文件名或路径快速过滤"}
+            </div>
+          </div>
           {directoryTreeLoading && <div className="empty">正在读取目录树…</div>}
           {!directoryTreeLoading && directoryTreeError && <div className="empty danger-text">{directoryTreeError}</div>}
-          {!directoryTreeLoading && !directoryTreeError && directoryTree?.tree && (
+          {!directoryTreeLoading && !directoryTreeError && directoryTree?.tree && filteredTree.node && (
             <div className="directory-tree-output" role="tree">
               <DirectoryTreeNodeView
-                node={directoryTree.tree}
-                expandedPaths={expandedDirectoryPaths}
+                node={filteredTree.node}
+                expandedPaths={effectiveExpandedPaths}
+                searchText={searchText}
                 onToggleDirectory={onToggleDirectoryNode}
                 onOpenFile={onOpenDirectoryFile}
               />
             </div>
+          )}
+          {!directoryTreeLoading && !directoryTreeError && directoryTree?.tree && !filteredTree.node && (
+            <div className="empty">未找到匹配文件或目录</div>
           )}
           {!directoryTreeLoading && !directoryTreeError && directoryTree?.truncated && (
             <div className="directory-tree-note">目录较大，已限制展示深度和条目数。文件可双击打开，也可拖入下方会话框。</div>
@@ -333,8 +518,10 @@ export default function App() {
   const [attachments, setAttachments] = useState([]);
   const [toolListCollapsed, setToolListCollapsed] = useState(false);
   const [directoryTreeOpen, setDirectoryTreeOpen] = useState(false);
+  const [sessionFilesOpen, setSessionFilesOpen] = useState(false);
   const [directoryTree, setDirectoryTree] = useState(null);
   const [expandedDirectoryPaths, setExpandedDirectoryPaths] = useState(() => new Set());
+  const [directoryTreeSearch, setDirectoryTreeSearch] = useState("");
   const [directoryTreeLoading, setDirectoryTreeLoading] = useState(false);
   const [directoryTreeError, setDirectoryTreeError] = useState("");
   const [piCommand, setPiCommand] = useState(localStorage.getItem("piCommand") || DEFAULT_COMMAND);
@@ -348,6 +535,7 @@ export default function App() {
   const processingRef = useRef(false);
   const outputIdleTimerRef = useRef(null);
   const persistOutputTimerRef = useRef(null);
+  const fileEventSeenRef = useRef(new Set());
   const projectsRef = useRef(projects);
   const activeProjectIdRef = useRef(activeProjectId);
   const activeProjectSessionIdRef = useRef(activeProjectSessionId);
@@ -404,6 +592,16 @@ export default function App() {
     setStatus(`已打开文件：${basename(path)}`);
   }
 
+  async function openSessionFile(file) {
+    await invoke("open_file_with_default_app", { path: file.path });
+    setStatus(`已打开文件：${file.name || basename(file.path)}`);
+  }
+
+  async function openSessionFileDirectory(file) {
+    await invoke("open_path_in_file_manager", { path: file.path });
+    setStatus(`已打开所在目录：${file.name || basename(file.path)}`);
+  }
+
   function saveProjects(nextProjects) {
     projectsRef.current = nextProjects;
     setProjects(nextProjects);
@@ -430,6 +628,80 @@ export default function App() {
     if (persistOutputTimerRef.current) clearTimeout(persistOutputTimerRef.current);
     persistOutputTimerRef.current = setTimeout(() => persistCurrentSessionOutput(), 600);
   }
+
+  function addSessionFiles(kind, files) {
+    const projectId = activeProjectIdRef.current;
+    const sessionId = activeProjectSessionIdRef.current;
+    if (!projectId || !sessionId || !Array.isArray(files) || files.length === 0) return;
+    const field = kind === "output" ? "output_files" : "referenced_files";
+    const now = new Date().toISOString();
+    let changed = false;
+    const nextProjects = projectsRef.current.map((project) => {
+      if (project.id !== projectId) return project;
+      return {
+        ...project,
+        updated_at: now,
+        sessions: (project.sessions || []).map((session) => {
+          if (session.id !== sessionId) return session;
+          const existing = new Set((session[field] || []).map((item) => item.path));
+          const additions = files.filter((item) => item?.path && !existing.has(item.path));
+          if (additions.length === 0) return session;
+          changed = true;
+          return { ...session, [field]: [...(session[field] || []), ...additions], updated_at: now };
+        })
+      };
+    });
+    if (changed) saveProjects(nextProjects);
+  }
+
+  function applyPiIdeFileEvents(events) {
+    if (!Array.isArray(events) || events.length === 0) return;
+    const referenced = [];
+    const output = [];
+
+    for (const event of events) {
+      if (!event?.path || !event?.kind) continue;
+      const key = event.id || `${event.kind}:${event.source}:${event.toolCallId}:${event.path}:${event.timestamp}`;
+      if (fileEventSeenRef.current.has(key)) continue;
+      fileEventSeenRef.current.add(key);
+
+      const record = {
+        id: makeId("session-file"),
+        name: event.name || basename(event.path),
+        path: event.path,
+        source: event.source || "pi-tool",
+        confidence: event.confidence || "precise",
+        tool_name: event.toolName,
+        tool_call_id: event.toolCallId,
+        created_at: event.timestamp || new Date().toISOString()
+      };
+
+      if (event.kind === "reference") referenced.push(record);
+      else if (event.kind === "output") output.push(record);
+    }
+
+    if (referenced.length) addSessionFiles("referenced", referenced);
+    if (output.length) addSessionFiles("output", output);
+  }
+
+  useEffect(() => {
+    if (!piStarted || !activeProject?.path) return;
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const events = await invoke("load_pi_ide_file_events", { workdir: activeProject.path });
+        if (!cancelled) applyPiIdeFileEvents(events);
+      } catch (_) {
+        // 文件跟踪扩展尚未生成或 Pi 未写入事件时忽略。
+      }
+    };
+    poll();
+    const timer = window.setInterval(poll, 1200);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [piStarted, activeProject?.path]);
 
   useEffect(() => {
     setCommand("");
@@ -723,6 +995,7 @@ export default function App() {
     localStorage.setItem("piCommand", commandText);
     if (runWorkdir) localStorage.setItem("workdir", runWorkdir);
     recordSessionStart(commandText, runWorkdir);
+    fileEventSeenRef.current = new Set();
     await invoke("start_pi", { piCommand: commandText, workdir: runWorkdir });
     setPiStarted(true);
   }
@@ -769,6 +1042,10 @@ export default function App() {
     const finalPrompt = buildPromptWithAttachments(userText, attachments);
     if (!finalPrompt.trim()) return;
     const titleSource = titleFromPromptAndAttachments(userText, attachments);
+    const projectPath = activeProject?.path || workdir;
+    const attachmentFiles = fileRecordsFromPaths(attachments.map((item) => item.path), "user-attachment");
+    const inputPathFiles = fileRecordsFromPaths(extractFilePathsFromText(userText, projectPath), "user-input");
+    addSessionFiles("referenced", [...attachmentFiles, ...inputPathFiles]);
     processingRef.current = true;
     setIsProcessing(true);
     try {
@@ -787,18 +1064,27 @@ export default function App() {
     const uniquePaths = [...new Set(paths.filter(Boolean).map(String))];
     if (uniquePaths.length === 0) return;
 
+    const existing = new Set(attachments.map((item) => item.path));
+    const additions = uniquePaths
+      .filter((path) => !existing.has(path))
+      .map((path) => ({
+        id: makeId("attachment"),
+        name: basename(path),
+        path,
+        token: quotePath(path)
+      }));
+
+    if (additions.length === 0) {
+      setStatus("文件已在会话文件中");
+      requestAnimationFrame(() => inputRef.current?.focus());
+      return;
+    }
+
     setAttachments((prev) => {
-      const existing = new Set(prev.map((item) => item.path));
-      const additions = uniquePaths
-        .filter((path) => !existing.has(path))
-        .map((path) => ({
-          id: makeId("attachment"),
-          name: basename(path),
-          path,
-          token: quotePath(path)
-        }));
-      return [...prev, ...additions];
+      const prevPaths = new Set(prev.map((item) => item.path));
+      return [...prev, ...additions.filter((item) => !prevPaths.has(item.path))];
     });
+    setStatus(additions.length === 1 ? `已加入会话文件：${additions[0].name}` : `已加入 ${additions.length} 个会话文件`);
     requestAnimationFrame(() => inputRef.current?.focus());
   }
 
@@ -827,6 +1113,7 @@ export default function App() {
 
   function handleDrop(e) {
     e.preventDefault();
+    e.stopPropagation();
     const treeFilePath = e.dataTransfer.getData("application/x-pi-file-path");
     if (treeFilePath) {
       insertFileAttachments([treeFilePath]);
@@ -840,6 +1127,11 @@ export default function App() {
     const files = Array.from(e.dataTransfer.files || []);
     const paths = files.map((f) => f.path || f.name).filter(Boolean);
     if (paths.length) insertFileAttachments(paths);
+  }
+
+  function handleComposerDragOver(e) {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
   }
 
   function handleComposerAction() {
@@ -904,7 +1196,7 @@ export default function App() {
             terminalInputEnabled={terminalInputEnabled}
           />
         </div>
-        <div className="composer">
+        <div className="composer" onDragOver={handleComposerDragOver} onDrop={handleDrop}>
           <div className="composer-toolbar">
             <div className="attachment-bar inline">
               {attachments.length === 0 ? (
@@ -936,17 +1228,24 @@ export default function App() {
       <aside className="sidebar right">
         <RightToolPanel
           activeProject={activeProject}
+          activeSession={activeProjectSession}
           toolListCollapsed={toolListCollapsed}
           directoryTreeOpen={directoryTreeOpen}
+          sessionFilesOpen={sessionFilesOpen}
           directoryTree={directoryTree}
           directoryTreeLoading={directoryTreeLoading}
           directoryTreeError={directoryTreeError}
           expandedDirectoryPaths={expandedDirectoryPaths}
+          directoryTreeSearch={directoryTreeSearch}
+          onDirectoryTreeSearchChange={setDirectoryTreeSearch}
           onToggleToolList={() => setToolListCollapsed((value) => !value)}
           onToggleDirectoryTree={() => setDirectoryTreeOpen((value) => !value)}
+          onToggleSessionFiles={() => setSessionFilesOpen((value) => !value)}
           onRefreshDirectoryTree={() => loadDirectoryTree().catch((e) => setDirectoryTreeError(String(e)))}
           onToggleDirectoryNode={toggleDirectoryNode}
           onOpenDirectoryFile={(path) => openDirectoryFile(path).catch((e) => setStatus(String(e)))}
+          onOpenSessionFile={(file) => openSessionFile(file).catch((e) => setStatus(String(e)))}
+          onOpenSessionFileDirectory={(file) => openSessionFileDirectory(file).catch((e) => setStatus(String(e)))}
         />
       </aside>
     </div>
