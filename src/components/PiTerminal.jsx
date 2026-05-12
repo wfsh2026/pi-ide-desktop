@@ -11,7 +11,7 @@ function normalizeForScrollableTerminal(data) {
     .replace(/\x1b\[3J/g, "");
 }
 
-export default function PiTerminal({ activeSessionId, clearSignal, replaySignal = 0, replayContent = "", terminalInputEnabled = true }) {
+export default function PiTerminal({ activeSessionId, clearSignal, replaySignal = 0, replayContent = "", terminalInputEnabled = true, onTerminalInput }) {
   const hostRef = useRef(null);
   const scrollbarRef = useRef(null);
   const thumbRef = useRef(null);
@@ -22,10 +22,15 @@ export default function PiTerminal({ activeSessionId, clearSignal, replaySignal 
   const resizeFrameRef = useRef(null);
   const activeSessionIdRef = useRef(activeSessionId);
   const terminalInputEnabledRef = useRef(terminalInputEnabled);
+  const onTerminalInputRef = useRef(onTerminalInput);
 
   useEffect(() => {
     activeSessionIdRef.current = activeSessionId;
   }, [activeSessionId]);
+
+  useEffect(() => {
+    onTerminalInputRef.current = onTerminalInput;
+  }, [onTerminalInput]);
 
   useEffect(() => {
     terminalInputEnabledRef.current = terminalInputEnabled;
@@ -171,7 +176,8 @@ export default function PiTerminal({ activeSessionId, clearSignal, replaySignal 
       if (!terminalInputEnabledRef.current) return;
       const sessionId = activeSessionIdRef.current;
       if (!sessionId) return;
-      invoke("send_pi_input", { sessionId, input: data }).catch(() => {});
+      if (onTerminalInputRef.current) onTerminalInputRef.current(data).catch(() => {});
+      else invoke("send_pi_input", { sessionId, input: data }).catch(() => {});
     });
     const resizeObserver = new ResizeObserver(fitAndNotify);
     resizeObserver.observe(host);
