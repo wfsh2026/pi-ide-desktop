@@ -51,7 +51,7 @@ export default function PiTerminal({ activeSessionId, clearSignal, replaySignal 
       smoothScrollDuration: 0,
       fontFamily: "Menlo, Monaco, Consolas, 'Courier New', monospace",
       fontSize: 13,
-      theme: { background: "#0b1020", foreground: "#e6edf3" }
+      theme: { background: "#111111", foreground: "#e8e8e8", cursor: "#e8e8e8", selectionBackground: "#343434" }
     });
     const fit = new FitAddon();
     term.loadAddon(fit);

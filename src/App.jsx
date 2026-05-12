@@ -510,7 +510,6 @@ export default function App() {
   const [clearTerminalSignal, setClearTerminalSignal] = useState(0);
   const [terminalReplaySignal, setTerminalReplaySignal] = useState(0);
   const [terminalReplayContent, setTerminalReplayContent] = useState("");
-  const [isProcessing, setIsProcessing] = useState(false);
   const [terminalInputEnabled, setTerminalInputEnabled] = useState(true);
   const [piSessionStatus, setPiSessionStatus] = useState({});
   const [openedFromContext, setOpenedFromContext] = useState(false);
@@ -532,18 +531,19 @@ export default function App() {
 
   const inputRef = useRef(null);
   const outputBufferRef = useRef("");
-  const processingRef = useRef(false);
-  const outputIdleTimerRef = useRef(null);
+  const outputIdleTimersRef = useRef({});
   const persistOutputTimerRef = useRef(null);
   const fileEventSeenRef = useRef(new Set());
   const projectsRef = useRef(projects);
   const activeProjectIdRef = useRef(activeProjectId);
   const activeProjectSessionIdRef = useRef(activeProjectSessionId);
+  const piSessionStatusRef = useRef(piSessionStatus);
   const launchHandledRef = useRef(false);
 
   useEffect(() => { projectsRef.current = projects; }, [projects]);
   useEffect(() => { activeProjectIdRef.current = activeProjectId; }, [activeProjectId]);
   useEffect(() => { activeProjectSessionIdRef.current = activeProjectSessionId; }, [activeProjectSessionId]);
+  useEffect(() => { piSessionStatusRef.current = piSessionStatus; }, [piSessionStatus]);
 
   const activeProject = useMemo(() => projects.find((p) => p.id === activeProjectId), [projects, activeProjectId]);
   const activeProjectSession = useMemo(
@@ -551,6 +551,7 @@ export default function App() {
     [activeProject, activeProjectSessionId]
   );
   const piStarted = Boolean(activeProjectSessionId && piSessionStatus[activeProjectSessionId]?.running);
+  const isProcessing = Boolean(activeProjectSessionId && piSessionStatus[activeProjectSessionId]?.processing);
 
   const loadDirectoryTree = useCallback(async (projectPath = activeProject?.path) => {
     if (!projectPath) {
@@ -609,6 +610,28 @@ export default function App() {
     localStorage.setItem(PROJECTS_STORAGE_KEY, JSON.stringify(nextProjects));
   }
 
+  function getSessionById(sessionId) {
+    for (const project of projectsRef.current) {
+      const session = (project.sessions || []).find((item) => item.id === sessionId);
+      if (session) return { project, session };
+    }
+    return { project: null, session: null };
+  }
+
+  function setSessionRuntimeStatus(sessionId, patch) {
+    if (!sessionId) return;
+    setPiSessionStatus((prev) => ({
+      ...prev,
+      [sessionId]: { ...(prev[sessionId] || {}), ...patch }
+    }));
+  }
+
+  function clearSessionIdleTimer(sessionId) {
+    const timer = outputIdleTimersRef.current[sessionId];
+    if (timer) clearTimeout(timer);
+    delete outputIdleTimersRef.current[sessionId];
+  }
+
   function updateSessionById(sessionId, updater, { persist = true } = {}) {
     if (!sessionId) return null;
     let updatedSession = null;
@@ -632,19 +655,7 @@ export default function App() {
   }
 
   function persistCurrentSessionOutput() {
-    const projectId = activeProjectIdRef.current;
-    const sessionId = activeProjectSessionIdRef.current;
-    if (!projectId || !sessionId) return;
-    const nextProjects = projectsRef.current.map((project) => {
-      if (project.id !== projectId) return project;
-      return {
-        ...project,
-        sessions: (project.sessions || []).map((session) => session.id === sessionId
-          ? { ...session, output: outputBufferRef.current, updated_at: new Date().toISOString() }
-          : session)
-      };
-    });
-    saveProjects(nextProjects);
+    localStorage.setItem(PROJECTS_STORAGE_KEY, JSON.stringify(projectsRef.current));
   }
 
   function schedulePersistCurrentSessionOutput() {
@@ -741,14 +752,20 @@ export default function App() {
   }
 
   useEffect(() => {
-    if (!piStarted || !activeProject?.path) return;
+    const runningProjectPaths = [...new Set(
+      projects.flatMap((project) => (project.sessions || []).some((session) => piSessionStatus[session.id]?.running) ? [project.path] : [])
+    )].filter(Boolean);
+    if (runningProjectPaths.length === 0) return;
+
     let cancelled = false;
     const poll = async () => {
-      try {
-        const events = await invoke("load_pi_ide_file_events", { workdir: activeProject.path });
-        if (!cancelled) applyPiIdeFileEvents(events);
-      } catch (_) {
-        // 文件跟踪扩展尚未生成或 Pi 未写入事件时忽略。
+      for (const projectPath of runningProjectPaths) {
+        try {
+          const events = await invoke("load_pi_ide_file_events", { workdir: projectPath });
+          if (!cancelled) applyPiIdeFileEvents(events);
+        } catch (_) {
+          // 文件跟踪扩展尚未生成或 Pi 未写入事件时忽略。
+        }
       }
     };
     poll();
@@ -757,7 +774,7 @@ export default function App() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [piStarted, activeProject?.path]);
+  }, [projects, piSessionStatus]);
 
   useEffect(() => {
     setCommand("");
@@ -784,9 +801,11 @@ export default function App() {
       const text = payload && typeof payload === "object" ? String(payload.status || "") : String(payload || "");
       setStatus(text);
       if (sessionId) {
+        const running = text.includes("Pi 已启动") || text.includes("Pi 已经在运行");
+        const stopped = text.includes("Pi 已停止");
         setPiSessionStatus((prev) => ({
           ...prev,
-          [sessionId]: { running: text.includes("Pi 已启动") || text.includes("Pi 已经在运行"), status: text }
+          [sessionId]: { ...(prev[sessionId] || {}), running: stopped ? false : running || prev[sessionId]?.running || false, processing: stopped ? false : prev[sessionId]?.processing || false, status: text }
         }));
       }
     }).then((f) => unsubs.push(f));
@@ -796,16 +815,15 @@ export default function App() {
       const data = String(payload.data ?? "");
       if (sessionId && data) appendOutputToSession(sessionId, data);
 
-      if (sessionId !== activeProjectSessionIdRef.current || !processingRef.current) return;
-      if (outputIdleTimerRef.current) clearTimeout(outputIdleTimerRef.current);
+      if (!sessionId || !piSessionStatusRef.current[sessionId]?.processing) return;
+      clearSessionIdleTimer(sessionId);
       if (data.includes("[PTY 读取错误]") || data.includes("Pi 已停止")) {
-        processingRef.current = false;
-        setIsProcessing(false);
+        setSessionRuntimeStatus(sessionId, { processing: false });
         return;
       }
-      outputIdleTimerRef.current = setTimeout(() => {
-        processingRef.current = false;
-        setIsProcessing(false);
+      outputIdleTimersRef.current[sessionId] = setTimeout(() => {
+        setSessionRuntimeStatus(sessionId, { processing: false });
+        delete outputIdleTimersRef.current[sessionId];
       }, 2000);
     }).then((f) => unsubs.push(f));
     getCurrentWebview().onDragDropEvent((event) => {
@@ -814,7 +832,8 @@ export default function App() {
       }
     }).then((f) => unsubs.push(f));
     return () => {
-      if (outputIdleTimerRef.current) clearTimeout(outputIdleTimerRef.current);
+      Object.values(outputIdleTimersRef.current).forEach((timer) => clearTimeout(timer));
+      outputIdleTimersRef.current = {};
       if (persistOutputTimerRef.current) clearTimeout(persistOutputTimerRef.current);
       persistCurrentSessionOutput();
       unsubs.forEach((f) => f());
