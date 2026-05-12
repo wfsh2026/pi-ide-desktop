@@ -1,6 +1,6 @@
 [package]
 name = "pi-ide-desktop"
-version = "1.0.1"
+version = "1.1.0"
 description = "A lightweight desktop IDE container for pi.dev Pi Coding Agent"
 authors = ["Pi IDE"]
 edition = "2021"
