@@ -185,8 +185,10 @@ fn ensure_pi_ide_file_tracker(workdir: &Path) -> Result<(), String> {
   fs::create_dir_all(&extensions_dir).map_err(|e| format!("创建 Pi IDE 扩展目录失败: {e}"))?;
   fs::write(extensions_dir.join("pi-ide-file-tracker.ts"), PI_IDE_FILE_TRACKER_EXTENSION)
     .map_err(|e| format!("写入 Pi IDE 文件跟踪扩展失败: {e}"))?;
-  fs::write(pi_ide_file_events_path(workdir), "")
-    .map_err(|e| format!("初始化 Pi IDE 文件事件失败: {e}"))?;
+  let events_path = pi_ide_file_events_path(workdir);
+  if !events_path.exists() {
+    fs::write(&events_path, "").map_err(|e| format!("初始化 Pi IDE 文件事件失败: {e}"))?;
+  }
   Ok(())
 }
 
