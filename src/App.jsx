@@ -3,14 +3,17 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
-import { Play, Square, Send, FolderOpen, Plus, Folder, X, File, FolderTree, ChevronDown, ChevronRight, RefreshCw } from "lucide-react";
+import { Play, Square, Send, FolderOpen, Plus, Folder, X, File, FolderTree, ChevronDown, ChevronRight, RefreshCw, MessageSquare, TerminalSquare } from "lucide-react";
 import PiTerminal from "./components/PiTerminal.jsx";
+import SessionTimeline from "./components/SessionTimeline.jsx";
+import { applyPiIdeTimelineEvent } from "./piIdeEventMapper.js";
 
 const DEFAULT_COMMAND = "pi";
 const PROJECTS_STORAGE_KEY = "piIdeProjects";
 const ACTIVE_PROJECT_STORAGE_KEY = "piIdeActiveProjectId";
 const ACTIVE_SESSION_STORAGE_KEY = "piIdeActiveProjectSessionId";
 const EXE_SESSION_STORAGE_KEY = "piIdeExeSessionId";
+const CENTER_VIEW_STORAGE_KEY = "piIdeCenterView";
 
 function insertAtCursor(text, insert) {
   const start = text.selectionStart ?? 0;
@@ -107,6 +110,116 @@ function fileRecordsFromPaths(paths, source) {
     source,
     created_at: new Date().toISOString()
   }));
+}
+
+function normalizeCenterView(value) {
+  return value === "terminal" ? "terminal" : "session";
+}
+
+function latestTurnIndex(turns) {
+  if (!Array.isArray(turns) || turns.length === 0) return -1;
+  for (let index = turns.length - 1; index >= 0; index -= 1) {
+    if (turns[index]?.status === "running") return index;
+  }
+  return turns.length - 1;
+}
+
+function latestRunningTurnIndex(turns) {
+  if (!Array.isArray(turns)) return -1;
+  for (let index = turns.length - 1; index >= 0; index -= 1) {
+    if (turns[index]?.status === "running") return index;
+  }
+  return -1;
+}
+
+function createTimelineTurn({ userText, finalPrompt, attachments }) {
+  const now = new Date().toISOString();
+  return {
+    id: makeId("turn"),
+    status: "running",
+    created_at: now,
+    updated_at: now,
+    items: [
+      {
+        id: makeId("item"),
+        type: "user_message",
+        text: userText,
+        final_prompt: finalPrompt,
+        attachments,
+        status: "completed",
+        created_at: now,
+        updated_at: now
+      },
+      {
+        id: makeId("item"),
+        type: "progress",
+        title: "任务已发送给 Pi",
+        detail: "等待 AI 分析并返回结果。",
+        status: "running",
+        created_at: now,
+        updated_at: now
+      },
+      {
+        id: makeId("item"),
+        type: "assistant_message",
+        text: "",
+        status: "running",
+        created_at: now,
+        updated_at: now
+      }
+    ]
+  };
+}
+
+function updateLatestTurnStatus(turns, status, now, errorDetail = "") {
+  const list = Array.isArray(turns) ? turns : [];
+  const index = latestRunningTurnIndex(list);
+  if (index < 0) return list;
+  return list.map((turn, turnIndex) => {
+    if (turnIndex !== index) return turn;
+    const nextItems = (Array.isArray(turn.items) ? turn.items : []).map((item) => {
+      if (item.type === "progress") {
+        return { ...item, status, detail: status === "completed" ? "AI 已完成本轮任务。" : item.detail, updated_at: now };
+      }
+      if (item.type === "assistant_message" && item.status === "running") {
+        return { ...item, status, updated_at: now };
+      }
+      return item;
+    });
+    const errorItems = status === "failed" && errorDetail ? [{
+      id: makeId("item"),
+      type: "error",
+      title: "执行失败",
+      detail: errorDetail,
+      status: "failed",
+      created_at: now,
+      updated_at: now
+    }] : [];
+    return { ...turn, status, items: [...nextItems, ...errorItems], updated_at: now };
+  });
+}
+
+function appendFileItemToLatestTurn(turns, kind, files, now) {
+  const list = Array.isArray(turns) ? turns : [];
+  const index = latestTurnIndex(list);
+  if (index < 0 || !Array.isArray(files) || files.length === 0) return list;
+  const type = kind === "output" ? "file_output" : "file_reference";
+  return list.map((turn, turnIndex) => turnIndex === index ? {
+    ...turn,
+    items: [
+      ...(Array.isArray(turn.items) ? turn.items : []),
+      {
+        id: makeId("item"),
+        type,
+        title: kind === "output" ? "AI 输出文件" : "AI 参考文件",
+        files,
+        status: "completed",
+        created_at: now,
+        updated_at: now
+      }
+    ],
+    updated_at: now
+  } : turn);
 }
 
 function debugLog(message, data = undefined) {
@@ -520,6 +633,7 @@ export default function App() {
   const [terminalReplaySignal, setTerminalReplaySignal] = useState(0);
   const [terminalReplayContent, setTerminalReplayContent] = useState("");
   const [terminalInputEnabled, setTerminalInputEnabled] = useState(true);
+  const [centerView, setCenterView] = useState(() => normalizeCenterView(localStorage.getItem(CENTER_VIEW_STORAGE_KEY)));
   const [piSessionStatus, setPiSessionStatus] = useState({});
   const [openedFromContext, setOpenedFromContext] = useState(false);
   const [command, setCommand] = useState("");
@@ -564,6 +678,16 @@ export default function App() {
   const piStarted = Boolean(activeProjectSessionId && piSessionStatus[activeProjectSessionId]?.running);
   const piStarting = Boolean(activeProjectSessionId && piSessionStatus[activeProjectSessionId]?.starting);
   const isProcessing = Boolean(activeProjectSessionId && piSessionStatus[activeProjectSessionId]?.processing);
+
+  useEffect(() => {
+    localStorage.setItem(CENTER_VIEW_STORAGE_KEY, centerView);
+  }, [centerView]);
+
+  useEffect(() => {
+    if (centerView !== "terminal") return;
+    setTerminalReplayContent(activeProjectSession?.output || "");
+    setTerminalReplaySignal((value) => value + 1);
+  }, [centerView, activeProjectSessionId]);
 
   const loadDirectoryTree = useCallback(async (projectPath = activeProject?.path) => {
     if (!projectPath) {
@@ -711,24 +835,75 @@ export default function App() {
           const additions = files.filter((item) => item?.path && !existing.has(item.path));
           if (additions.length === 0) return session;
           changed = true;
-          return { ...session, [field]: [...(session[field] || []), ...additions], updated_at: now };
+          return {
+            ...session,
+            [field]: [...(session[field] || []), ...additions],
+            turns: appendFileItemToLatestTurn(session.turns, kind, additions, now),
+            updated_at: now
+          };
         })
       };
     });
     if (changed) saveProjects(nextProjects);
   }
 
-  function applyPiIdeFileEvents(events) {
+  function addTurnToSession(sessionId, turn) {
+    updateSessionById(sessionId, (session) => ({
+      ...session,
+      turns: [...(Array.isArray(session.turns) ? session.turns : []), turn],
+      updated_at: turn.updated_at
+    }));
+  }
+
+  function markLatestTurnStatus(sessionId, status, errorDetail = "") {
+    const now = new Date().toISOString();
+    updateSessionById(sessionId, (session) => {
+      return {
+        ...session,
+        turns: updateLatestTurnStatus(session.turns, status, now, errorDetail),
+        updated_at: now
+      };
+    });
+  }
+
+  function applyPiIdeEvents(events) {
     if (!Array.isArray(events) || events.length === 0) return;
     const bySession = new Map();
 
     for (const event of events) {
-      if (!event?.path || !event?.kind) continue;
       const targetSessionId = event.ideSessionId || event.ide_session_id || activeProjectSessionIdRef.current;
       if (!targetSessionId) continue;
-      const key = event.id || `${targetSessionId}:${event.kind}:${event.source}:${event.toolCallId}:${event.path}:${event.timestamp}`;
+      const runtime = piSessionStatusRef.current[targetSessionId] || {};
+      const eventRunId = event.ideRunId || event.ide_run_id;
+      if (eventRunId && runtime.runId && eventRunId !== runtime.runId) continue;
+      if (!eventRunId && runtime.runId && event.kind !== "reference" && event.kind !== "output") continue;
+      const key = event.id || `${targetSessionId}:${event.kind}:${event.eventType || event.type}:${event.source}:${event.toolCallId}:${event.path}:${event.timestamp}`;
       if (fileEventSeenRef.current.has(key)) continue;
       fileEventSeenRef.current.add(key);
+
+      if (event.kind === "timeline") {
+        const failedEvent = event.eventType === "extension_error" || (event.eventType === "auto_retry_end" && event.success === false);
+        if (event.eventType === "agent_start") {
+          clearSessionIdleTimer(targetSessionId);
+          setSessionRuntimeStatus(targetSessionId, { processing: true });
+        }
+        updateSessionById(targetSessionId, (session) => ({
+          ...session,
+          turns: applyPiIdeTimelineEvent(session.turns, event, { makeId }),
+          updated_at: event.timestamp || new Date().toISOString()
+        }));
+        if (event.eventType === "agent_end") {
+          clearSessionIdleTimer(targetSessionId);
+          setSessionRuntimeStatus(targetSessionId, { processing: false });
+        }
+        if (failedEvent) {
+          clearSessionIdleTimer(targetSessionId);
+          setSessionRuntimeStatus(targetSessionId, { processing: false });
+        }
+        continue;
+      }
+
+      if (!event?.path || !event?.kind) continue;
 
       const record = {
         id: makeId("session-file"),
@@ -753,28 +928,6 @@ export default function App() {
     }
   }
 
-  function detectSessionFilesFromOutput(data, targetSessionId = activeProjectSessionIdRef.current) {
-    const { project } = getSessionById(targetSessionId);
-    const projectPath = project?.path || activeProject?.path || workdir;
-    const clean = stripAnsiForDetection(data);
-    const referenced = [];
-    const output = [];
-    const referenceKeywords = /(read|reading|cat |open file|读取|查看|参考|打开文件|读取文件|已读取)/i;
-    const outputKeywords = /(write|wrote|written|created|saved|edited|modified|replaced|output|生成|写入|创建|保存|修改|编辑|替换|输出|创建文本文件|已创建)/i;
-
-    for (const line of clean.split(/\r?\n/)) {
-      const hasOutputKeyword = outputKeywords.test(line);
-      const hasReferenceKeyword = referenceKeywords.test(line);
-      const paths = extractFilePathsFromText(line, projectPath, hasOutputKeyword || hasReferenceKeyword);
-      if (paths.length === 0) continue;
-      if (hasOutputKeyword) output.push(...fileRecordsFromPaths(paths, "ai-output-detected"));
-      else if (hasReferenceKeyword) referenced.push(...fileRecordsFromPaths(paths, "ai-reference-detected"));
-    }
-
-    if (referenced.length) addSessionFiles("referenced", referenced, targetSessionId);
-    if (output.length) addSessionFiles("output", output, targetSessionId);
-  }
-
   function appendOutputToSession(sessionId, data) {
     if (!sessionId || !data) return;
     debugLog("appendOutputToSession", { sessionId, bytes: data.length, active: activeProjectSessionIdRef.current });
@@ -785,13 +938,16 @@ export default function App() {
       sessions: (project.sessions || []).map((session) => {
         if (session.id !== sessionId) return session;
         changed = true;
-        return { ...session, output: `${session.output || ""}${data}`, updated_at: now };
+        return {
+          ...session,
+          output: `${session.output || ""}${data}`,
+          updated_at: now
+        };
       })
     }));
     if (!changed) return;
     projectsRef.current = nextProjects;
     if (sessionId === activeProjectSessionIdRef.current) outputBufferRef.current += data;
-    detectSessionFilesFromOutput(data, sessionId);
     scheduleProjectsRenderAndPersist();
   }
 
@@ -805,10 +961,10 @@ export default function App() {
     const poll = async () => {
       for (const projectPath of runningProjectPaths) {
         try {
-          const events = await invoke("load_pi_ide_file_events", { workdir: projectPath });
-          if (!cancelled) applyPiIdeFileEvents(events);
+          const events = await invoke("load_pi_ide_events", { workdir: projectPath });
+          if (!cancelled) applyPiIdeEvents(events);
         } catch (_) {
-          // 文件跟踪扩展尚未生成或 Pi 未写入事件时忽略。
+          // 事件桥扩展尚未生成或 Pi 未写入事件时忽略。
         }
       }
     };
@@ -855,6 +1011,7 @@ export default function App() {
           running: stopped ? false : running || previous.running || false,
           starting: false,
           processing: stopped ? false : previous.processing || false,
+          runId: payload.runId || payload.run_id || previous.runId,
           status: text
         });
       }
@@ -870,12 +1027,9 @@ export default function App() {
       clearSessionIdleTimer(sessionId);
       if (data.includes("[PTY 读取错误]") || data.includes("Pi 已停止")) {
         setSessionRuntimeStatus(sessionId, { processing: false });
+        markLatestTurnStatus(sessionId, "failed", data);
         return;
       }
-      outputIdleTimersRef.current[sessionId] = setTimeout(() => {
-        setSessionRuntimeStatus(sessionId, { processing: false });
-        delete outputIdleTimersRef.current[sessionId];
-      }, 2000);
     }).then((f) => unsubs.push(f));
     getCurrentWebview().onDragDropEvent((event) => {
       if (event.payload?.type === "drop") {
@@ -923,7 +1077,7 @@ export default function App() {
           ? {
               ...project,
               updated_at: now,
-              sessions: [...sessions, { id: sessionId, title: sessionTitle, created_at: now, updated_at: now, output: "", start_command: startCommand, draft_command: "", attachments: [], referenced_files: [], output_files: [] }]
+              sessions: [...sessions, { id: sessionId, title: sessionTitle, created_at: now, updated_at: now, output: "", start_command: startCommand, draft_command: "", attachments: [], turns: [], referenced_files: [], output_files: [] }]
             }
           : project);
       } else {
@@ -940,7 +1094,7 @@ export default function App() {
           path,
           created_at: now,
           updated_at: now,
-          sessions: [{ id: sessionId, title: sessionTitle, created_at: now, updated_at: now, output: "", start_command: startCommand, draft_command: "", attachments: [], referenced_files: [], output_files: [] }]
+          sessions: [{ id: sessionId, title: sessionTitle, created_at: now, updated_at: now, output: "", start_command: startCommand, draft_command: "", attachments: [], turns: [], referenced_files: [], output_files: [] }]
         }
       ];
     }
@@ -979,7 +1133,7 @@ export default function App() {
           updated_at: now,
           sessions: [
             ...(project.sessions || []),
-            { id: sessionId, title: "新 Pi 会话", created_at: now, updated_at: now, output: "", draft_command: "", attachments: [], referenced_files: [], output_files: [] }
+            { id: sessionId, title: "新 Pi 会话", created_at: now, updated_at: now, output: "", draft_command: "", attachments: [], turns: [], referenced_files: [], output_files: [] }
           ]
         }
       : project);
@@ -1211,7 +1365,7 @@ export default function App() {
     if (runWorkdir) localStorage.setItem("workdir", runWorkdir);
     recordSessionStart(commandText, runWorkdir);
     startingSessionsRef.current.add(sessionId);
-    setSessionRuntimeStatus(sessionId, { starting: true, status: "Pi 启动中" });
+    setSessionRuntimeStatus(sessionId, { starting: true, runId: null, status: "Pi 启动中" });
     try {
       debugLog("startPi invoke", { sessionId, workdir: runWorkdir, commandLen: commandText.length, continueSession });
       await invoke("start_pi_session", { sessionId, piCommand: commandText, workdir: runWorkdir, continueSession });
@@ -1249,6 +1403,7 @@ export default function App() {
     await invoke("stop_pi_session", { sessionId });
     clearSessionIdleTimer(sessionId);
     setSessionRuntimeStatus(sessionId, { running: false, processing: false, status: "Pi 已停止" });
+    markLatestTurnStatus(sessionId, "cancelled");
     persistCurrentSessionOutput();
   }
 
@@ -1280,6 +1435,7 @@ export default function App() {
     await invoke("send_pi_input", { sessionId, input: "\x03" });
     clearSessionIdleTimer(sessionId);
     setSessionRuntimeStatus(sessionId, { processing: false });
+    markLatestTurnStatus(sessionId, "cancelled");
   }
 
   async function sendCommand(raw = command) {
@@ -1290,15 +1446,22 @@ export default function App() {
     const projectPath = activeProject?.path || workdir;
     const attachmentFiles = fileRecordsFromPaths(attachments.map((item) => item.path), "user-attachment");
     const inputPathFiles = fileRecordsFromPaths(extractFilePathsFromText(userText, projectPath), "user-input");
-    addSessionFiles("referenced", [...attachmentFiles, ...inputPathFiles]);
     await ensureActivePiRunning();
     const sessionId = activeProjectSessionIdRef.current;
     if (!sessionId) throw new Error("请先选择或创建一个会话");
+    const turn = createTimelineTurn({
+      userText: userText || titleSource,
+      finalPrompt,
+      attachments: [...attachmentFiles, ...inputPathFiles]
+    });
+    addTurnToSession(sessionId, turn);
+    addSessionFiles("referenced", [...attachmentFiles, ...inputPathFiles]);
     setSessionRuntimeStatus(sessionId, { processing: true });
     try {
       await invoke("send_pi_input", { sessionId, input: `${finalPrompt}\r` });
     } catch (error) {
       setSessionRuntimeStatus(sessionId, { processing: false });
+      markLatestTurnStatus(sessionId, "failed", String(error));
       throw error;
     }
     updateActiveProjectSessionAfterCommand(titleSource);
@@ -1433,6 +1596,14 @@ export default function App() {
       <main className="main">
         <header className="topbar">
           <span className="status">{status}</span>
+          <div className="view-switch">
+            <button className={centerView === "session" ? "primary" : ""} onClick={() => setCenterView("session")}>
+              <MessageSquare size={15}/> 会话视图
+            </button>
+            <button className={centerView === "terminal" ? "primary" : ""} onClick={() => setCenterView("terminal")}>
+              <TerminalSquare size={15}/> 终端视图
+            </button>
+          </div>
           {!openedFromContext && !piStarted && (
             <textarea className="pi-start-input" value={piCommand} onChange={(e) => {
               const value = e.target.value;
@@ -1451,15 +1622,25 @@ export default function App() {
           </button>
           <button className="danger" onClick={() => stopAllPi().catch((e) => setStatus(String(e)))}>停止全部 Pi</button>
         </header>
-        <div className="terminal-wrap">
-          <PiTerminal
-            activeSessionId={activeProjectSessionId}
-            clearSignal={clearTerminalSignal}
-            replaySignal={terminalReplaySignal}
-            replayContent={terminalReplayContent}
-            terminalInputEnabled={terminalInputEnabled}
-            onTerminalInput={handleTerminalInput}
-          />
+        <div className="center-view-wrap">
+          {centerView === "session" ? (
+            <SessionTimeline
+              project={activeProject}
+              session={activeProjectSession}
+              runtimeStatus={activeProjectSessionId ? piSessionStatus[activeProjectSessionId] : null}
+              onOpenFile={(file) => openSessionFile(file).catch((e) => setStatus(String(e)))}
+              onOpenDirectory={(file) => openSessionFileDirectory(file).catch((e) => setStatus(String(e)))}
+            />
+          ) : (
+            <PiTerminal
+              activeSessionId={activeProjectSessionId}
+              clearSignal={clearTerminalSignal}
+              replaySignal={terminalReplaySignal}
+              replayContent={terminalReplayContent}
+              terminalInputEnabled={terminalInputEnabled}
+              onTerminalInput={handleTerminalInput}
+            />
+          )}
         </div>
         <div className="composer" onDragOver={handleComposerDragOver} onDrop={handleDrop}>
           <div className="composer-toolbar">

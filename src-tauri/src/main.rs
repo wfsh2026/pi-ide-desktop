@@ -83,14 +83,15 @@ fn get_debug_log_path() -> Result<String, String> {
   Ok(debug_log_path()?.to_string_lossy().to_string())
 }
 
-const PI_IDE_FILE_TRACKER_EXTENSION: &str = r#"import * as fs from "node:fs";
+const PI_IDE_BRIDGE_EXTENSION: &str = r#"import * as fs from "node:fs";
 import * as path from "node:path";
 import { execFileSync } from "node:child_process";
 
 const bashBefore = new Map();
+let sequence = 0;
 
 function eventFile(cwd) {
-  return path.join(cwd, ".pi", "pi-ide-file-events.jsonl");
+  return path.join(cwd, ".pi", "pi-ide-events.jsonl");
 }
 
 function normalizeFilePath(cwd, raw) {
@@ -107,20 +108,46 @@ function sessionInfo(ctx) {
     sessionFile: manager?.getSessionFile?.(),
     leafId: manager?.getLeafId?.(),
     ideSessionId: process.env.PI_IDE_SESSION_ID,
+    ideRunId: process.env.PI_IDE_RUN_ID,
   };
 }
 
 function appendEvent(ctx, payload) {
   const cwd = ctx?.cwd || process.cwd();
   const file = eventFile(cwd);
+  sequence += 1;
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.appendFileSync(file, JSON.stringify({
     schema: 1,
+    id: payload.id || `${process.env.PI_IDE_RUN_ID || process.env.PI_IDE_SESSION_ID || "pi"}:${sequence}`,
     timestamp: new Date().toISOString(),
     cwd,
     ...sessionInfo(ctx),
     ...payload,
   }) + "\n", "utf8");
+}
+
+function textContent(message) {
+  return (message?.content || []).map((item) => {
+    if (typeof item === "string") return item;
+    if (item?.type === "text") return item.text || "";
+    return "";
+  }).filter(Boolean).join("");
+}
+
+function compactResult(result) {
+  return {
+    content: result?.content || [],
+    details: result?.details || {},
+  };
+}
+
+function appendTimeline(ctx, eventType, payload = {}) {
+  appendEvent(ctx, {
+    kind: "timeline",
+    eventType,
+    ...payload,
+  });
 }
 
 function recordPath(ctx, kind, source, toolCallId, toolName, rawPath, extra = {}) {
@@ -154,6 +181,77 @@ function gitChangedFiles(cwd) {
 export default function(pi) {
   pi.on("session_start", async (_event, ctx) => {
     appendEvent(ctx, { kind: "session", source: "session-start" });
+  });
+
+  pi.on("agent_start", async (event, ctx) => {
+    appendTimeline(ctx, event.type);
+  });
+
+  pi.on("agent_end", async (event, ctx) => {
+    appendTimeline(ctx, event.type);
+  });
+
+  pi.on("turn_start", async (event, ctx) => {
+    appendTimeline(ctx, event.type, {
+      turnIndex: event.turnIndex,
+      turnTimestamp: event.timestamp,
+    });
+  });
+
+  pi.on("turn_end", async (event, ctx) => {
+    appendTimeline(ctx, event.type, {
+      turnIndex: event.turnIndex,
+      text: textContent(event.message),
+      toolResults: event.toolResults?.map(compactResult) || [],
+    });
+  });
+
+  pi.on("message_update", async (event, ctx) => {
+    const delta = event.assistantMessageEvent || {};
+    appendTimeline(ctx, event.type, {
+      messageId: event.message?.id,
+      deltaType: delta.type,
+      contentIndex: delta.contentIndex,
+      delta: delta.delta || "",
+      content: delta.content || "",
+      reason: delta.reason || "",
+      text: textContent(event.message),
+      toolCall: delta.toolCall || undefined,
+    });
+  });
+
+  pi.on("message_end", async (event, ctx) => {
+    appendTimeline(ctx, event.type, {
+      messageId: event.message?.id,
+      text: textContent(event.message),
+      messageRole: event.message?.role,
+    });
+  });
+
+  pi.on("tool_execution_start", async (event, ctx) => {
+    appendTimeline(ctx, event.type, {
+      toolCallId: event.toolCallId,
+      toolName: event.toolName,
+      args: event.args || {},
+    });
+  });
+
+  pi.on("tool_execution_update", async (event, ctx) => {
+    appendTimeline(ctx, event.type, {
+      toolCallId: event.toolCallId,
+      toolName: event.toolName,
+      args: event.args || {},
+      partialResult: compactResult(event.partialResult),
+    });
+  });
+
+  pi.on("tool_execution_end", async (event, ctx) => {
+    appendTimeline(ctx, event.type, {
+      toolCallId: event.toolCallId,
+      toolName: event.toolName,
+      result: compactResult(event.result),
+      isError: Boolean(event.isError),
+    });
   });
 
   pi.on("tool_call", async (event, ctx) => {
@@ -201,15 +299,23 @@ fn pi_ide_file_events_path(workdir: &Path) -> PathBuf {
   workdir.join(".pi").join("pi-ide-file-events.jsonl")
 }
 
+fn pi_ide_events_path(workdir: &Path) -> PathBuf {
+  workdir.join(".pi").join("pi-ide-events.jsonl")
+}
+
 fn ensure_pi_ide_file_tracker(workdir: &Path) -> Result<(), String> {
   let pi_dir = workdir.join(".pi");
   let extensions_dir = pi_dir.join("extensions");
   fs::create_dir_all(&extensions_dir).map_err(|e| format!("创建 Pi IDE 扩展目录失败: {e}"))?;
-  fs::write(extensions_dir.join("pi-ide-file-tracker.ts"), PI_IDE_FILE_TRACKER_EXTENSION)
-    .map_err(|e| format!("写入 Pi IDE 文件跟踪扩展失败: {e}"))?;
-  let events_path = pi_ide_file_events_path(workdir);
+  fs::write(extensions_dir.join("pi-ide-file-tracker.ts"), PI_IDE_BRIDGE_EXTENSION)
+    .map_err(|e| format!("写入 Pi IDE 事件桥扩展失败: {e}"))?;
+  let events_path = pi_ide_events_path(workdir);
   if !events_path.exists() {
-    fs::write(&events_path, "").map_err(|e| format!("初始化 Pi IDE 文件事件失败: {e}"))?;
+    fs::write(&events_path, "").map_err(|e| format!("初始化 Pi IDE 事件流失败: {e}"))?;
+  }
+  let legacy_events_path = pi_ide_file_events_path(workdir);
+  if !legacy_events_path.exists() {
+    fs::write(&legacy_events_path, "").map_err(|e| format!("初始化 Pi IDE 文件事件失败: {e}"))?;
   }
   Ok(())
 }
@@ -747,8 +853,10 @@ async fn start_pi_session(app: tauri::AppHandle, session_id: String, pi_command:
   append_debug_line(&format!("[backend] start_pi_session build command session_id={session_id} command_len={} extra_args={:?}", raw.len(), extra_args));
   let mut cmd = build_pi_command(&raw, &extra_args)?;
   let session_dir = session_dir(&session_id)?;
+  let run_id = format!("pi-run-{}-{}", chrono::Utc::now().timestamp_millis(), session_id);
   cmd.env("PI_CODING_AGENT_SESSION_DIR", session_dir.to_string_lossy().to_string());
   cmd.env("PI_IDE_SESSION_ID", session_id.clone());
+  cmd.env("PI_IDE_RUN_ID", run_id.clone());
 
   if let Some(dir) = workdir.filter(|s| !s.trim().is_empty()) {
     let dir_path = PathBuf::from(&dir);
@@ -771,7 +879,7 @@ async fn start_pi_session(app: tauri::AppHandle, session_id: String, pi_command:
 
   PI_SESSIONS.lock().await.insert(session_id.clone(), PiRuntime { writer, child, master: pair.master });
   append_debug_line(&format!("[backend] start_pi_session spawned session_id={session_id}"));
-  let _ = app.emit("pi-status", serde_json::json!({ "sessionId": session_id, "status": format!("Pi 已启动：{}", raw) }));
+  let _ = app.emit("pi-status", serde_json::json!({ "sessionId": session_id, "runId": run_id, "status": format!("Pi 已启动：{}", raw) }));
 
   let out_app = app.clone();
   let out_session_id = session_id.clone();
@@ -918,17 +1026,11 @@ fn get_storage_paths() -> Result<serde_json::Value, String> {
   }))
 }
 
-#[tauri::command]
-fn load_pi_ide_file_events(workdir: String) -> Result<Vec<serde_json::Value>, String> {
-  let dir = PathBuf::from(workdir.trim());
-  if !dir.exists() || !dir.is_dir() {
-    return Ok(vec![]);
-  }
-  let path = pi_ide_file_events_path(&dir);
+fn read_jsonl_values(path: PathBuf) -> Result<Vec<serde_json::Value>, String> {
   if !path.exists() {
     return Ok(vec![]);
   }
-  let raw = fs::read_to_string(&path).map_err(|e| format!("读取 Pi IDE 文件事件失败 {:?}: {e}", path))?;
+  let raw = fs::read_to_string(&path).map_err(|e| format!("读取 JSONL 失败 {:?}: {e}", path))?;
   let mut events = Vec::new();
   for line in raw.lines().filter(|line| !line.trim().is_empty()) {
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
@@ -936,6 +1038,24 @@ fn load_pi_ide_file_events(workdir: String) -> Result<Vec<serde_json::Value>, St
     }
   }
   Ok(events)
+}
+
+#[tauri::command]
+fn load_pi_ide_file_events(workdir: String) -> Result<Vec<serde_json::Value>, String> {
+  let dir = PathBuf::from(workdir.trim());
+  if !dir.exists() || !dir.is_dir() {
+    return Ok(vec![]);
+  }
+  read_jsonl_values(pi_ide_file_events_path(&dir))
+}
+
+#[tauri::command]
+fn load_pi_ide_events(workdir: String) -> Result<Vec<serde_json::Value>, String> {
+  let dir = PathBuf::from(workdir.trim());
+  if !dir.exists() || !dir.is_dir() {
+    return Ok(vec![]);
+  }
+  read_jsonl_values(pi_ide_events_path(&dir))
 }
 
 fn main() {
@@ -962,7 +1082,8 @@ fn main() {
       delete_session_node,
       clear_sessions,
       get_storage_paths,
-      load_pi_ide_file_events
+      load_pi_ide_file_events,
+      load_pi_ide_events
     ])
     .setup(|app| {
       if let Err(e) = register_windows_context_menu() {
