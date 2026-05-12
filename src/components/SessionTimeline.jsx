@@ -33,6 +33,14 @@ function formatDuration(ms) {
   return `${min}m ${sec}s`;
 }
 
+function formatModel(model) {
+  if (!model) return "";
+  const name = model.name || model.id || model.model || "";
+  const provider = model.provider || "";
+  if (!name && !provider) return "";
+  return provider ? `${name} via ${provider}` : name;
+}
+
 function elapsedText(turn, active, hasVisibleWork, now) {
   const start = turn.createdAt ? new Date(turn.createdAt).getTime() : now;
   const end = active ? now : (turn.updatedAt ? new Date(turn.updatedAt).getTime() : now);
@@ -158,6 +166,22 @@ function StatusLine({ label, expanded, canExpand, onToggle }) {
 
   if (!canExpand) return <div className="codex-status-line">{content}</div>;
   return <button className="codex-status-line interactive" onClick={onToggle}>{content}</button>;
+}
+
+function OperationRecords({ items }) {
+  const records = (items || []).filter((item) => item?.title);
+  if (records.length === 0) return null;
+  return (
+    <div className="codex-operation-list">
+      {records.map((item) => (
+        <div className={`codex-operation-row ${item.status || ""}`} key={item.id}>
+          {item.status === "running" ? <Loader2 className="spin" size={13}/> : <Check size={13}/>}
+          <span>{item.title}</span>
+          {item.detail && <small>{item.detail}</small>}
+        </div>
+      ))}
+    </div>
+  );
 }
 
 function OutputFileCard({ file, onOpenFile, onOpenDirectory }) {
@@ -288,6 +312,7 @@ function TurnView({ turn, runtimeStatus, fallbackOutputFiles, expanded, expanded
     <div className="codex-turn">
       <UserMessage item={parts.user}/>
       <StatusLine label={status} expanded={expanded} canExpand={hasDetails} onToggle={onToggleTurn}/>
+      <OperationRecords items={parts.progress}/>
       {parts.assistantText.trim() ? <MarkdownText text={parts.assistantText}/> : active ? <div className="codex-thinking">正在思考</div> : null}
       {parts.outputs.length > 0 && (
         <div className="codex-output-section">
@@ -312,6 +337,7 @@ export default function SessionTimeline({ project, session, runtimeStatus, onOpe
   const turns = useMemo(() => buildSessionTimeline(session), [session]);
   const active = Boolean(runtimeStatus?.processing || runtimeStatus?.starting);
   const sessionOutputFiles = uniqueFiles(session?.output_files || []);
+  const modelLabel = formatModel(runtimeStatus?.model || session?.current_model);
 
   useEffect(() => {
     if (!active) return;
@@ -359,7 +385,7 @@ export default function SessionTimeline({ project, session, runtimeStatus, onOpe
       <div className="session-view-header">
         <div>
           <strong>{session.title || "新 Pi 会话"}</strong>
-          <small>{project?.name || "未选择项目"}</small>
+          <small>{[project?.name || "未选择项目", modelLabel ? `模型：${modelLabel}` : ""].filter(Boolean).join(" · ")}</small>
         </div>
         <span className={`timeline-status ${active ? "active" : ""}`}>
           {active ? <Loader2 className="spin" size={14}/> : <Bot size={14}/>}

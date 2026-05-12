@@ -142,6 +142,16 @@ function compactResult(result) {
   };
 }
 
+function modelInfo(model) {
+  if (!model) return undefined;
+  return {
+    id: model.id || model.model || "",
+    name: model.name || model.id || model.model || "",
+    provider: model.provider || "",
+    api: model.api || "",
+  };
+}
+
 function appendTimeline(ctx, eventType, payload = {}) {
   appendEvent(ctx, {
     kind: "timeline",
@@ -180,7 +190,17 @@ function gitChangedFiles(cwd) {
 
 export default function(pi) {
   pi.on("session_start", async (_event, ctx) => {
-    appendEvent(ctx, { kind: "session", source: "session-start" });
+    appendEvent(ctx, { kind: "session", source: "session-start", model: modelInfo(ctx?.model) });
+    appendEvent(ctx, { kind: "model", source: "session-start", model: modelInfo(ctx?.model) });
+  });
+
+  pi.on("model_select", async (event, ctx) => {
+    appendEvent(ctx, {
+      kind: "model",
+      source: event.source,
+      model: modelInfo(event.model),
+      previousModel: modelInfo(event.previousModel),
+    });
   });
 
   pi.on("agent_start", async (event, ctx) => {
@@ -225,6 +245,7 @@ export default function(pi) {
       messageId: event.message?.id,
       text: textContent(event.message),
       messageRole: event.message?.role,
+      model: modelInfo(event.message),
     });
   });
 
@@ -887,7 +908,14 @@ async fn start_pi_session(app: tauri::AppHandle, session_id: String, pi_command:
     let mut buf = vec![0u8; 8192];
     loop {
       match reader.read(&mut buf) {
-        Ok(0) => break,
+        Ok(0) => {
+          append_debug_line(&format!("[backend] pi-output eof session_id={}", out_session_id));
+          let _ = out_app.emit("pi-status", serde_json::json!({
+            "sessionId": out_session_id,
+            "status": "Pi 已退出"
+          }));
+          break;
+        }
         Ok(n) => {
           append_debug_line(&format!("[backend] pi-output session_id={} bytes={}", out_session_id, n));
           let _ = out_app.emit("pi-output", serde_json::json!({
@@ -896,9 +924,14 @@ async fn start_pi_session(app: tauri::AppHandle, session_id: String, pi_command:
           }));
         }
         Err(e) => {
+          append_debug_line(&format!("[backend] pi-output error session_id={} error={}", out_session_id, e));
           let _ = out_app.emit("pi-output", serde_json::json!({
             "sessionId": out_session_id,
             "data": format!("\r\n[PTY 读取错误] {e}\r\n")
+          }));
+          let _ = out_app.emit("pi-status", serde_json::json!({
+            "sessionId": out_session_id,
+            "status": "Pi 已退出"
           }));
           break;
         }

@@ -1,5 +1,27 @@
 export function stripAnsiText(text) {
-  return String(text || "").replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, "");
+  return String(text || "")
+    .replace(/\x1B\][^\x07]*(?:\x07|\x1B\\)/g, "")
+    .replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, "");
+}
+
+export function isPiStartupOutput(text) {
+  const value = stripAnsiText(text).replace(/\x07/g, "").trim();
+  if (!value) return false;
+  const markers = [
+    /(?:^|\n)\s*0;(?:pi|npm|π - agent)/i,
+    /\bWelcome back!\b/i,
+    /\bTips\b/i,
+    /\bLoaded\b/i,
+    /Recent sessions/i,
+    /Press any key to continue/i,
+    /\[Prompts\]/i,
+    /\[Extensions\]/i,
+    /Update Available/i,
+    /Package Updates Available/i,
+    /npm root/i,
+    /npm view pi-intercom version/i
+  ];
+  return markers.filter((pattern) => pattern.test(value)).length >= 2;
 }
 
 export function splitMarkdownSections(text) {
@@ -144,7 +166,7 @@ export function buildSessionTimeline(session) {
   }
 
   const firstPrompt = String(session.first_prompt || "").trim();
-  const output = stripAnsiText(session.output || "").trim();
+  const output = isPiStartupOutput(session.output) ? "" : stripAnsiText(session.output || "").trim();
   if (!firstPrompt && !output) return [];
 
   return [{
@@ -161,13 +183,13 @@ export function buildSessionTimeline(session) {
         attachments: Array.isArray(session.attachments) ? session.attachments : [],
         created_at: session.created_at
       }, 0) : null,
-      normalizeTimelineItem({
+      output ? normalizeTimelineItem({
         id: `${session.id || "session"}-fallback-assistant`,
         type: "assistant_message",
         text: output,
         status: output ? "completed" : "pending",
         updated_at: session.updated_at
-      }, 1)
+      }, 1) : null
     ].filter(Boolean)
   }];
 }

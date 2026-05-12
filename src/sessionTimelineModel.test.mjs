@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
-import { buildSessionTimeline, splitMarkdownSections, stripAnsiText } from "./sessionTimelineModel.js";
+import { buildSessionTimeline, isPiStartupOutput, splitMarkdownSections, stripAnsiText } from "./sessionTimelineModel.js";
 
 assert.equal(stripAnsiText("\u001b[31m错误\u001b[0m"), "错误");
+assert.equal(stripAnsiText("\u001b]0;pi\u0007内容"), "内容");
 
 assert.deepEqual(buildSessionTimeline(null), []);
 
@@ -32,6 +33,19 @@ const fallbackTimeline = buildSessionTimeline({
 assert.equal(fallbackTimeline.length, 1);
 assert.equal(fallbackTimeline[0].items[0].text, "解释代码");
 assert.equal(fallbackTimeline[0].items[1].text, "这是结果");
+
+const startupOutput = "\u001b]0;pi\u0007\n[Prompts]\n  user\n[Extensions]\n╭─── pi agent ─╮\nWelcome back!\nTips\nLoaded\nPress any key to continue (30s)\nUpdate Available";
+assert.equal(isPiStartupOutput(startupOutput), true);
+assert.deepEqual(buildSessionTimeline({ id: "startup", output: startupOutput }), []);
+
+const startupWithPrompt = buildSessionTimeline({
+  id: "startup-prompt",
+  first_prompt: "测试会话窗口",
+  output: startupOutput
+});
+assert.equal(startupWithPrompt.length, 1);
+assert.equal(startupWithPrompt[0].items.length, 1);
+assert.equal(startupWithPrompt[0].items[0].type, "user_message");
 
 const itemTimeline = buildSessionTimeline({
   id: "s3",

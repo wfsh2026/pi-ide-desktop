@@ -65,6 +65,12 @@ assert.equal(command.command, "rg --files");
 assert.equal(command.output, "src/App.jsx");
 assert.equal(command.status, "completed");
 
+const progressItems = turns[0].items.filter((item) => item.type === "progress");
+assert.equal(progressItems.some((item) => item.title === "正在思考"), true);
+assert.equal(progressItems.some((item) => item.title === "正在输出结果"), true);
+assert.equal(progressItems.some((item) => item.title === "已运行 rg --files"), true);
+assert.equal(progressItems.filter((item) => item.key === "progress-tool-call-1").length, 1);
+
 turns = applyPiIdeTimelineEvent(turns, {
   kind: "timeline",
   eventType: "agent_end"

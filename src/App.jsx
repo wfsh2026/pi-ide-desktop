@@ -866,6 +866,30 @@ export default function App() {
     });
   }
 
+  function normalizeModelInfo(model) {
+    if (!model) return null;
+    const id = String(model.id || model.model || model.name || "").trim();
+    const name = String(model.name || model.id || model.model || "").trim();
+    if (!id && !name) return null;
+    return {
+      id,
+      name: name || id,
+      provider: String(model.provider || "").trim(),
+      api: String(model.api || "").trim()
+    };
+  }
+
+  function updateSessionModel(sessionId, model) {
+    const normalized = normalizeModelInfo(model);
+    if (!sessionId || !normalized) return;
+    setSessionRuntimeStatus(sessionId, { model: normalized });
+    updateSessionById(sessionId, (session) => ({
+      ...session,
+      current_model: normalized,
+      updated_at: new Date().toISOString()
+    }));
+  }
+
   function applyPiIdeEvents(events) {
     if (!Array.isArray(events) || events.length === 0) return;
     const bySession = new Map();
@@ -881,7 +905,14 @@ export default function App() {
       if (fileEventSeenRef.current.has(key)) continue;
       fileEventSeenRef.current.add(key);
 
+      if (event.kind === "model") {
+        updateSessionModel(targetSessionId, event.model);
+        continue;
+      }
+
       if (event.kind === "timeline") {
+        debugLog("timeline event", { targetSessionId, eventType: event.eventType, eventRunId, runtimeRunId: runtime.runId });
+        if (event.model) updateSessionModel(targetSessionId, event.model);
         const failedEvent = event.eventType === "extension_error" || (event.eventType === "auto_retry_end" && event.success === false);
         if (event.eventType === "agent_start") {
           clearSessionIdleTimer(targetSessionId);
@@ -893,12 +924,16 @@ export default function App() {
           updated_at: event.timestamp || new Date().toISOString()
         }));
         if (event.eventType === "agent_end") {
+          debugLog("processing false by agent_end", { targetSessionId });
           clearSessionIdleTimer(targetSessionId);
           setSessionRuntimeStatus(targetSessionId, { processing: false });
+          markLatestTurnStatus(targetSessionId, "completed");
         }
         if (failedEvent) {
+          debugLog("processing false by failed timeline event", { targetSessionId, eventType: event.eventType });
           clearSessionIdleTimer(targetSessionId);
           setSessionRuntimeStatus(targetSessionId, { processing: false });
+          markLatestTurnStatus(targetSessionId, "failed", event.error || event.finalError || event.errorMessage || "Pi 执行失败");
         }
         continue;
       }
@@ -1005,8 +1040,12 @@ export default function App() {
       setStatus(text);
       if (sessionId) {
         const running = text.includes("Pi 已启动") || text.includes("Pi 已经在运行");
-        const stopped = text.includes("Pi 已停止");
+        const stopped = text.includes("Pi 已停止") || text.includes("Pi 已退出");
         const previous = piSessionStatusRef.current[sessionId] || {};
+        if (stopped) {
+          clearSessionIdleTimer(sessionId);
+          markLatestTurnStatus(sessionId, "failed", text);
+        }
         setSessionRuntimeStatus(sessionId, {
           running: stopped ? false : running || previous.running || false,
           starting: false,
@@ -1025,11 +1064,18 @@ export default function App() {
 
       if (!sessionId || !piSessionStatusRef.current[sessionId]?.processing) return;
       clearSessionIdleTimer(sessionId);
-      if (data.includes("[PTY 读取错误]") || data.includes("Pi 已停止")) {
+      if (data.includes("[PTY 读取错误]") || data.includes("Pi 已停止") || data.includes("Pi 已退出")) {
+        debugLog("processing false by terminal error", { sessionId });
         setSessionRuntimeStatus(sessionId, { processing: false });
         markLatestTurnStatus(sessionId, "failed", data);
         return;
       }
+      outputIdleTimersRef.current[sessionId] = setTimeout(() => {
+        debugLog("processing false by idle fallback", { sessionId });
+        setSessionRuntimeStatus(sessionId, { processing: false });
+        markLatestTurnStatus(sessionId, "completed");
+        delete outputIdleTimersRef.current[sessionId];
+      }, 4000);
     }).then((f) => unsubs.push(f));
     getCurrentWebview().onDragDropEvent((event) => {
       if (event.payload?.type === "drop") {
@@ -1371,6 +1417,10 @@ export default function App() {
       await invoke("start_pi_session", { sessionId, piCommand: commandText, workdir: runWorkdir, continueSession });
       debugLog("startPi done", { sessionId });
       setSessionRuntimeStatus(sessionId, { running: true, starting: false, processing: false, status: "Pi 已启动" });
+    } catch (error) {
+      debugLog("startPi failed", { sessionId, error: String(error) });
+      setSessionRuntimeStatus(sessionId, { running: false, starting: false, processing: false, status: `Pi 启动失败：${String(error)}` });
+      throw error;
     } finally {
       startingSessionsRef.current.delete(sessionId);
     }
@@ -1392,9 +1442,15 @@ export default function App() {
   }
 
   async function handleTerminalInput(data) {
-    await ensureActivePiRunning();
     const sessionId = activeProjectSessionIdRef.current;
-    await invoke("send_pi_input", { sessionId, input: data });
+    try {
+      await ensureActivePiRunning();
+      await invoke("send_pi_input", { sessionId, input: data });
+    } catch (error) {
+      debugLog("terminal input failed", { sessionId, error: String(error) });
+      setStatus(String(error));
+      if (sessionId) setSessionRuntimeStatus(sessionId, { starting: false, processing: false, status: String(error) });
+    }
   }
 
   async function stopPi() {
