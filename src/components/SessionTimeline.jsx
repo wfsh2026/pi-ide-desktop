@@ -1,0 +1,397 @@
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { Bot, Check, ChevronDown, ChevronRight, Clock3, Copy, ExternalLink, File, FileText, Loader2, MoreHorizontal, RotateCcw, Terminal } from "lucide-react";
+import { buildSessionTimeline, splitMarkdownSections } from "../sessionTimelineModel.js";
+
+function uniqueFiles(files) {
+  const seen = new Set();
+  return (files || []).filter((file) => {
+    const key = file?.path || file?.name;
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function fileExt(file) {
+  const name = String(file?.name || file?.path || "");
+  const ext = name.includes(".") ? name.split(".").pop().toUpperCase() : "FILE";
+  return ext || "FILE";
+}
+
+function fileLabel(file) {
+  const ext = fileExt(file);
+  if (["MD", "TXT", "DOC", "DOCX", "PDF"].includes(ext)) return `文档 · ${ext}`;
+  if (["JS", "JSX", "TS", "TSX", "RS", "PY", "CSS", "HTML", "JSON"].includes(ext)) return `代码 · ${ext}`;
+  return `文件 · ${ext}`;
+}
+
+function formatDuration(ms) {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  const min = Math.floor(total / 60);
+  const sec = total % 60;
+  if (min <= 0) return `${sec}s`;
+  return `${min}m ${sec}s`;
+}
+
+function elapsedText(turn, active, hasVisibleWork, now) {
+  const start = turn.createdAt ? new Date(turn.createdAt).getTime() : now;
+  const end = active ? now : (turn.updatedAt ? new Date(turn.updatedAt).getTime() : now);
+  if (active && !hasVisibleWork && end - start < 3000) return "正在思考";
+  return `已处理 ${formatDuration(end - start)}`;
+}
+
+function copyText(text) {
+  navigator.clipboard?.writeText(String(text || "")).catch(() => {});
+}
+
+function InlineText({ text }) {
+  const parts = String(text || "").split(/(`[^`]+`)/g);
+  return (
+    <>
+      {parts.map((part, index) => {
+        if (part.startsWith("`") && part.endsWith("`")) {
+          return <code className="codex-inline-code" key={index}>{part.slice(1, -1)}</code>;
+        }
+        return <React.Fragment key={index}>{part}</React.Fragment>;
+      })}
+    </>
+  );
+}
+
+function MarkdownText({ text }) {
+  const sections = splitMarkdownSections(text);
+  if (sections.length === 0) return null;
+
+  return (
+    <div className="codex-markdown">
+      {sections.map((section, index) => {
+        if (section.type === "code") {
+          return (
+            <pre className="codex-code" key={`${section.type}-${index}`}>
+              {section.language && <span>{section.language}</span>}
+              <code>{section.text}</code>
+            </pre>
+          );
+        }
+
+        return section.text.split(/\n{2,}/).map((block, blockIndex) => {
+          const value = block.trim();
+          if (!value) return null;
+          const heading = value.match(/^(#{1,4})\s+(.+)$/);
+          if (heading) return <h4 key={`${index}-${blockIndex}`}>{heading[2]}</h4>;
+
+          const lines = value.split("\n");
+          const bulletLines = lines.filter((line) => /^[-*]\s+/.test(line.trim()));
+          if (bulletLines.length > 0 && bulletLines.length === lines.length) {
+            return (
+              <ul key={`${index}-${blockIndex}`}>
+                {bulletLines.map((line, lineIndex) => <li key={lineIndex}><InlineText text={line.trim().replace(/^[-*]\s+/, "")}/></li>)}
+              </ul>
+            );
+          }
+
+          const orderedLines = lines.filter((line) => /^\d+\.\s+/.test(line.trim()));
+          if (orderedLines.length > 0 && orderedLines.length === lines.length) {
+            return (
+              <ol key={`${index}-${blockIndex}`}>
+                {orderedLines.map((line, lineIndex) => <li key={lineIndex}><InlineText text={line.trim().replace(/^\d+\.\s+/, "")}/></li>)}
+              </ol>
+            );
+          }
+
+          return <p key={`${index}-${blockIndex}`}><InlineText text={value}/></p>;
+        });
+      })}
+    </div>
+  );
+}
+
+function collectTurnParts(turn, fallbackOutputFiles) {
+  const parts = {
+    user: null,
+    assistantText: "",
+    progress: [],
+    thinking: [],
+    commands: [],
+    references: [],
+    outputs: [],
+    errors: []
+  };
+
+  for (const item of turn.items || []) {
+    if (item.type === "user_message") parts.user = item;
+    else if (item.type === "assistant_message") parts.assistantText += item.text || "";
+    else if (item.type === "progress") parts.progress.push(item);
+    else if (item.type === "thinking") parts.thinking.push(item);
+    else if (item.type === "command") parts.commands.push(item);
+    else if (item.type === "file_reference") parts.references.push(...(item.files || []));
+    else if (item.type === "file_output") parts.outputs.push(...(item.files || []));
+    else if (item.type === "error") parts.errors.push(item);
+  }
+
+  parts.references = uniqueFiles(parts.references);
+  parts.outputs = uniqueFiles(parts.outputs.length ? parts.outputs : fallbackOutputFiles);
+  return parts;
+}
+
+function UserMessage({ item }) {
+  if (!item) return null;
+  return (
+    <div className="codex-user-message">
+      <div className="codex-user-bubble">
+        <MarkdownText text={item.text}/>
+      </div>
+      <button className="codex-mini-action" title="复制" onClick={() => copyText(item.text)}>
+        <Copy size={13}/>
+      </button>
+    </div>
+  );
+}
+
+function StatusLine({ label, expanded, canExpand, onToggle }) {
+  const content = (
+    <>
+      <span>{label}</span>
+      {canExpand && (expanded ? <ChevronDown size={13}/> : <ChevronRight size={13}/>)}
+    </>
+  );
+
+  if (!canExpand) return <div className="codex-status-line">{content}</div>;
+  return <button className="codex-status-line interactive" onClick={onToggle}>{content}</button>;
+}
+
+function OutputFileCard({ file, onOpenFile, onOpenDirectory }) {
+  return (
+    <div className="codex-output-file-card">
+      <div className="codex-file-icon"><FileText size={18}/></div>
+      <div className="codex-file-meta">
+        <strong>{file.name || file.path}</strong>
+        <small>{fileLabel(file)}</small>
+      </div>
+      <button
+        className="codex-open-file"
+        onClick={() => onOpenFile?.(file)}
+        onContextMenu={(event) => {
+          event.preventDefault();
+          onOpenDirectory?.(file);
+        }}
+      >
+        打开 <ChevronDown size={13}/>
+      </button>
+    </div>
+  );
+}
+
+function ChangeSummary({ files, onOpenFile }) {
+  if (files.length === 0) return null;
+  return (
+    <div className="codex-change-card">
+      <div className="codex-change-head">
+        <strong>{files.length} 个文件已更改</strong>
+        <div>
+          <button title="撤销"><RotateCcw size={13}/>撤销</button>
+          <button title="审核"><ExternalLink size={13}/>审核</button>
+          <button title="更多"><MoreHorizontal size={14}/></button>
+        </div>
+      </div>
+      {files.map((file) => (
+        <button className="codex-change-row" key={file.path || file.name} onClick={() => onOpenFile?.(file)}>
+          <span>{file.path || file.name}</span>
+          <small>{file.additions != null ? `+${file.additions}` : "已更改"}{file.deletions != null ? ` -${file.deletions}` : ""}</small>
+          <ChevronDown size={13}/>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function CommandDetails({ commands, expandedCommands, onToggleCommand }) {
+  if (commands.length === 0) return null;
+  return (
+    <div className="codex-detail-block">
+      <div className="codex-detail-title"><Terminal size={14}/> 已运行 {commands.length} 条命令</div>
+      {commands.map((command, index) => {
+        const id = command.id || `command-${index}`;
+        const expanded = expandedCommands.has(id);
+        return (
+          <div className="codex-command-detail" key={id}>
+            <button className="codex-command-toggle" onClick={() => onToggleCommand(id)}>
+              {expanded ? <ChevronDown size={13}/> : <ChevronRight size={13}/>}
+              {command.status === "running" ? `正在运行 ${command.command}` : "已运行命令"}
+            </button>
+            {expanded && (
+              <div className="codex-shell-card">
+                <div className="codex-shell-label">Shell</div>
+                <pre><code>{command.cwd ? `${command.cwd}> ${command.command}` : `$ ${command.command}`}{command.output ? `\n\n${command.output}` : ""}</code></pre>
+                <div className={command.exitCode && command.exitCode !== 0 ? "codex-shell-result danger" : "codex-shell-result"}>
+                  <Check size={13}/> {command.exitCode && command.exitCode !== 0 ? `失败 ${command.exitCode}` : "成功"}
+                </div>
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function FileDetailList({ title, files }) {
+  if (files.length === 0) return null;
+  return (
+    <div className="codex-detail-block">
+      <div className="codex-detail-title"><File size={14}/> {title} {files.length} 个文件</div>
+      <div className="codex-detail-files">
+        {files.map((file) => <span key={file.path || file.name}>{file.name || file.path}</span>)}
+      </div>
+    </div>
+  );
+}
+
+function TurnDetails({ parts, expandedCommands, onToggleCommand }) {
+  const hasDetails = parts.commands.length || parts.references.length || parts.progress.length || parts.thinking.length || parts.errors.length;
+  if (!hasDetails) return null;
+
+  return (
+    <div className="codex-turn-details">
+      <CommandDetails commands={parts.commands} expandedCommands={expandedCommands} onToggleCommand={onToggleCommand}/>
+      <FileDetailList title="已读取" files={parts.references}/>
+      {parts.progress.length > 0 && (
+        <div className="codex-detail-block">
+          <div className="codex-detail-title"><Loader2 size={14}/> 处理过程</div>
+          {parts.progress.map((item) => <div className="codex-detail-note" key={item.id}>{item.title}{item.detail ? `：${item.detail}` : ""}</div>)}
+        </div>
+      )}
+      {parts.thinking.length > 0 && (
+        <div className="codex-detail-block">
+          <div className="codex-detail-title"><Bot size={14}/> 思考过程</div>
+          {parts.thinking.map((item) => <pre className="codex-code" key={item.id}><code>{item.text}</code></pre>)}
+        </div>
+      )}
+      {parts.errors.map((error) => (
+        <div className="codex-detail-block danger" key={error.id}>
+          <div className="codex-detail-title">{error.title}</div>
+          <pre className="codex-code"><code>{error.detail}</code></pre>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function TurnView({ turn, runtimeStatus, fallbackOutputFiles, expanded, expandedCommands, onToggleTurn, onToggleCommand, onOpenFile, onOpenDirectory, now }) {
+  const active = Boolean((runtimeStatus?.processing || runtimeStatus?.starting) && turn.status === "running");
+  const parts = collectTurnParts(turn, fallbackOutputFiles);
+  const hasDetails = Boolean(parts.commands.length || parts.references.length || parts.progress.length || parts.thinking.length || parts.errors.length);
+  const hasVisibleWork = Boolean(parts.assistantText.trim() || parts.commands.length || parts.outputs.length || parts.errors.length);
+  const status = elapsedText(turn, active, hasVisibleWork, now);
+
+  return (
+    <div className="codex-turn">
+      <UserMessage item={parts.user}/>
+      <StatusLine label={status} expanded={expanded} canExpand={hasDetails} onToggle={onToggleTurn}/>
+      {parts.assistantText.trim() ? <MarkdownText text={parts.assistantText}/> : active ? <div className="codex-thinking">正在思考</div> : null}
+      {parts.outputs.length > 0 && (
+        <div className="codex-output-section">
+          <strong>已输出文件：</strong>
+          <div className="codex-output-links">
+            {parts.outputs.map((file) => <button key={file.path || file.name} onClick={() => onOpenFile?.(file)}><File size={13}/>{file.name || file.path}</button>)}
+          </div>
+          {parts.outputs.map((file) => <OutputFileCard key={file.path || file.name} file={file} onOpenFile={onOpenFile} onOpenDirectory={onOpenDirectory}/>)}
+          <ChangeSummary files={parts.outputs} onOpenFile={onOpenFile}/>
+        </div>
+      )}
+      {expanded && <TurnDetails parts={parts} expandedCommands={expandedCommands} onToggleCommand={onToggleCommand}/>}
+    </div>
+  );
+}
+
+export default function SessionTimeline({ project, session, runtimeStatus, onOpenFile, onOpenDirectory }) {
+  const viewportRef = useRef(null);
+  const [expandedTurns, setExpandedTurns] = useState(() => new Set());
+  const [expandedCommands, setExpandedCommands] = useState(() => new Set());
+  const [now, setNow] = useState(Date.now());
+  const turns = useMemo(() => buildSessionTimeline(session), [session]);
+  const active = Boolean(runtimeStatus?.processing || runtimeStatus?.starting);
+  const sessionOutputFiles = uniqueFiles(session?.output_files || []);
+
+  useEffect(() => {
+    if (!active) return;
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [active]);
+
+  useEffect(() => {
+    if (!active || !viewportRef.current) return;
+    viewportRef.current.scrollTop = viewportRef.current.scrollHeight;
+  }, [active, session?.output, turns.length]);
+
+  function toggleTurn(id) {
+    setExpandedTurns((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  function toggleCommand(id) {
+    setExpandedCommands((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  if (!session) {
+    return (
+      <div className="session-view codex-session-view">
+        <div className="session-empty-state">
+          <Clock3 size={20}/>
+          <strong>未选择会话</strong>
+          <span>请先在左侧选择或创建一个 Pi 会话。</span>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="session-view codex-session-view">
+      <div className="session-view-header">
+        <div>
+          <strong>{session.title || "新 Pi 会话"}</strong>
+          <small>{project?.name || "未选择项目"}</small>
+        </div>
+        <span className={`timeline-status ${active ? "active" : ""}`}>
+          {active ? <Loader2 className="spin" size={14}/> : <Bot size={14}/>}
+          {active ? "处理中" : "已完成"}
+        </span>
+      </div>
+
+      <div className="session-timeline codex-stream" ref={viewportRef}>
+        {turns.length === 0 ? (
+          <div className="session-empty-state">
+            <Bot size={20}/>
+            <strong>会话尚未开始</strong>
+            <span>在下方输入任务后，这里会按 Codex 风格整理展示。</span>
+          </div>
+        ) : (
+          turns.map((turn, index) => (
+            <TurnView
+              key={turn.id}
+              turn={turn}
+              runtimeStatus={index === turns.length - 1 ? runtimeStatus : null}
+              fallbackOutputFiles={index === turns.length - 1 ? sessionOutputFiles : []}
+              expanded={expandedTurns.has(turn.id)}
+              expandedCommands={expandedCommands}
+              onToggleTurn={() => toggleTurn(turn.id)}
+              onToggleCommand={toggleCommand}
+              onOpenFile={onOpenFile}
+              onOpenDirectory={onOpenDirectory}
+              now={now}
+            />
+          ))
+        )}
+      </div>
+    </div>
+  );
+}
