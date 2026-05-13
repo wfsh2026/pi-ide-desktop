@@ -2,14 +2,45 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Bot, Check, ChevronDown, ChevronRight, Clock3, Copy, ExternalLink, File, FileText, Loader2, MoreHorizontal, RotateCcw, Terminal } from "lucide-react";
 import { buildSessionTimeline, splitMarkdownSections } from "../sessionTimelineModel.js";
 
+function fileKey(file) {
+  return file?.path || file?.name || "";
+}
+
 function uniqueFiles(files) {
   const seen = new Set();
   return (files || []).filter((file) => {
-    const key = file?.path || file?.name;
+    const key = fileKey(file);
     if (!key || seen.has(key)) return false;
     seen.add(key);
     return true;
   });
+}
+
+function collectTurnOutputFileKeys(turns) {
+  const keys = new Set();
+  for (const turn of turns || []) {
+    for (const item of turn?.items || []) {
+      if (item?.type !== "file_output") continue;
+      for (const file of item.files || []) {
+        const key = fileKey(file);
+        if (key) keys.add(key);
+      }
+    }
+  }
+  return keys;
+}
+
+function latestCompletedTurnId(turns) {
+  const list = Array.isArray(turns) ? turns : [];
+  for (let index = list.length - 1; index >= 0; index -= 1) {
+    if (list[index]?.status !== "running") return list[index].id;
+  }
+  return list[list.length - 1]?.id || null;
+}
+
+function isNearScrollBottom(element) {
+  if (!element) return true;
+  return element.scrollHeight - element.scrollTop - element.clientHeight <= 24;
 }
 
 function fileExt(file) {
@@ -331,12 +362,16 @@ function TurnView({ turn, runtimeStatus, fallbackOutputFiles, expanded, expanded
 
 export default function SessionTimeline({ project, session, runtimeStatus, onOpenFile, onOpenDirectory }) {
   const viewportRef = useRef(null);
+  const shouldAutoScrollRef = useRef(true);
   const [expandedTurns, setExpandedTurns] = useState(() => new Set());
   const [expandedCommands, setExpandedCommands] = useState(() => new Set());
   const [now, setNow] = useState(Date.now());
   const turns = useMemo(() => buildSessionTimeline(session), [session]);
   const active = Boolean(runtimeStatus?.processing || runtimeStatus?.starting);
-  const sessionOutputFiles = uniqueFiles(session?.output_files || []);
+  const turnOutputFileKeys = useMemo(() => collectTurnOutputFileKeys(turns), [turns]);
+  const fallbackOutputFiles = useMemo(() => uniqueFiles(session?.output_files || [])
+    .filter((file) => !turnOutputFileKeys.has(fileKey(file))), [session?.output_files, turnOutputFileKeys]);
+  const fallbackOutputTurnId = useMemo(() => latestCompletedTurnId(turns), [turns]);
   const modelLabel = formatModel(runtimeStatus?.model || session?.current_model);
 
   useEffect(() => {
@@ -346,9 +381,20 @@ export default function SessionTimeline({ project, session, runtimeStatus, onOpe
   }, [active]);
 
   useEffect(() => {
-    if (!active || !viewportRef.current) return;
+    shouldAutoScrollRef.current = true;
+    window.requestAnimationFrame(() => {
+      if (viewportRef.current) viewportRef.current.scrollTop = viewportRef.current.scrollHeight;
+    });
+  }, [session?.id]);
+
+  useEffect(() => {
+    if (!active || !viewportRef.current || !shouldAutoScrollRef.current) return;
     viewportRef.current.scrollTop = viewportRef.current.scrollHeight;
-  }, [active, session?.output, turns.length]);
+  }, [active, session?.output, session?.updated_at, turns.length]);
+
+  function handleViewportScroll(event) {
+    shouldAutoScrollRef.current = isNearScrollBottom(event.currentTarget);
+  }
 
   function toggleTurn(id) {
     setExpandedTurns((prev) => {
@@ -393,7 +439,7 @@ export default function SessionTimeline({ project, session, runtimeStatus, onOpe
         </span>
       </div>
 
-      <div className="session-timeline pi-session-stream" ref={viewportRef}>
+      <div className="session-timeline pi-session-stream" ref={viewportRef} onScroll={handleViewportScroll}>
         {turns.length === 0 ? (
           <div className="session-empty-state">
             <Bot size={20}/>
@@ -406,7 +452,7 @@ export default function SessionTimeline({ project, session, runtimeStatus, onOpe
               key={turn.id}
               turn={turn}
               runtimeStatus={index === turns.length - 1 ? runtimeStatus : null}
-              fallbackOutputFiles={index === turns.length - 1 ? sessionOutputFiles : []}
+              fallbackOutputFiles={turn.id === fallbackOutputTurnId ? fallbackOutputFiles : []}
               expanded={expandedTurns.has(turn.id)}
               expandedCommands={expandedCommands}
               onToggleTurn={() => toggleTurn(turn.id)}

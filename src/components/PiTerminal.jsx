@@ -29,7 +29,7 @@ function normalizeForScrollableTerminal(data) {
     .replace(/\x1b\[3J/g, "");
 }
 
-export default function PiTerminal({ activeSessionId, clearSignal, replaySignal = 0, replayContent = "", terminalInputEnabled = true, debugEnabled = false, debugWorkdir = "", onTerminalInput }) {
+export default function PiTerminal({ activeSessionId, clearSignal, replaySignal = 0, replayContent = "", debugEnabled = false, debugWorkdir = "", onTerminalInput }) {
   const hostRef = useRef(null);
   const scrollbarRef = useRef(null);
   const thumbRef = useRef(null);
@@ -41,7 +41,6 @@ export default function PiTerminal({ activeSessionId, clearSignal, replaySignal 
   const replayTimeoutRef = useRef(null);
   const isReplayingRef = useRef(false);
   const activeSessionIdRef = useRef(activeSessionId);
-  const terminalInputEnabledRef = useRef(terminalInputEnabled);
   const onTerminalInputRef = useRef(onTerminalInput);
   const debugEnabledRef = useRef(debugEnabled);
   const debugWorkdirRef = useRef(debugWorkdir);
@@ -62,15 +61,6 @@ export default function PiTerminal({ activeSessionId, clearSignal, replaySignal 
   }, [onTerminalInput]);
 
   useEffect(() => {
-    terminalInputEnabledRef.current = terminalInputEnabled;
-    const term = terminalRef.current;
-    if (term) {
-      term.options.disableStdin = !terminalInputEnabled;
-      if (terminalInputEnabled) term.focus();
-    }
-  }, [terminalInputEnabled]);
-
-  useEffect(() => {
     const host = hostRef.current;
     const scrollbar = scrollbarRef.current;
     const thumb = thumbRef.current;
@@ -80,7 +70,7 @@ export default function PiTerminal({ activeSessionId, clearSignal, replaySignal 
     const term = new Terminal({
       cursorBlink: true,
       convertEol: false,
-      disableStdin: !terminalInputEnabledRef.current,
+      disableStdin: false,
       scrollback: terminalScrollbackLimit(),
       scrollOnUserInput: false,
       smoothScrollDuration: 0,
@@ -199,7 +189,7 @@ export default function PiTerminal({ activeSessionId, clearSignal, replaySignal 
     };
 
     const onHostPointerDown = () => {
-      if (terminalInputEnabledRef.current) term.focus();
+      term.focus();
     };
 
     const dataDisposable = term.onData((data) => {
@@ -207,7 +197,6 @@ export default function PiTerminal({ activeSessionId, clearSignal, replaySignal 
         logDebug("terminal onData ignored during replay", { activeSessionId: activeSessionIdRef.current, bytes: data.length });
         return;
       }
-      if (!terminalInputEnabledRef.current) return;
       const sessionId = activeSessionIdRef.current;
       if (!sessionId) return;
       if (onTerminalInputRef.current) onTerminalInputRef.current(data).catch(() => {});
@@ -276,7 +265,7 @@ export default function PiTerminal({ activeSessionId, clearSignal, replaySignal 
       if (replayTimeoutRef.current) clearTimeout(replayTimeoutRef.current);
       replayTimeoutRef.current = null;
       isReplayingRef.current = false;
-      term.options.disableStdin = !terminalInputEnabledRef.current;
+      term.options.disableStdin = false;
       logDebug("terminal replay end", { activeSessionId: activeSessionIdRef.current, replaySignal, reason });
     };
     replayTimeoutRef.current = setTimeout(() => finishReplay("timeout"), 5000);
@@ -287,7 +276,7 @@ export default function PiTerminal({ activeSessionId, clearSignal, replaySignal 
   }, [replaySignal, replayContent]);
 
   return (
-    <div className={`xterm-frame ${terminalInputEnabled ? "terminal-native" : "terminal-enhanced"}`}>
+    <div className="xterm-frame terminal-native">
       <div className="xterm-host" ref={hostRef} />
       <div className="terminal-scrollbar" ref={scrollbarRef}>
         <div className="terminal-scrollbar-thumb" ref={thumbRef} />
