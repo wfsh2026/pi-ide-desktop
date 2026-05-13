@@ -58,7 +58,7 @@ function InlineText({ text }) {
     <>
       {parts.map((part, index) => {
         if (part.startsWith("`") && part.endsWith("`")) {
-          return <code className="codex-inline-code" key={index}>{part.slice(1, -1)}</code>;
+          return <code className="pi-session-inline-code" key={index}>{part.slice(1, -1)}</code>;
         }
         return <React.Fragment key={index}>{part}</React.Fragment>;
       })}
@@ -71,11 +71,11 @@ function MarkdownText({ text }) {
   if (sections.length === 0) return null;
 
   return (
-    <div className="codex-markdown">
+    <div className="pi-session-markdown">
       {sections.map((section, index) => {
         if (section.type === "code") {
           return (
-            <pre className="codex-code" key={`${section.type}-${index}`}>
+            <pre className="pi-session-code" key={`${section.type}-${index}`}>
               {section.language && <span>{section.language}</span>}
               <code>{section.text}</code>
             </pre>
@@ -145,11 +145,11 @@ function collectTurnParts(turn, fallbackOutputFiles) {
 function UserMessage({ item }) {
   if (!item) return null;
   return (
-    <div className="codex-user-message">
-      <div className="codex-user-bubble">
+    <div className="pi-session-user-message">
+      <div className="pi-session-user-bubble">
         <MarkdownText text={item.text}/>
       </div>
-      <button className="codex-mini-action" title="复制" onClick={() => copyText(item.text)}>
+      <button className="pi-session-mini-action" title="复制" onClick={() => copyText(item.text)}>
         <Copy size={13}/>
       </button>
     </div>
@@ -164,17 +164,17 @@ function StatusLine({ label, expanded, canExpand, onToggle }) {
     </>
   );
 
-  if (!canExpand) return <div className="codex-status-line">{content}</div>;
-  return <button className="codex-status-line interactive" onClick={onToggle}>{content}</button>;
+  if (!canExpand) return <div className="pi-session-status-line">{content}</div>;
+  return <button className="pi-session-status-line interactive" onClick={onToggle}>{content}</button>;
 }
 
 function OperationRecords({ items }) {
   const records = (items || []).filter((item) => item?.title);
   if (records.length === 0) return null;
   return (
-    <div className="codex-operation-list">
+    <div className="pi-session-operation-list">
       {records.map((item) => (
-        <div className={`codex-operation-row ${item.status || ""}`} key={item.id}>
+        <div className={`pi-session-operation-row ${item.status || ""}`} key={item.id}>
           {item.status === "running" ? <Loader2 className="spin" size={13}/> : <Check size={13}/>}
           <span>{item.title}</span>
           {item.detail && <small>{item.detail}</small>}
@@ -186,14 +186,14 @@ function OperationRecords({ items }) {
 
 function OutputFileCard({ file, onOpenFile, onOpenDirectory }) {
   return (
-    <div className="codex-output-file-card">
-      <div className="codex-file-icon"><FileText size={18}/></div>
-      <div className="codex-file-meta">
+    <div className="pi-session-output-file-card">
+      <div className="pi-session-file-icon"><FileText size={18}/></div>
+      <div className="pi-session-file-meta">
         <strong>{file.name || file.path}</strong>
         <small>{fileLabel(file)}</small>
       </div>
       <button
-        className="codex-open-file"
+        className="pi-session-open-file"
         onClick={() => onOpenFile?.(file)}
         onContextMenu={(event) => {
           event.preventDefault();
@@ -209,8 +209,8 @@ function OutputFileCard({ file, onOpenFile, onOpenDirectory }) {
 function ChangeSummary({ files, onOpenFile }) {
   if (files.length === 0) return null;
   return (
-    <div className="codex-change-card">
-      <div className="codex-change-head">
+    <div className="pi-session-change-card">
+      <div className="pi-session-change-head">
         <strong>{files.length} 个文件已更改</strong>
         <div>
           <button title="撤销"><RotateCcw size={13}/>撤销</button>
@@ -219,7 +219,7 @@ function ChangeSummary({ files, onOpenFile }) {
         </div>
       </div>
       {files.map((file) => (
-        <button className="codex-change-row" key={file.path || file.name} onClick={() => onOpenFile?.(file)}>
+        <button className="pi-session-change-row" key={file.path || file.name} onClick={() => onOpenFile?.(file)}>
           <span>{file.path || file.name}</span>
           <small>{file.additions != null ? `+${file.additions}` : "已更改"}{file.deletions != null ? ` -${file.deletions}` : ""}</small>
           <ChevronDown size={13}/>
@@ -232,22 +232,22 @@ function ChangeSummary({ files, onOpenFile }) {
 function CommandDetails({ commands, expandedCommands, onToggleCommand }) {
   if (commands.length === 0) return null;
   return (
-    <div className="codex-detail-block">
-      <div className="codex-detail-title"><Terminal size={14}/> 已运行 {commands.length} 条命令</div>
+    <div className="pi-session-detail-block">
+      <div className="pi-session-detail-title"><Terminal size={14}/> 已运行 {commands.length} 条命令</div>
       {commands.map((command, index) => {
         const id = command.id || `command-${index}`;
         const expanded = expandedCommands.has(id);
         return (
-          <div className="codex-command-detail" key={id}>
-            <button className="codex-command-toggle" onClick={() => onToggleCommand(id)}>
+          <div className="pi-session-command-detail" key={id}>
+            <button className="pi-session-command-toggle" onClick={() => onToggleCommand(id)}>
               {expanded ? <ChevronDown size={13}/> : <ChevronRight size={13}/>}
               {command.status === "running" ? `正在运行 ${command.command}` : "已运行命令"}
             </button>
             {expanded && (
-              <div className="codex-shell-card">
-                <div className="codex-shell-label">Shell</div>
+              <div className="pi-session-shell-card">
+                <div className="pi-session-shell-label">Shell</div>
                 <pre><code>{command.cwd ? `${command.cwd}> ${command.command}` : `$ ${command.command}`}{command.output ? `\n\n${command.output}` : ""}</code></pre>
-                <div className={command.exitCode && command.exitCode !== 0 ? "codex-shell-result danger" : "codex-shell-result"}>
+                <div className={command.exitCode && command.exitCode !== 0 ? "pi-session-shell-result danger" : "pi-session-shell-result"}>
                   <Check size={13}/> {command.exitCode && command.exitCode !== 0 ? `失败 ${command.exitCode}` : "成功"}
                 </div>
               </div>
@@ -262,9 +262,9 @@ function CommandDetails({ commands, expandedCommands, onToggleCommand }) {
 function FileDetailList({ title, files }) {
   if (files.length === 0) return null;
   return (
-    <div className="codex-detail-block">
-      <div className="codex-detail-title"><File size={14}/> {title} {files.length} 个文件</div>
-      <div className="codex-detail-files">
+    <div className="pi-session-detail-block">
+      <div className="pi-session-detail-title"><File size={14}/> {title} {files.length} 个文件</div>
+      <div className="pi-session-detail-files">
         {files.map((file) => <span key={file.path || file.name}>{file.name || file.path}</span>)}
       </div>
     </div>
@@ -276,25 +276,25 @@ function TurnDetails({ parts, expandedCommands, onToggleCommand }) {
   if (!hasDetails) return null;
 
   return (
-    <div className="codex-turn-details">
+    <div className="pi-session-turn-details">
       <CommandDetails commands={parts.commands} expandedCommands={expandedCommands} onToggleCommand={onToggleCommand}/>
       <FileDetailList title="已读取" files={parts.references}/>
       {parts.progress.length > 0 && (
-        <div className="codex-detail-block">
-          <div className="codex-detail-title"><Loader2 size={14}/> 处理过程</div>
-          {parts.progress.map((item) => <div className="codex-detail-note" key={item.id}>{item.title}{item.detail ? `：${item.detail}` : ""}</div>)}
+        <div className="pi-session-detail-block">
+          <div className="pi-session-detail-title"><Loader2 size={14}/> 处理过程</div>
+          {parts.progress.map((item) => <div className="pi-session-detail-note" key={item.id}>{item.title}{item.detail ? `：${item.detail}` : ""}</div>)}
         </div>
       )}
       {parts.thinking.length > 0 && (
-        <div className="codex-detail-block">
-          <div className="codex-detail-title"><Bot size={14}/> 思考过程</div>
-          {parts.thinking.map((item) => <pre className="codex-code" key={item.id}><code>{item.text}</code></pre>)}
+        <div className="pi-session-detail-block">
+          <div className="pi-session-detail-title"><Bot size={14}/> 思考过程</div>
+          {parts.thinking.map((item) => <pre className="pi-session-code" key={item.id}><code>{item.text}</code></pre>)}
         </div>
       )}
       {parts.errors.map((error) => (
-        <div className="codex-detail-block danger" key={error.id}>
-          <div className="codex-detail-title">{error.title}</div>
-          <pre className="codex-code"><code>{error.detail}</code></pre>
+        <div className="pi-session-detail-block danger" key={error.id}>
+          <div className="pi-session-detail-title">{error.title}</div>
+          <pre className="pi-session-code"><code>{error.detail}</code></pre>
         </div>
       ))}
     </div>
@@ -309,15 +309,15 @@ function TurnView({ turn, runtimeStatus, fallbackOutputFiles, expanded, expanded
   const status = elapsedText(turn, active, hasVisibleWork, now);
 
   return (
-    <div className="codex-turn">
+    <div className="pi-session-turn">
       <UserMessage item={parts.user}/>
       <StatusLine label={status} expanded={expanded} canExpand={hasDetails} onToggle={onToggleTurn}/>
       <OperationRecords items={parts.progress}/>
-      {parts.assistantText.trim() ? <MarkdownText text={parts.assistantText}/> : active ? <div className="codex-thinking">正在思考</div> : null}
+      {parts.assistantText.trim() ? <MarkdownText text={parts.assistantText}/> : active ? <div className="pi-session-thinking">正在思考</div> : null}
       {parts.outputs.length > 0 && (
-        <div className="codex-output-section">
+        <div className="pi-session-output-section">
           <strong>已输出文件：</strong>
-          <div className="codex-output-links">
+          <div className="pi-session-output-links">
             {parts.outputs.map((file) => <button key={file.path || file.name} onClick={() => onOpenFile?.(file)}><File size={13}/>{file.name || file.path}</button>)}
           </div>
           {parts.outputs.map((file) => <OutputFileCard key={file.path || file.name} file={file} onOpenFile={onOpenFile} onOpenDirectory={onOpenDirectory}/>)}
@@ -370,7 +370,7 @@ export default function SessionTimeline({ project, session, runtimeStatus, onOpe
 
   if (!session) {
     return (
-      <div className="session-view codex-session-view">
+      <div className="session-view pi-session-view">
         <div className="session-empty-state">
           <Clock3 size={20}/>
           <strong>未选择会话</strong>
@@ -381,7 +381,7 @@ export default function SessionTimeline({ project, session, runtimeStatus, onOpe
   }
 
   return (
-    <div className="session-view codex-session-view">
+    <div className="session-view pi-session-view">
       <div className="session-view-header">
         <div>
           <strong>{session.title || "新 Pi 会话"}</strong>
@@ -393,12 +393,12 @@ export default function SessionTimeline({ project, session, runtimeStatus, onOpe
         </span>
       </div>
 
-      <div className="session-timeline codex-stream" ref={viewportRef}>
+      <div className="session-timeline pi-session-stream" ref={viewportRef}>
         {turns.length === 0 ? (
           <div className="session-empty-state">
             <Bot size={20}/>
             <strong>会话尚未开始</strong>
-            <span>在下方输入任务后，这里会按 Codex 风格整理展示。</span>
+            <span>在下方输入任务后，这里会按结构化风格整理展示。</span>
           </div>
         ) : (
           turns.map((turn, index) => (
