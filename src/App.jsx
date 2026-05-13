@@ -291,10 +291,11 @@ function relativeTime(value) {
   return `${Math.floor(days / 7)} 周`;
 }
 
-function ProjectPanel({ projects, activeProjectId, activeSessionId, piSessionStatus, onAddProject, onNewSession, onSelectSession, onToggleProject, onDeleteProject, onDeleteSession, onRenameSession, onOpenProjectInExplorer }) {
+function ProjectPanel({ projects, activeProjectId, activeSessionId, piSessionStatus, onAddProject, onNewSession, onSelectSession, onToggleProject, onArchiveProject, onArchiveSession, onRenameSession, onOpenProjectInExplorer }) {
   const [menu, setMenu] = useState(null);
   const [editing, setEditing] = useState(null);
   const [draftTitle, setDraftTitle] = useState("");
+  const visibleProjects = projects.filter((project) => !project.archived);
 
   useEffect(() => {
     const close = () => setMenu(null);
@@ -347,12 +348,12 @@ function ProjectPanel({ projects, activeProjectId, activeSessionId, piSessionSta
         <button className="icon" title="添加项目目录" onClick={onAddProject}><Plus size={15}/></button>
       </div>
       <div className="project-list">
-        {projects.length === 0 && <div className="empty">暂无项目。点击 + 选择一个目录。</div>}
-        {projects.map((project) => (
+        {visibleProjects.length === 0 && <div className="empty">暂无项目。点击 + 选择一个目录。</div>}
+        {visibleProjects.map((project) => (
           <div className="project-group" key={project.id}>
             <div
               className={`project-heading ${activeProjectId === project.id ? "active" : ""}`}
-              title={`${project.path}\n左键展开/收起，右键删除项目`}
+              title={`${project.path}\n左键展开/收起，右键归档项目`}
               onClick={() => onToggleProject(project.id)}
               onContextMenu={(event) => openMenu(event, { type: "project", projectId: project.id })}
             >
@@ -362,8 +363,10 @@ function ProjectPanel({ projects, activeProjectId, activeSessionId, piSessionSta
             </div>
             {!project.collapsed && (
               <div className="project-sessions">
-                {(project.sessions || []).length === 0 && <div className="project-empty-session">暂无 Pi 会话</div>}
-                {(project.sessions || []).map((session) => {
+                {(() => {
+                  const visibleSessions = (project.sessions || []).filter((session) => !session.archived);
+                  if (visibleSessions.length === 0) return <div className="project-empty-session">暂无 Pi 会话</div>;
+                  return visibleSessions.map((session) => {
                   const isEditing = editing?.sessionId === session.id;
                   return (
                     <div
@@ -371,7 +374,7 @@ function ProjectPanel({ projects, activeProjectId, activeSessionId, piSessionSta
                       className={`project-session ${activeSessionId === session.id ? "active" : ""}`}
                       onClick={() => !isEditing && onSelectSession(project.id, session.id)}
                       onContextMenu={(event) => openMenu(event, { type: "session", projectId: project.id, session })}
-                      title={`${session.title}\n右键重命名/删除`}
+                      title={`${session.title}\n右键重命名/归档`}
                     >
                       {isEditing ? (
                         <input
@@ -399,7 +402,8 @@ function ProjectPanel({ projects, activeProjectId, activeSessionId, piSessionSta
                       )}
                     </div>
                   );
-                })}
+                  });
+                })()}
               </div>
             )}
           </div>
@@ -412,11 +416,11 @@ function ProjectPanel({ projects, activeProjectId, activeSessionId, piSessionSta
             onOpenProjectInExplorer(menu.projectId);
           }}>在资源管理器打开</button>}
           {menu.type === "session" && <button onClick={() => startRename(menu.projectId, menu.session)}>重命名</button>}
-          <button className="danger" onClick={() => {
+          <button onClick={() => {
             setMenu(null);
-            if (menu.type === "project") Promise.resolve(onDeleteProject(menu.projectId)).catch(() => {});
-            else Promise.resolve(onDeleteSession(menu.projectId, menu.session.id)).catch(() => {});
-          }}>删除</button>
+            if (menu.type === "project") Promise.resolve(onArchiveProject(menu.projectId)).catch(() => {});
+            else Promise.resolve(onArchiveSession(menu.projectId, menu.session.id)).catch(() => {});
+          }}>{menu.type === "project" ? "归档项目" : "归档会话"}</button>
         </div>
       )}
     </section>
@@ -526,26 +530,47 @@ function DirectoryTreeNodeView({ node, depth = 0, expandedPaths, searchText = ""
 }
 
 function SessionFilesSection({ title, files, emptyText, onOpenFile, onOpenDirectory }) {
+  const [expanded, setExpanded] = useState(true);
+  const fileList = files || [];
+
   return (
     <div className="session-files-section">
-      <h4>{title}</h4>
-      {(!files || files.length === 0) && <div className="session-files-empty">{emptyText}</div>}
-      {(files || []).map((file) => (
-        <button
-          key={`${file.path}-${file.source}`}
-          className="session-file-item"
-          title={`${file.path}\n左键打开文件，右键打开所在目录`}
-          onClick={() => onOpenFile(file)}
-          onContextMenu={(event) => {
-            event.preventDefault();
-            onOpenDirectory(file);
-          }}
-        >
-          <File size={14}/>
-          <span>{file.name || basename(file.path)}</span>
-          <small>{file.source || ""}</small>
-        </button>
-      ))}
+      <button
+        type="button"
+        className="session-files-section-toggle"
+        aria-expanded={expanded}
+        onClick={() => setExpanded((value) => !value)}
+      >
+        <span className="session-files-section-label">
+          {expanded ? <ChevronDown size={14}/> : <ChevronRight size={14}/>}
+          <strong>{title}</strong>
+        </span>
+        <small>{fileList.length} 个</small>
+      </button>
+      {expanded && (
+        fileList.length === 0
+          ? <div className="session-files-empty">{emptyText}</div>
+          : (
+            <div className="session-files-list">
+              {fileList.map((file) => (
+                <button
+                  key={`${file.path}-${file.source}`}
+                  className="session-file-item"
+                  title={`${file.path}\n左键打开文件，右键打开所在目录`}
+                  onClick={() => onOpenFile(file)}
+                  onContextMenu={(event) => {
+                    event.preventDefault();
+                    onOpenDirectory(file);
+                  }}
+                >
+                  <File size={14}/>
+                  <span>{file.name || basename(file.path)}</span>
+                  <small>{file.source || ""}</small>
+                </button>
+              ))}
+            </div>
+          )
+      )}
     </div>
   );
 }
@@ -1238,14 +1263,15 @@ export default function App() {
   function createOrSelectProjectForPath(path, { createNewSession = false, sessionTitle = "新 Pi 会话", startCommand = "" } = {}) {
     persistCurrentSessionOutput();
     const now = new Date().toISOString();
-    const existing = projectsRef.current.find((p) => p.path === path);
+    const existing = projectsRef.current.find((p) => p.path === path && !p.archived);
     let projectId = existing?.id || makeId("project");
     let sessionId = null;
     let nextProjects;
 
     if (existing) {
       const sessions = existing.sessions || [];
-      if (createNewSession || sessions.length === 0) {
+      const visibleSessions = sessions.filter((session) => !session.archived);
+      if (createNewSession || visibleSessions.length === 0) {
         sessionId = makeId("pi-session");
         nextProjects = projectsRef.current.map((project) => project.id === existing.id
           ? {
@@ -1255,7 +1281,7 @@ export default function App() {
             }
           : project);
       } else {
-        sessionId = sessions[0].id;
+        sessionId = visibleSessions[0].id;
         nextProjects = projectsRef.current;
       }
     } else {
@@ -1288,9 +1314,10 @@ export default function App() {
   async function addProject() {
     const selected = await open({ directory: true, multiple: false, title: "选择项目目录" });
     if (typeof selected !== "string") return;
-    const existing = projectsRef.current.find((p) => p.path === selected);
-    if (existing && (existing.sessions || []).length > 0) {
-      selectProjectSession(existing.id, existing.sessions[0].id);
+    const existing = projectsRef.current.find((p) => p.path === selected && !p.archived);
+    const existingSession = existing?.sessions?.find((session) => !session.archived);
+    if (existing && existingSession) {
+      selectProjectSession(existing.id, existingSession.id);
       invoke("ensure_pi_ide_config", { workdir: selected, legacyCommand: legacyPiCommandRef.current }).catch(() => {});
       return;
     }
@@ -1343,58 +1370,63 @@ export default function App() {
     setStatus(`已在资源管理器打开：${project.name}`);
   }
 
-  async function deleteProject(projectId) {
+  function activateFirstVisibleProjectSession(nextProjects) {
+    const nextProject = nextProjects.find((project) => !project.archived && (project.sessions || []).some((session) => !session.archived));
+    const nextSession = nextProject?.sessions?.find((session) => !session.archived);
+    if (nextProject && nextSession) {
+      selectProjectSession(nextProject.id, nextSession.id);
+      return;
+    }
+    activeProjectIdRef.current = null;
+    activeProjectSessionIdRef.current = null;
+    setActiveProjectId(null);
+    setActiveProjectSessionId(null);
+    outputBufferRef.current = "";
+    setTerminalReplayContent("");
+    setTerminalReplaySignal((value) => value + 1);
+  }
+
+  async function archiveProject(projectId) {
     const project = projectsRef.current.find((p) => p.id === projectId);
     if (!project) return;
-    if (!window.confirm(`确定删除项目「${project.name}」及其所有会话记录吗？不会删除磁盘文件。`)) return;
+    if (!window.confirm(`确定归档项目「${project.name}」吗？归档后会从当前列表隐藏，不会删除磁盘文件或 Pi 原生会话。`)) return;
     await Promise.all((project.sessions || []).map((session) => invoke("stop_pi_session", { sessionId: session.id }).catch(() => {})));
     setPiSessionStatus((prev) => {
       const next = { ...prev };
       for (const session of project.sessions || []) delete next[session.id];
       return next;
     });
-    const nextProjects = projectsRef.current.filter((p) => p.id !== projectId);
+    const now = new Date().toISOString();
+    const nextProjects = projectsRef.current.map((p) => p.id === projectId
+      ? { ...p, archived: true, archived_at: now, updated_at: now }
+      : p);
     saveProjects(nextProjects);
     if (activeProjectIdRef.current === projectId) {
-      const nextProject = nextProjects[0];
-      const nextSession = nextProject?.sessions?.[0];
-      if (nextProject && nextSession) selectProjectSession(nextProject.id, nextSession.id);
-      else {
-        activeProjectIdRef.current = null;
-        activeProjectSessionIdRef.current = null;
-        setActiveProjectId(null);
-        setActiveProjectSessionId(null);
-        outputBufferRef.current = "";
-        setTerminalReplayContent("");
-        setTerminalReplaySignal((value) => value + 1);
-      }
+      activateFirstVisibleProjectSession(nextProjects);
     }
   }
 
-  async function deleteProjectSession(projectId, sessionId) {
+  async function archiveProjectSession(projectId, sessionId) {
     const project = projectsRef.current.find((p) => p.id === projectId);
     const session = project?.sessions?.find((s) => s.id === sessionId);
     if (!project || !session) return;
-    if (!window.confirm(`确定删除会话「${session.title}」吗？`)) return;
+    if (!window.confirm(`确定归档会话「${session.title}」吗？归档后会从当前列表隐藏，不会删除 Pi 原生会话。`)) return;
     await invoke("stop_pi_session", { sessionId }).catch(() => {});
     setPiSessionStatus((prev) => {
       const next = { ...prev };
       delete next[sessionId];
       return next;
     });
-    const nextProjects = projectsRef.current.map((p) => p.id === projectId ? { ...p, sessions: (p.sessions || []).filter((s) => s.id !== sessionId) } : p);
+    const now = new Date().toISOString();
+    const nextProjects = projectsRef.current.map((p) => p.id === projectId
+      ? { ...p, sessions: (p.sessions || []).map((s) => s.id === sessionId ? { ...s, archived: true, archived_at: now, updated_at: now } : s) }
+      : p);
     saveProjects(nextProjects);
     if (activeProjectSessionIdRef.current === sessionId) {
       const nextProject = nextProjects.find((p) => p.id === projectId);
-      const nextSession = nextProject?.sessions?.[0];
+      const nextSession = nextProject?.sessions?.find((session) => !session.archived);
       if (nextSession) selectProjectSession(projectId, nextSession.id);
-      else {
-        activeProjectSessionIdRef.current = null;
-        setActiveProjectSessionId(null);
-        outputBufferRef.current = "";
-        setTerminalReplayContent("");
-        setTerminalReplaySignal((value) => value + 1);
-      }
+      else activateFirstVisibleProjectSession(nextProjects);
     }
   }
 
@@ -1800,8 +1832,8 @@ export default function App() {
           onNewSession={(projectId) => createAndStartProjectSession(projectId).catch((e) => setStatus(String(e)))}
           onSelectSession={(projectId, sessionId) => activateProjectSession(projectId, sessionId).catch((e) => setStatus(String(e)))}
           onToggleProject={toggleProject}
-          onDeleteProject={deleteProject}
-          onDeleteSession={deleteProjectSession}
+          onArchiveProject={archiveProject}
+          onArchiveSession={archiveProjectSession}
           onRenameSession={renameProjectSession}
           onOpenProjectInExplorer={(projectId) => openProjectInExplorer(projectId).catch((e) => setStatus(String(e)))}
         />
