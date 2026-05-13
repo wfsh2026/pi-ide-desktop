@@ -934,20 +934,23 @@ export default function App() {
   useEffect(() => {
     const projectPath = activeProject?.path || workdir || "";
     let cancelled = false;
-    invoke("ensure_pi_ide_config", { workdir: projectPath || null, legacyCommand: legacyPiCommandRef.current }).then((config) => {
-      if (cancelled) return;
-      const enabled = Boolean(config?.debugEnabled ?? config?.enabled);
-      backgroundPiIdleStopMinutesRef.current = normalizeBackgroundPiIdleStopMinutes(config?.backgroundIdleStopMinutes);
-      setDebugLogEnabled(enabled);
-      setDebugLogContext({ enabled, workdir: projectPath });
-    }).catch(() => {
-      if (cancelled) return;
-      backgroundPiIdleStopMinutesRef.current = DEFAULT_BACKGROUND_PI_IDLE_STOP_MINUTES;
-      setDebugLogEnabled(false);
-      setDebugLogContext({ enabled: false, workdir: projectPath });
-    });
+    const timer = window.setTimeout(() => {
+      invoke("ensure_pi_ide_config", { workdir: projectPath || null, legacyCommand: legacyPiCommandRef.current }).then((config) => {
+        if (cancelled) return;
+        const enabled = Boolean(config?.debugEnabled ?? config?.enabled);
+        backgroundPiIdleStopMinutesRef.current = normalizeBackgroundPiIdleStopMinutes(config?.backgroundIdleStopMinutes);
+        setDebugLogEnabled(enabled);
+        setDebugLogContext({ enabled, workdir: projectPath });
+      }).catch(() => {
+        if (cancelled) return;
+        backgroundPiIdleStopMinutesRef.current = DEFAULT_BACKGROUND_PI_IDLE_STOP_MINUTES;
+        setDebugLogEnabled(false);
+        setDebugLogContext({ enabled: false, workdir: projectPath });
+      });
+    }, 800);
     return () => {
       cancelled = true;
+      window.clearTimeout(timer);
     };
   }, [activeProject?.path, workdir]);
 
@@ -1172,8 +1175,9 @@ export default function App() {
   }
 
   useEffect(() => {
-    checkPiEnvironment(activeProject?.path || workdir, { showStatus: false }).catch(() => {});
-  }, [activeProject?.path, workdir, checkPiEnvironment]);
+    setPiEnvironment(null);
+    setPiSetupOpen(false);
+  }, [activeProject?.path, workdir]);
 
   function saveProjects(nextProjects) {
     const compactProjects = normalizeStoredProjects(nextProjects, storageLimits());
@@ -1547,7 +1551,7 @@ export default function App() {
       const projectPath = context?.projectPath || context?.project_path;
       if (projectPath) {
         createOrSelectProjectForPath(projectPath, { createNewSession: true, sessionTitle: "右键启动" });
-        invoke("ensure_pi_ide_config", { workdir: projectPath, legacyCommand: legacyPiCommandRef.current }).catch(() => {});
+        setTimeout(() => invoke("ensure_pi_ide_config", { workdir: projectPath, legacyCommand: legacyPiCommandRef.current }).catch(() => {}), 800);
         setStatus(`已载入项目：${basename(projectPath)}`);
       }
     }).catch(() => {});
@@ -1679,7 +1683,9 @@ export default function App() {
     setActiveProjectSessionId(sessionId);
     setWorkdir(path);
     outputBufferRef.current = "";
-    setTerminalReplayContent("");
+    setCommand("");
+    setAttachments([]);
+    if (terminalReplayContent) setTerminalReplayContent("");
     setTerminalReplaySignal((value) => value + 1);
     return { projectId, sessionId, path };
   }
@@ -1691,11 +1697,11 @@ export default function App() {
     const existingSession = existing?.sessions?.find((session) => !session.archived);
     if (existing && existingSession) {
       selectProjectSession(existing.id, existingSession.id);
-      invoke("ensure_pi_ide_config", { workdir: selected, legacyCommand: legacyPiCommandRef.current }).catch(() => {});
+      setTimeout(() => invoke("ensure_pi_ide_config", { workdir: selected, legacyCommand: legacyPiCommandRef.current }).catch(() => {}), 800);
       return;
     }
     createOrSelectProjectForPath(selected);
-    invoke("ensure_pi_ide_config", { workdir: selected, legacyCommand: legacyPiCommandRef.current }).catch(() => {});
+    setTimeout(() => invoke("ensure_pi_ide_config", { workdir: selected, legacyCommand: legacyPiCommandRef.current }).catch(() => {}), 800);
   }
 
   function createProjectSession(projectId) {
@@ -1839,8 +1845,14 @@ export default function App() {
     setCommand(session.draft_command || "");
     setAttachments(session.attachments || []);
     if (!sameSession && !options.skipReplay) {
-      replayTerminalTail(sessionId, session.output || "");
-      debugLog("selectProjectSession replay", { sessionId, outputBytes: (session.output || "").length });
+      if (centerView === "terminal") {
+        replayTerminalTail(sessionId, session.output || "");
+        debugLog("selectProjectSession replay", { sessionId, outputBytes: (session.output || "").length });
+      } else {
+        setTerminalReplayContent("");
+        setTerminalReplaySignal((value) => value + 1);
+        debugLog("selectProjectSession defer replay", { sessionId, outputBytes: (session.output || "").length });
+      }
     } else if (!sameSession && options.skipReplay) {
       setTerminalReplayContent("");
       setTerminalReplaySignal((value) => value + 1);
