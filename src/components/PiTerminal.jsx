@@ -5,7 +5,7 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 
 const TERMINAL_SCROLLBACK_STORAGE_KEY = "piIdeTerminalScrollback";
-const DEFAULT_TERMINAL_SCROLLBACK = 10000;
+const DEFAULT_TERMINAL_SCROLLBACK = 100000;
 
 function configuredPositiveNumber(key, fallback) {
   const value = Number(localStorage.getItem(key));
@@ -24,9 +24,10 @@ function debugLog(enabled, workdir, message, data = undefined) {
 
 function normalizeForScrollableTerminal(data) {
   return String(data || "")
+    .replace(/\x1bc/g, "")
     .replace(/\x1b\[\?(?:1000|1002|1003|1005|1006|1015|1007|2004)[hl]/g, "")
     .replace(/\x1b\[\?(?:1047|1048|1049)[hl]/g, "")
-    .replace(/\x1b\[3J/g, "");
+    .replace(/\x1b\[(?:2|3)J/g, "");
 }
 
 export default function PiTerminal({ activeSessionId, clearSignal, replaySignal = 0, replayContent = "", debugEnabled = false, debugWorkdir = "", onTerminalInput }) {
@@ -268,25 +269,13 @@ export default function PiTerminal({ activeSessionId, clearSignal, replaySignal 
       term.options.disableStdin = false;
       logDebug("terminal replay end", { activeSessionId: activeSessionIdRef.current, replaySignal, reason });
     };
-    replayTimeoutRef.current = setTimeout(() => finishReplay("timeout"), 5000);
     term.reset();
     const content = normalizeForScrollableTerminal(replayContent);
     if (!content) {
       finishReplay("empty");
       return;
     }
-    const chunkSize = 16 * 1024;
-    let offset = 0;
-    const writeNextChunk = () => {
-      if (finished) return;
-      const chunk = content.slice(offset, offset + chunkSize);
-      offset += chunk.length;
-      term.write(chunk, () => {
-        if (offset >= content.length) finishReplay("callback");
-        else window.requestAnimationFrame(writeNextChunk);
-      });
-    };
-    writeNextChunk();
+    term.write(content, () => finishReplay("callback"));
   }, [replaySignal, replayContent]);
 
   return (
