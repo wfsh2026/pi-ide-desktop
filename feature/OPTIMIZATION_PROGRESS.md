@@ -102,4 +102,4 @@ Pi 官方支持 RPC 模式，适合 IDE 或自定义 UI 作为结构化主通道
 - 验证通过：`node src/projectStorageModel.test.mjs`、`node src/sessionTimelineModel.test.mjs`、`node src/piIdeEventMapper.test.mjs`、`npm run build`。
 - 2026-05-13：针对打开项目卡顿风险进一步收紧目录树加载规则：移除切换项目时自动加载目录树的 effect，`get_directory_tree` 首次只返回根节点且不预扫描 preview lines；用户展开目录时再调用 `get_directory_children`。验证通过：`npm run build`、`node src/projectStorageModel.test.mjs`、`node src/sessionTimelineModel.test.mjs`、`node src/piIdeEventMapper.test.mjs`、`cargo check`。
 - 2026-05-13：继续优化默认启动内容：项目打开/切换时不再自动执行 Pi 环境检测，只重置环境状态并等待用户点击“环境设置”或发送任务时检测；配置 ensure 延迟执行；非终端视图切换会话时延迟读取终端日志尾部。
-- 2026-05-13：完成会话切换体验修复。点击左侧会话后延迟 250ms 后台预启动对应 Pi 实例，让 UI 先完成切换；新增会话输入队列，用户在 Pi 启动中发送的首条消息会先排队，Pi 启动完成后自动发送，避免首条消息丢失；Pi 环境检测增加 5 分钟缓存；空会话不再因启动欢迎输出触发 `--continue`；`SessionTimeline` 改为稳定的最近记录窗口和“加载更早记录”按钮，避免按估算高度虚拟滚动造成滚动位置跳动；终端历史 replay 保持 16KB 分块写入 xterm，避免切换终端视图时一次性写入大文本造成 UI 冻结。
+- 2026-05-13：完成会话切换体验修复。点击左侧会话后延迟 250ms 后台预启动对应 Pi 实例，让 UI 先完成切换；新增会话输入队列，用户在 Pi 启动中发送的首条消息会先排队，Pi 启动完成后自动发送，避免首条消息丢失；Pi 环境检测增加 5 分钟缓存；空会话不再因启动欢迎输出触发 `--continue`；会话视图移除最近记录窗口限制，恢复完整 turn 渲染，保证文本和折叠详情完整显示；终端历史 replay 恢复完整写入，默认 scrollback 提升到 100000，并改回 xterm 原生滚动条，避免自定义滚动条只能查看当前屏幕内容。

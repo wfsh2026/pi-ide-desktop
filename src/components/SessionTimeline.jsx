@@ -38,9 +38,6 @@ function latestCompletedTurnId(turns) {
   return list[list.length - 1]?.id || null;
 }
 
-const INITIAL_VISIBLE_TURNS = 80;
-const LOAD_MORE_TURNS = 80;
-
 function isNearScrollBottom(element) {
   if (!element) return true;
   return element.scrollHeight - element.scrollTop - element.clientHeight <= 24;
@@ -366,7 +363,6 @@ function TurnView({ turn, runtimeStatus, fallbackOutputFiles, expanded, expanded
 export default function SessionTimeline({ project, session, runtimeStatus, onOpenFile, onOpenDirectory }) {
   const viewportRef = useRef(null);
   const shouldAutoScrollRef = useRef(true);
-  const [visibleCount, setVisibleCount] = useState(INITIAL_VISIBLE_TURNS);
   const [expandedTurns, setExpandedTurns] = useState(() => new Set());
   const [expandedCommands, setExpandedCommands] = useState(() => new Set());
   const [now, setNow] = useState(Date.now());
@@ -377,8 +373,6 @@ export default function SessionTimeline({ project, session, runtimeStatus, onOpe
     .filter((file) => !turnOutputFileKeys.has(fileKey(file))), [session?.output_files, turnOutputFileKeys]);
   const fallbackOutputTurnId = useMemo(() => latestCompletedTurnId(turns), [turns]);
   const modelLabel = formatModel(runtimeStatus?.model || session?.current_model);
-  const hiddenTurnCount = Math.max(0, turns.length - visibleCount);
-  const visibleTurns = useMemo(() => turns.slice(-visibleCount), [turns, visibleCount]);
 
   useEffect(() => {
     if (!active) return;
@@ -387,7 +381,6 @@ export default function SessionTimeline({ project, session, runtimeStatus, onOpe
   }, [active]);
 
   useEffect(() => {
-    setVisibleCount(INITIAL_VISIBLE_TURNS);
     shouldAutoScrollRef.current = true;
     window.requestAnimationFrame(() => {
       if (viewportRef.current) viewportRef.current.scrollTop = viewportRef.current.scrollHeight;
@@ -454,28 +447,21 @@ export default function SessionTimeline({ project, session, runtimeStatus, onOpe
             <span>在下方输入任务后，这里会按结构化风格整理展示。</span>
           </div>
         ) : (
-          <>
-            {hiddenTurnCount > 0 && (
-              <button className="timeline-load-more" onClick={() => setVisibleCount((value) => value + LOAD_MORE_TURNS)}>
-                加载更早 {Math.min(LOAD_MORE_TURNS, hiddenTurnCount)} 条记录，已隐藏 {hiddenTurnCount} 条
-              </button>
-            )}
-            {visibleTurns.map((turn) => (
-              <TurnView
-                key={turn.id}
-                turn={turn}
-                runtimeStatus={turn.id === turns[turns.length - 1]?.id ? runtimeStatus : null}
-                fallbackOutputFiles={turn.id === fallbackOutputTurnId ? fallbackOutputFiles : []}
-                expanded={expandedTurns.has(turn.id)}
-                expandedCommands={expandedCommands}
-                onToggleTurn={() => toggleTurn(turn.id)}
-                onToggleCommand={toggleCommand}
-                onOpenFile={onOpenFile}
-                onOpenDirectory={onOpenDirectory}
-                now={now}
-              />
-            ))}
-          </>
+          turns.map((turn, index) => (
+            <TurnView
+              key={turn.id}
+              turn={turn}
+              runtimeStatus={index === turns.length - 1 ? runtimeStatus : null}
+              fallbackOutputFiles={turn.id === fallbackOutputTurnId ? fallbackOutputFiles : []}
+              expanded={expandedTurns.has(turn.id)}
+              expandedCommands={expandedCommands}
+              onToggleTurn={() => toggleTurn(turn.id)}
+              onToggleCommand={toggleCommand}
+              onOpenFile={onOpenFile}
+              onOpenDirectory={onOpenDirectory}
+              now={now}
+            />
+          ))
         )}
       </div>
     </div>

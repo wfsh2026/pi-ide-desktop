@@ -1,8 +1,8 @@
 export const DEFAULT_STORAGE_LIMITS = {
-  terminalPreviewChars: 256 * 1024,
-  sessionTextPreviewChars: 128 * 1024,
-  sessionTurnLimit: 50,
-  sessionFileRecordLimit: 500
+  terminalPreviewChars: 1024 * 1024,
+  sessionTextPreviewChars: 10 * 1024 * 1024,
+  sessionTurnLimit: 100000,
+  sessionFileRecordLimit: 10000
 };
 
 export function positiveInteger(value, fallback) {
