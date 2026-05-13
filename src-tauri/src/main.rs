@@ -44,6 +44,8 @@ struct DirectoryTreeNode {
   path: String,
   is_dir: bool,
   omitted: bool,
+  children_loaded: bool,
+  has_more: bool,
   children: Vec<DirectoryTreeNode>,
 }
 
@@ -54,6 +56,26 @@ struct DirectoryTreeResponse {
   tree: DirectoryTreeNode,
   truncated: bool,
 }
+
+#[derive(Debug, Serialize)]
+struct DirectoryTreeChildrenResponse {
+  path: String,
+  children: Vec<DirectoryTreeNode>,
+  truncated: bool,
+}
+
+#[derive(Clone, Copy)]
+struct DirectoryTreeConfig {
+  initial_depth: usize,
+  max_entries_per_directory: usize,
+  preview_max_depth: usize,
+  preview_max_lines: usize,
+}
+
+const DEFAULT_DIRECTORY_TREE_INITIAL_DEPTH: usize = 1;
+const DEFAULT_DIRECTORY_TREE_MAX_ENTRIES_PER_DIRECTORY: usize = 160;
+const DEFAULT_DIRECTORY_TREE_PREVIEW_MAX_DEPTH: usize = 2;
+const DEFAULT_DIRECTORY_TREE_PREVIEW_MAX_LINES: usize = 220;
 
 fn storage_dir() -> Result<PathBuf, String> {
   let home = dirs::home_dir().ok_or("无法定位用户 Home 目录")?;
@@ -67,6 +89,13 @@ fn sessions_path() -> Result<PathBuf, String> { Ok(storage_dir()?.join("sessions
 fn debug_log_path() -> Result<PathBuf, String> { Ok(storage_dir()?.join("debug.log")) }
 fn global_config_path() -> Result<PathBuf, String> { Ok(storage_dir()?.join("config.json")) }
 fn project_config_path(workdir: &Path) -> PathBuf { workdir.join(".pi.ide").join("config.json") }
+fn pi_agent_dir() -> Result<PathBuf, String> {
+  let home = dirs::home_dir().ok_or("无法定位用户 Home 目录")?;
+  Ok(home.join(".pi").join("agent"))
+}
+fn global_pi_settings_path() -> Result<PathBuf, String> { Ok(pi_agent_dir()?.join("settings.json")) }
+fn global_pi_models_path() -> Result<PathBuf, String> { Ok(pi_agent_dir()?.join("models.json")) }
+fn project_pi_settings_path(workdir: &Path) -> PathBuf { workdir.join(".pi").join("settings.json") }
 
 fn append_debug_line_raw(line: &str) {
   if let Ok(path) = debug_log_path() {
@@ -109,6 +138,12 @@ fn default_global_config(command: &str) -> serde_json::Value {
     },
     "debug": {
       "enabled": false
+    },
+    "directoryTree": {
+      "initialDepth": DEFAULT_DIRECTORY_TREE_INITIAL_DEPTH,
+      "maxEntriesPerDirectory": DEFAULT_DIRECTORY_TREE_MAX_ENTRIES_PER_DIRECTORY,
+      "previewMaxDepth": DEFAULT_DIRECTORY_TREE_PREVIEW_MAX_DEPTH,
+      "previewMaxLines": DEFAULT_DIRECTORY_TREE_PREVIEW_MAX_LINES
     }
   })
 }
@@ -122,6 +157,12 @@ fn default_project_config() -> serde_json::Value {
     },
     "debug": {
       "enabled": false
+    },
+    "directoryTree": {
+      "initialDepth": DEFAULT_DIRECTORY_TREE_INITIAL_DEPTH,
+      "maxEntriesPerDirectory": DEFAULT_DIRECTORY_TREE_MAX_ENTRIES_PER_DIRECTORY,
+      "previewMaxDepth": DEFAULT_DIRECTORY_TREE_PREVIEW_MAX_DEPTH,
+      "previewMaxLines": DEFAULT_DIRECTORY_TREE_PREVIEW_MAX_LINES
     }
   })
 }
@@ -162,6 +203,44 @@ fn ensure_debug_config(value: &mut serde_json::Value) -> bool {
   false
 }
 
+fn ensure_directory_tree_config(value: &mut serde_json::Value) -> bool {
+  let Some(map) = value.as_object_mut() else {
+    return false;
+  };
+  let default_value = serde_json::json!({
+    "initialDepth": DEFAULT_DIRECTORY_TREE_INITIAL_DEPTH,
+    "maxEntriesPerDirectory": DEFAULT_DIRECTORY_TREE_MAX_ENTRIES_PER_DIRECTORY,
+    "previewMaxDepth": DEFAULT_DIRECTORY_TREE_PREVIEW_MAX_DEPTH,
+    "previewMaxLines": DEFAULT_DIRECTORY_TREE_PREVIEW_MAX_LINES
+  });
+  let Some(directory_tree) = map.get_mut("directoryTree") else {
+    map.insert("directoryTree".to_string(), default_value);
+    return true;
+  };
+  let Some(directory_tree_map) = directory_tree.as_object_mut() else {
+    *directory_tree = default_value;
+    return true;
+  };
+
+  let mut changed = false;
+  for (key, fallback) in [
+    ("initialDepth", DEFAULT_DIRECTORY_TREE_INITIAL_DEPTH),
+    ("maxEntriesPerDirectory", DEFAULT_DIRECTORY_TREE_MAX_ENTRIES_PER_DIRECTORY),
+    ("previewMaxDepth", DEFAULT_DIRECTORY_TREE_PREVIEW_MAX_DEPTH),
+    ("previewMaxLines", DEFAULT_DIRECTORY_TREE_PREVIEW_MAX_LINES),
+  ] {
+    let valid = directory_tree_map
+      .get(key)
+      .and_then(|value| value.as_u64())
+      .is_some_and(|value| value > 0);
+    if !valid {
+      directory_tree_map.insert(key.to_string(), serde_json::json!(fallback));
+      changed = true;
+    }
+  }
+  changed
+}
+
 fn ensure_config_file_defaults(path: &Path, default_value: serde_json::Value) -> Result<(), String> {
   if !path.exists() {
     write_json_value(path, &default_value)?;
@@ -171,7 +250,8 @@ fn ensure_config_file_defaults(path: &Path, default_value: serde_json::Value) ->
     write_json_value(path, &default_value)?;
     return Ok(());
   };
-  if ensure_debug_config(&mut value) {
+  let changed = ensure_debug_config(&mut value) || ensure_directory_tree_config(&mut value);
+  if changed {
     write_json_value(path, &value)?;
   }
   Ok(())
@@ -229,6 +309,48 @@ fn config_debug_enabled(value: Option<&serde_json::Value>) -> Option<bool> {
     .and_then(|v| v.get("debug"))
     .and_then(|debug| debug.get("enabled"))
     .and_then(|enabled| enabled.as_bool())
+}
+
+fn config_usize(value: Option<&serde_json::Value>, section: &str, key: &str) -> Option<usize> {
+  value
+    .and_then(|v| v.get(section))
+    .and_then(|section| section.get(key))
+    .and_then(|raw| raw.as_u64())
+    .filter(|raw| *raw > 0)
+    .and_then(|raw| usize::try_from(raw).ok())
+}
+
+fn apply_directory_tree_config(value: Option<&serde_json::Value>, config: &mut DirectoryTreeConfig) {
+  if let Some(initial_depth) = config_usize(value, "directoryTree", "initialDepth") {
+    config.initial_depth = initial_depth;
+  }
+  if let Some(max_entries) = config_usize(value, "directoryTree", "maxEntriesPerDirectory") {
+    config.max_entries_per_directory = max_entries;
+  }
+  if let Some(preview_max_depth) = config_usize(value, "directoryTree", "previewMaxDepth") {
+    config.preview_max_depth = preview_max_depth;
+  }
+  if let Some(preview_max_lines) = config_usize(value, "directoryTree", "previewMaxLines") {
+    config.preview_max_lines = preview_max_lines;
+  }
+}
+
+fn resolve_directory_tree_config(workdir: Option<&Path>) -> Result<DirectoryTreeConfig, String> {
+  let (global_path, project_path) = ensure_pi_ide_config_files(workdir, None)?;
+  let global_config = read_json_value(&global_path)?;
+  let project_config = match &project_path {
+    Some(path) => read_json_value(path)?,
+    None => None,
+  };
+  let mut config = DirectoryTreeConfig {
+    initial_depth: DEFAULT_DIRECTORY_TREE_INITIAL_DEPTH,
+    max_entries_per_directory: DEFAULT_DIRECTORY_TREE_MAX_ENTRIES_PER_DIRECTORY,
+    preview_max_depth: DEFAULT_DIRECTORY_TREE_PREVIEW_MAX_DEPTH,
+    preview_max_lines: DEFAULT_DIRECTORY_TREE_PREVIEW_MAX_LINES,
+  };
+  apply_directory_tree_config(global_config.as_ref(), &mut config);
+  apply_directory_tree_config(project_config.as_ref(), &mut config);
+  Ok(config)
 }
 
 fn resolve_debug_logging_enabled(workdir: Option<&Path>, legacy_command: Option<&str>) -> Result<bool, String> {
@@ -309,6 +431,109 @@ fn ensure_pi_ide_config(workdir: Option<String>, legacy_command: Option<String>)
     "debugEnabled": debug_enabled,
     "globalConfig": global_path.to_string_lossy(),
     "projectConfig": project_path.map(|path| path.to_string_lossy().to_string())
+  }))
+}
+
+fn json_string(value: Option<&serde_json::Value>, key: &str) -> Option<String> {
+  value
+    .and_then(|v| v.get(key))
+    .and_then(|raw| raw.as_str())
+    .map(str::trim)
+    .filter(|text| !text.is_empty())
+    .map(ToString::to_string)
+}
+
+fn pi_model_value(provider: &str, id: &str, name: Option<&str>, api: Option<&str>, source: &str) -> serde_json::Value {
+  serde_json::json!({
+    "provider": provider,
+    "id": id,
+    "name": name.map(str::trim).filter(|value| !value.is_empty()).unwrap_or(id),
+    "api": api.map(str::trim).filter(|value| !value.is_empty()).unwrap_or(""),
+    "source": source
+  })
+}
+
+fn push_pi_model(models: &mut Vec<serde_json::Value>, seen: &mut std::collections::HashSet<String>, provider: &str, id: &str, name: Option<&str>, api: Option<&str>, source: &str) {
+  let provider = provider.trim();
+  let id = id.trim();
+  if id.is_empty() {
+    return;
+  }
+  let key = format!("{provider}:{id}");
+  if seen.insert(key) {
+    models.push(pi_model_value(provider, id, name, api, source));
+  }
+}
+
+fn collect_configured_models(models_config: Option<&serde_json::Value>, models: &mut Vec<serde_json::Value>, seen: &mut std::collections::HashSet<String>) {
+  let Some(providers) = models_config
+    .and_then(|value| value.get("providers"))
+    .and_then(|value| value.as_object())
+  else {
+    return;
+  };
+
+  for (provider, config) in providers {
+    let provider_api = json_string(Some(config), "api");
+    if let Some(list) = config.get("models").and_then(|value| value.as_array()) {
+      for model in list {
+        if let Some(id) = json_string(Some(model), "id") {
+          let name = json_string(Some(model), "name");
+          let api = json_string(Some(model), "api").or_else(|| provider_api.clone());
+          push_pi_model(models, seen, provider, &id, name.as_deref(), api.as_deref(), "models.json");
+        }
+      }
+    }
+
+    if let Some(overrides) = config.get("modelOverrides").and_then(|value| value.as_object()) {
+      for (id, model) in overrides {
+        let name = json_string(Some(model), "name");
+        let api = json_string(Some(model), "api").or_else(|| provider_api.clone());
+        push_pi_model(models, seen, provider, id, name.as_deref(), api.as_deref(), "models.json");
+      }
+    }
+  }
+}
+
+#[tauri::command]
+fn load_pi_model_config(workdir: Option<String>) -> Result<serde_json::Value, String> {
+  let workdir_path = workdir
+    .as_deref()
+    .map(str::trim)
+    .filter(|s| !s.is_empty())
+    .map(PathBuf::from);
+  let global_settings_path = global_pi_settings_path()?;
+  let global_models_path = global_pi_models_path()?;
+  let project_settings_path = workdir_path
+    .as_deref()
+    .filter(|path| path.exists() && path.is_dir())
+    .map(project_pi_settings_path);
+
+  let global_settings = read_json_value(&global_settings_path)?;
+  let project_settings = match &project_settings_path {
+    Some(path) => read_json_value(path)?,
+    None => None,
+  };
+  let models_config = read_json_value(&global_models_path)?;
+
+  let default_provider = json_string(project_settings.as_ref(), "defaultProvider")
+    .or_else(|| json_string(global_settings.as_ref(), "defaultProvider"));
+  let default_model = json_string(project_settings.as_ref(), "defaultModel")
+    .or_else(|| json_string(global_settings.as_ref(), "defaultModel"));
+
+  let mut models = Vec::new();
+  let mut seen = std::collections::HashSet::new();
+  collect_configured_models(models_config.as_ref(), &mut models, &mut seen);
+  if let Some(id) = default_model.as_deref() {
+    push_pi_model(&mut models, &mut seen, default_provider.as_deref().unwrap_or(""), id, None, None, "settings.json");
+  }
+
+  Ok(serde_json::json!({
+    "models": models,
+    "defaultModel": default_model.map(|id| pi_model_value(default_provider.as_deref().unwrap_or(""), &id, None, None, "settings.json")),
+    "globalSettings": global_settings_path.to_string_lossy(),
+    "projectSettings": project_settings_path.map(|path| path.to_string_lossy().to_string()),
+    "modelsConfig": global_models_path.to_string_lossy()
   }))
 }
 
@@ -833,12 +1058,7 @@ fn should_omit_dir(name: &str) -> bool {
   )
 }
 
-fn sorted_directory_entries(dir: &Path) -> Result<Vec<fs::DirEntry>, String> {
-  let mut entries = fs::read_dir(dir)
-    .map_err(|e| format!("读取目录失败 {:?}: {e}", dir))?
-    .filter_map(|entry| entry.ok())
-    .collect::<Vec<_>>();
-
+fn sort_directory_entries(entries: &mut [fs::DirEntry]) {
   entries.sort_by(|a, b| {
     let a_is_dir = a.file_type().map(|t| t.is_dir()).unwrap_or(false);
     let b_is_dir = b.file_type().map(|t| t.is_dir()).unwrap_or(false);
@@ -846,8 +1066,22 @@ fn sorted_directory_entries(dir: &Path) -> Result<Vec<fs::DirEntry>, String> {
       .cmp(&a_is_dir)
       .then_with(|| a.file_name().to_string_lossy().to_lowercase().cmp(&b.file_name().to_string_lossy().to_lowercase()))
   });
+}
 
-  Ok(entries)
+fn limited_sorted_directory_entries(dir: &Path, max_entries: usize) -> Result<(Vec<fs::DirEntry>, bool), String> {
+  let mut entries = Vec::new();
+  let mut truncated = false;
+  for entry in fs::read_dir(dir).map_err(|e| format!("读取目录失败 {:?}: {e}", dir))? {
+    if entries.len() >= max_entries {
+      truncated = true;
+      break;
+    }
+    if let Ok(entry) = entry {
+      entries.push(entry);
+    }
+  }
+  sort_directory_entries(&mut entries);
+  Ok((entries, truncated))
 }
 
 fn push_directory_tree_lines(
@@ -856,6 +1090,7 @@ fn push_directory_tree_lines(
   depth: usize,
   max_depth: usize,
   max_lines: usize,
+  max_entries_per_directory: usize,
   lines: &mut Vec<String>,
   truncated: &mut bool,
 ) -> Result<(), String> {
@@ -863,7 +1098,7 @@ fn push_directory_tree_lines(
     return Ok(());
   }
 
-  let entries = sorted_directory_entries(dir)?;
+  let (entries, entries_truncated) = limited_sorted_directory_entries(dir, max_entries_per_directory)?;
 
   for (index, entry) in entries.iter().enumerate() {
     if lines.len() >= max_lines {
@@ -889,6 +1124,7 @@ fn push_directory_tree_lines(
           depth + 1,
           max_depth,
           max_lines,
+          max_entries_per_directory,
           lines,
           truncated,
         )?;
@@ -896,6 +1132,11 @@ fn push_directory_tree_lines(
     } else {
       lines.push(format!("{}{}{}", prefix, connector, name));
     }
+  }
+
+  if entries_truncated && !*truncated && lines.len() < max_lines {
+    lines.push(format!("{}… 已省略更多条目", prefix));
+    *truncated = true;
   }
 
   Ok(())
@@ -906,8 +1147,7 @@ fn build_directory_tree_node(
   name: String,
   depth: usize,
   max_depth: usize,
-  max_nodes: usize,
-  node_count: &mut usize,
+  max_entries_per_directory: usize,
   truncated: &mut bool,
 ) -> Result<DirectoryTreeNode, String> {
   let is_dir = path.is_dir();
@@ -916,30 +1156,32 @@ fn build_directory_tree_node(
     path: path.to_string_lossy().to_string(),
     is_dir,
     omitted: false,
+    children_loaded: !is_dir,
+    has_more: false,
     children: vec![],
   };
 
-  if !is_dir || *truncated || depth >= max_depth {
+  if !is_dir {
     return Ok(node);
   }
 
-  for entry in sorted_directory_entries(path)? {
-    if *node_count >= max_nodes {
-      node.children.push(DirectoryTreeNode {
-        name: "… 已省略更多条目".to_string(),
-        path: path.to_string_lossy().to_string(),
-        is_dir: false,
-        omitted: true,
-        children: vec![],
-      });
-      *truncated = true;
-      break;
-    }
+  if depth >= max_depth {
+    node.children_loaded = false;
+    node.has_more = true;
+    return Ok(node);
+  }
 
+  node.children_loaded = true;
+  let (entries, entries_truncated) = limited_sorted_directory_entries(path, max_entries_per_directory)?;
+  if entries_truncated {
+    node.has_more = true;
+    *truncated = true;
+  }
+
+  for entry in entries {
     let child_path = entry.path();
     let child_name = entry.file_name().to_string_lossy().to_string();
     let file_type = entry.file_type().map_err(|e| format!("读取文件类型失败 {:?}: {e}", child_path))?;
-    *node_count += 1;
 
     if file_type.is_dir() && should_omit_dir(&child_name) {
       node.children.push(DirectoryTreeNode {
@@ -947,6 +1189,8 @@ fn build_directory_tree_node(
         path: child_path.to_string_lossy().to_string(),
         is_dir: true,
         omitted: true,
+        children_loaded: true,
+        has_more: false,
         children: vec![],
       });
     } else {
@@ -955,11 +1199,22 @@ fn build_directory_tree_node(
         child_name,
         depth + 1,
         max_depth,
-        max_nodes,
-        node_count,
+        max_entries_per_directory,
         truncated,
       )?);
     }
+  }
+
+  if entries_truncated {
+    node.children.push(DirectoryTreeNode {
+      name: "… 已省略更多条目".to_string(),
+      path: path.to_string_lossy().to_string(),
+      is_dir: false,
+      omitted: true,
+      children_loaded: true,
+      has_more: false,
+      children: vec![],
+    });
   }
 
   Ok(node)
@@ -1062,18 +1317,75 @@ fn get_directory_tree(path: String) -> Result<DirectoryTreeResponse, String> {
     .and_then(|name| name.to_str())
     .unwrap_or("当前项目")
     .to_string();
+  let config = resolve_directory_tree_config(Some(&root))?;
   let mut lines = vec![format!("{}/", root_name)];
-  let mut truncated = false;
-  push_directory_tree_lines(&root, "", 0, 4, 500, &mut lines, &mut truncated)?;
+  let mut lines_truncated = false;
+  push_directory_tree_lines(
+    &root,
+    "",
+    0,
+    config.preview_max_depth,
+    config.preview_max_lines,
+    config.max_entries_per_directory,
+    &mut lines,
+    &mut lines_truncated,
+  )?;
 
-  let mut node_count = 1;
-  let tree = build_directory_tree_node(&root, root_name, 0, 4, 500, &mut node_count, &mut truncated)?;
+  let mut tree_truncated = false;
+  let tree = build_directory_tree_node(
+    &root,
+    root_name,
+    0,
+    config.initial_depth,
+    config.max_entries_per_directory,
+    &mut tree_truncated,
+  )?;
 
   Ok(DirectoryTreeResponse {
     root: root.to_string_lossy().to_string(),
     lines,
     tree,
-    truncated,
+    truncated: lines_truncated || tree_truncated,
+  })
+}
+
+#[tauri::command]
+fn get_directory_children(project_root: String, path: String) -> Result<DirectoryTreeChildrenResponse, String> {
+  let root = PathBuf::from(project_root.trim());
+  let target = PathBuf::from(path.trim());
+  if !root.exists() || !root.is_dir() {
+    return Err(format!("项目目录不存在：{}", root.to_string_lossy()));
+  }
+  if !target.exists() || !target.is_dir() {
+    return Err(format!("目录不存在：{}", target.to_string_lossy()));
+  }
+
+  let canonical_root = root.canonicalize().map_err(|e| format!("解析项目目录失败 {:?}: {e}", root))?;
+  let canonical_target = target.canonicalize().map_err(|e| format!("解析目录失败 {:?}: {e}", target))?;
+  if !canonical_target.starts_with(&canonical_root) {
+    return Err(format!("目录不在当前项目内：{}", target.to_string_lossy()));
+  }
+
+  let config = resolve_directory_tree_config(Some(&root))?;
+  let name = target
+    .file_name()
+    .and_then(|name| name.to_str())
+    .unwrap_or("目录")
+    .to_string();
+  let mut truncated = false;
+  let node = build_directory_tree_node(
+    &target,
+    name,
+    0,
+    1,
+    config.max_entries_per_directory,
+    &mut truncated,
+  )?;
+
+  Ok(DirectoryTreeChildrenResponse {
+    path: target.to_string_lossy().to_string(),
+    children: node.children,
+    truncated: node.has_more || truncated,
   })
 }
 
@@ -1696,9 +2008,11 @@ fn main() {
       append_debug_log,
       get_debug_log_path,
       get_debug_logging_config,
+      load_pi_model_config,
       open_path_in_file_manager,
       open_file_with_default_app,
       get_directory_tree,
+      get_directory_children,
       append_terminal_log,
       read_terminal_log_tail,
       clear_terminal_log,

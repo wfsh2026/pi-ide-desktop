@@ -19,6 +19,8 @@ const TERMINAL_PREVIEW_CHARS_STORAGE_KEY = "piIdeTerminalPreviewChars";
 const SESSION_TEXT_PREVIEW_CHARS_STORAGE_KEY = "piIdeSessionTextPreviewChars";
 const SESSION_TURN_LIMIT_STORAGE_KEY = "piIdeSessionTurnLimit";
 const SESSION_FILE_RECORD_LIMIT_STORAGE_KEY = "piIdeSessionFileRecordLimit";
+const BACKGROUND_PI_IDLE_STOP_MINUTES_STORAGE_KEY = "piIdeBackgroundPiIdleStopMinutes";
+const DEFAULT_BACKGROUND_PI_IDLE_STOP_MINUTES = 5;
 
 function insertAtCursor(text, insert) {
   const start = text.selectionStart ?? 0;
@@ -38,6 +40,13 @@ function configuredPositiveNumber(key, fallback) {
   return positiveInteger(localStorage.getItem(key), fallback);
 }
 
+function configuredNonNegativeNumber(key, fallback) {
+  const raw = localStorage.getItem(key);
+  if (raw == null) return fallback;
+  const value = Number(raw);
+  return Number.isFinite(value) && value >= 0 ? Math.floor(value) : fallback;
+}
+
 function storageLimits() {
   return {
     terminalPreviewChars: configuredPositiveNumber(TERMINAL_PREVIEW_CHARS_STORAGE_KEY, DEFAULT_STORAGE_LIMITS.terminalPreviewChars),
@@ -45,6 +54,10 @@ function storageLimits() {
     sessionTurnLimit: configuredPositiveNumber(SESSION_TURN_LIMIT_STORAGE_KEY, DEFAULT_STORAGE_LIMITS.sessionTurnLimit),
     sessionFileRecordLimit: configuredPositiveNumber(SESSION_FILE_RECORD_LIMIT_STORAGE_KEY, DEFAULT_STORAGE_LIMITS.sessionFileRecordLimit)
   };
+}
+
+function backgroundPiIdleStopMs() {
+  return configuredNonNegativeNumber(BACKGROUND_PI_IDLE_STOP_MINUTES_STORAGE_KEY, DEFAULT_BACKGROUND_PI_IDLE_STOP_MINUTES) * 60 * 1000;
 }
 
 function limitTerminalPreview(text) {
@@ -140,6 +153,19 @@ function formatModelInfo(model) {
   const provider = String(model.provider || "").trim();
   if (!name && !provider) return "";
   return provider ? `${name} via ${provider}` : name;
+}
+
+function sameModel(left, right) {
+  if (!left || !right) return false;
+  return String(left.id || left.model || "") === String(right.id || right.model || "")
+    && String(left.provider || "") === String(right.provider || "");
+}
+
+function sessionModelOptions(session) {
+  const list = Array.isArray(session?.available_models) ? session.available_models : [];
+  const selected = session?.pending_model || session?.current_model;
+  if (!selected || list.some((model) => sameModel(model, selected))) return list;
+  return [selected, ...list];
 }
 
 function normalizeCenterView(value) {
@@ -291,7 +317,7 @@ function relativeTime(value) {
   return `${Math.floor(days / 7)} 周`;
 }
 
-function ProjectPanel({ projects, activeProjectId, activeSessionId, piSessionStatus, onAddProject, onNewSession, onSelectSession, onToggleProject, onArchiveProject, onArchiveSession, onRenameSession, onOpenProjectInExplorer }) {
+function ProjectPanel({ projects, activeProjectId, activeSessionId, piSessionStatus, onAddProject, onNewSession, onSelectSession, onToggleProject, onStopSessionPi, onArchiveProject, onArchiveSession, onRenameSession, onOpenProjectInExplorer }) {
   const [menu, setMenu] = useState(null);
   const [editing, setEditing] = useState(null);
   const [draftTitle, setDraftTitle] = useState("");
@@ -416,6 +442,10 @@ function ProjectPanel({ projects, activeProjectId, activeSessionId, piSessionSta
             onOpenProjectInExplorer(menu.projectId);
           }}>在资源管理器打开</button>}
           {menu.type === "session" && <button onClick={() => startRename(menu.projectId, menu.session)}>重命名</button>}
+          {menu.type === "session" && (piSessionStatus?.[menu.session.id]?.running || piSessionStatus?.[menu.session.id]?.starting) && <button onClick={() => {
+            setMenu(null);
+            Promise.resolve(onStopSessionPi(menu.session.id)).catch(() => {});
+          }}>关闭 Pi</button>}
           <button onClick={() => {
             setMenu(null);
             if (menu.type === "project") Promise.resolve(onArchiveProject(menu.projectId)).catch(() => {});
@@ -466,6 +496,19 @@ function collectDirectorySearchExpandedPaths(node) {
   return paths;
 }
 
+function replaceDirectoryTreeNode(node, targetPath, updater) {
+  if (!node) return node;
+  if (node.path === targetPath) return updater(node);
+  const children = Array.isArray(node.children) ? node.children : [];
+  let changed = false;
+  const nextChildren = children.map((child) => {
+    const nextChild = replaceDirectoryTreeNode(child, targetPath, updater);
+    if (nextChild !== child) changed = true;
+    return nextChild;
+  });
+  return changed ? { ...node, children: nextChildren } : node;
+}
+
 function HighlightText({ text, query }) {
   const value = String(text || "");
   const keyword = String(query || "").trim();
@@ -475,15 +518,16 @@ function HighlightText({ text, query }) {
   return <>{value.slice(0, index)}<mark>{value.slice(index, index + keyword.length)}</mark>{value.slice(index + keyword.length)}</>;
 }
 
-function DirectoryTreeNodeView({ node, depth = 0, expandedPaths, searchText = "", onToggleDirectory, onOpenFile }) {
+function DirectoryTreeNodeView({ node, depth = 0, expandedPaths, loadingPaths = new Set(), searchText = "", onToggleDirectory, onOpenFile }) {
   if (!node) return null;
   const isDir = isDirectoryNode(node);
   const children = Array.isArray(node.children) ? node.children : [];
+  const loading = loadingPaths.has(node.path);
   const expanded = expandedPaths.has(node.path);
-  const canExpand = isDir && !node.omitted && children.length > 0;
+  const canExpand = isDir && !node.omitted && (children.length > 0 || loading || node.has_more || node.children_loaded === false);
 
   function handleClick() {
-    if (canExpand) onToggleDirectory(node.path);
+    if (canExpand) onToggleDirectory(node);
   }
 
   function handleDoubleClick(event) {
@@ -509,10 +553,11 @@ function DirectoryTreeNodeView({ node, depth = 0, expandedPaths, searchText = ""
         onDoubleClick={handleDoubleClick}
         onDragStart={handleDragStart}
       >
-        <span className="directory-tree-toggle">{isDir ? (canExpand ? (expanded ? "▾" : "▸") : "•") : ""}</span>
+        <span className="directory-tree-toggle">{isDir ? (loading ? "…" : (canExpand ? (expanded ? "▾" : "▸") : "•")) : ""}</span>
         {isDir ? <Folder size={14}/> : <File size={14}/>}
         <span className="directory-tree-name"><HighlightText text={node.name} query={searchText}/>{isDir ? "/" : ""}</span>
         {node.omitted && <em>已省略</em>}
+        {loading && <em>加载中</em>}
       </div>
       {isDir && expanded && children.map((child) => (
         <DirectoryTreeNodeView
@@ -520,6 +565,7 @@ function DirectoryTreeNodeView({ node, depth = 0, expandedPaths, searchText = ""
           node={child}
           depth={depth + 1}
           expandedPaths={expandedPaths}
+          loadingPaths={loadingPaths}
           searchText={searchText}
           onToggleDirectory={onToggleDirectory}
           onOpenFile={onOpenFile}
@@ -585,6 +631,7 @@ function RightToolPanel({
   directoryTreeLoading,
   directoryTreeError,
   expandedDirectoryPaths,
+  directoryTreeNodeLoadingPaths,
   directoryTreeSearch,
   onDirectoryTreeSearchChange,
   onToggleToolList,
@@ -674,6 +721,7 @@ function RightToolPanel({
               <DirectoryTreeNodeView
                 node={filteredTree.node}
                 expandedPaths={effectiveExpandedPaths}
+                loadingPaths={directoryTreeNodeLoadingPaths}
                 searchText={searchText}
                 onToggleDirectory={onToggleDirectoryNode}
                 onOpenFile={onOpenDirectoryFile}
@@ -684,7 +732,7 @@ function RightToolPanel({
             <div className="empty">未找到匹配文件或目录</div>
           )}
           {!directoryTreeLoading && !directoryTreeError && directoryTree?.truncated && (
-            <div className="directory-tree-note">目录较大，已限制展示深度和条目数。文件可双击打开，也可拖入下方会话框。</div>
+            <div className="directory-tree-note">目录按需加载，展开目录时读取子项。单层条目过多时会按配置限制显示。</div>
           )}
         </div>
       )}
@@ -697,7 +745,6 @@ export default function App() {
   const [clearTerminalSignal, setClearTerminalSignal] = useState(0);
   const [terminalReplaySignal, setTerminalReplaySignal] = useState(0);
   const [terminalReplayContent, setTerminalReplayContent] = useState("");
-  const [terminalInputEnabled, setTerminalInputEnabled] = useState(true);
   const [centerView, setCenterView] = useState(() => normalizeCenterView(localStorage.getItem(CENTER_VIEW_STORAGE_KEY)));
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [piSessionStatus, setPiSessionStatus] = useState({});
@@ -708,6 +755,7 @@ export default function App() {
   const [sessionFilesOpen, setSessionFilesOpen] = useState(false);
   const [directoryTree, setDirectoryTree] = useState(null);
   const [expandedDirectoryPaths, setExpandedDirectoryPaths] = useState(() => new Set());
+  const [directoryTreeNodeLoadingPaths, setDirectoryTreeNodeLoadingPaths] = useState(() => new Set());
   const [directoryTreeSearch, setDirectoryTreeSearch] = useState("");
   const [directoryTreeLoading, setDirectoryTreeLoading] = useState(false);
   const [directoryTreeError, setDirectoryTreeError] = useState("");
@@ -742,10 +790,13 @@ export default function App() {
     [activeProject, activeProjectSessionId]
   );
   const isProcessing = Boolean(activeProjectSessionId && piSessionStatus[activeProjectSessionId]?.processing);
+  const activeRuntimeModel = activeProjectSessionId ? piSessionStatus[activeProjectSessionId]?.model : null;
+  const activePendingModel = activeProjectSession?.pending_model || null;
   const activeModelLabel = useMemo(
-    () => formatModelInfo(piSessionStatus[activeProjectSessionId]?.model || activeProjectSession?.current_model),
-    [activeProjectSessionId, activeProjectSession?.current_model, piSessionStatus]
+    () => formatModelInfo(activeRuntimeModel || activePendingModel || activeProjectSession?.current_model),
+    [activeRuntimeModel, activePendingModel, activeProjectSession?.current_model]
   );
+  const activeModelPending = Boolean(activePendingModel && !activeRuntimeModel);
 
   useEffect(() => {
     const projectPath = activeProject?.path || workdir || "";
@@ -793,11 +844,13 @@ export default function App() {
     if (!projectPath) {
       setDirectoryTree(null);
       setExpandedDirectoryPaths(new Set());
+      setDirectoryTreeNodeLoadingPaths(new Set());
       setDirectoryTreeError("请先在左侧选择一个项目");
       return;
     }
     setDirectoryTreeLoading(true);
     setDirectoryTreeError("");
+    setDirectoryTreeNodeLoadingPaths(new Set());
     try {
       const result = await invoke("get_directory_tree", { path: projectPath });
       setDirectoryTree(result);
@@ -805,6 +858,7 @@ export default function App() {
     } catch (error) {
       setDirectoryTree(null);
       setExpandedDirectoryPaths(new Set());
+      setDirectoryTreeNodeLoadingPaths(new Set());
       setDirectoryTreeError(String(error));
     } finally {
       setDirectoryTreeLoading(false);
@@ -816,13 +870,48 @@ export default function App() {
     loadDirectoryTree(activeProject?.path);
   }, [directoryTreeOpen, activeProject?.path, loadDirectoryTree]);
 
-  function toggleDirectoryNode(path) {
+  async function loadDirectoryNodeChildren(path) {
+    if (!activeProject?.path || !path) return;
+    setDirectoryTreeNodeLoadingPaths((prev) => new Set(prev).add(path));
+    try {
+      const result = await invoke("get_directory_children", { projectRoot: activeProject.path, path });
+      setDirectoryTree((prev) => {
+        if (!prev?.tree) return prev;
+        return {
+          ...prev,
+          truncated: Boolean(prev.truncated || result?.truncated),
+          tree: replaceDirectoryTreeNode(prev.tree, result.path || path, (node) => ({
+            ...node,
+            children: result?.children || [],
+            children_loaded: true,
+            has_more: Boolean(result?.truncated)
+          }))
+        };
+      });
+    } catch (error) {
+      setDirectoryTreeError(String(error));
+    } finally {
+      setDirectoryTreeNodeLoadingPaths((prev) => {
+        const next = new Set(prev);
+        next.delete(path);
+        return next;
+      });
+    }
+  }
+
+  function toggleDirectoryNode(node) {
+    const path = node?.path;
+    if (!path) return;
+    const shouldLoadChildren = isDirectoryNode(node) && !node.omitted && node.children_loaded === false;
     setExpandedDirectoryPaths((prev) => {
       const next = new Set(prev);
       if (next.has(path)) next.delete(path);
       else next.add(path);
       return next;
     });
+    if (!expandedDirectoryPaths.has(path) && shouldLoadChildren && !directoryTreeNodeLoadingPaths.has(path)) {
+      loadDirectoryNodeChildren(path);
+    }
   }
 
   async function openDirectoryFile(path) {
@@ -876,6 +965,28 @@ export default function App() {
     };
     piSessionStatusRef.current = next;
     setPiSessionStatus(next);
+  }
+
+  function touchPiSessionActivity(sessionId, patch = {}) {
+    if (!sessionId) return;
+    const now = Date.now();
+    const isActive = sessionId === activeProjectSessionIdRef.current;
+    const current = piSessionStatusRef.current[sessionId] || {};
+    setSessionRuntimeStatus(sessionId, {
+      ...patch,
+      lastActivityAt: now,
+      backgroundSinceAt: isActive ? null : current.backgroundSinceAt || now
+    });
+  }
+
+  function markSessionBackgroundState(previousSessionId, nextSessionId) {
+    const now = Date.now();
+    if (previousSessionId && previousSessionId !== nextSessionId && piSessionStatusRef.current[previousSessionId]?.running) {
+      setSessionRuntimeStatus(previousSessionId, { backgroundSinceAt: now });
+    }
+    if (nextSessionId && piSessionStatusRef.current[nextSessionId]?.running) {
+      setSessionRuntimeStatus(nextSessionId, { backgroundSinceAt: null, lastActivityAt: now });
+    }
   }
 
   function clearSessionIdleTimer(sessionId) {
@@ -1002,6 +1113,7 @@ export default function App() {
     updateSessionById(sessionId, (session) => ({
       ...session,
       current_model: normalized,
+      pending_model: null,
       updated_at: new Date().toISOString()
     }));
   }
@@ -1034,16 +1146,19 @@ export default function App() {
       fileEventSeenRef.current.add(key);
 
       if (event.kind === "model") {
+        touchPiSessionActivity(targetSessionId);
         updateSessionModel(targetSessionId, event.model);
         continue;
       }
 
       if (event.kind === "models") {
+        touchPiSessionActivity(targetSessionId);
         updateSessionModels(targetSessionId, event.models, event.currentModel || event.current_model);
         continue;
       }
 
       if (event.kind === "model_switch_result") {
+        touchPiSessionActivity(targetSessionId);
         if (event.success) {
           updateSessionModel(targetSessionId, event.model);
           setStatus(`已切换模型：${formatModelInfo(event.model)}`);
@@ -1061,6 +1176,7 @@ export default function App() {
       }
 
       if (event.kind === "timeline") {
+        touchPiSessionActivity(targetSessionId);
         debugLog("timeline event", { targetSessionId, eventType: event.eventType, eventRunId, runtimeRunId: runtime.runId });
         if (event.model) updateSessionModel(targetSessionId, event.model);
         const failedEvent = event.eventType === "extension_error" || (event.eventType === "auto_retry_end" && event.success === false);
@@ -1167,6 +1283,25 @@ export default function App() {
   }, [projects, piSessionStatus]);
 
   useEffect(() => {
+    const timer = window.setInterval(() => {
+      const limitMs = backgroundPiIdleStopMs();
+      if (limitMs <= 0) return;
+      const now = Date.now();
+      const activeSessionId = activeProjectSessionIdRef.current;
+      for (const [sessionId, runtime] of Object.entries(piSessionStatusRef.current)) {
+        if (sessionId === activeSessionId) continue;
+        if (!runtime?.running || runtime.processing || runtime.starting || runtime.idleStopping) continue;
+        const idleStart = Math.max(Number(runtime.lastActivityAt) || 0, Number(runtime.backgroundSinceAt) || 0);
+        if (!idleStart || now - idleStart < limitMs) continue;
+        stopProjectSessionPi(sessionId, { reason: "idle" }).catch((error) => {
+          debugLog("idle stop failed", { sessionId, error: String(error) });
+        });
+      }
+    }, 30000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
     setCommand("");
     outputBufferRef.current = "";
     setTerminalReplayContent("");
@@ -1213,7 +1348,10 @@ export default function App() {
       debugLog("pi-output event", { sessionId: payload.sessionId || payload.session_id, bytes: String(payload.data ?? "").length, active: activeProjectSessionIdRef.current });
       const sessionId = payload.sessionId || payload.session_id;
       const data = String(payload.data ?? "");
-      if (sessionId && data) appendOutputToSession(sessionId, data);
+      if (sessionId && data) {
+        touchPiSessionActivity(sessionId);
+        appendOutputToSession(sessionId, data);
+      }
 
       if (!sessionId || !piSessionStatusRef.current[sessionId]?.processing) return;
       clearSessionIdleTimer(sessionId);
@@ -1300,6 +1438,7 @@ export default function App() {
     }
 
     saveProjects(nextProjects);
+    markSessionBackgroundState(activeProjectSessionIdRef.current, sessionId);
     activeProjectIdRef.current = projectId;
     activeProjectSessionIdRef.current = sessionId;
     setActiveProjectId(projectId);
@@ -1341,6 +1480,7 @@ export default function App() {
         }
       : project);
     saveProjects(nextProjects);
+    markSessionBackgroundState(activeProjectSessionIdRef.current, sessionId);
     activeProjectIdRef.current = projectId;
     activeProjectSessionIdRef.current = sessionId;
     setActiveProjectId(projectId);
@@ -1455,6 +1595,7 @@ export default function App() {
       return null;
     }
     const sameSession = sessionId === activeProjectSessionIdRef.current;
+    markSessionBackgroundState(activeProjectSessionIdRef.current, sessionId);
     activeProjectIdRef.current = projectId;
     activeProjectSessionIdRef.current = sessionId;
     setActiveProjectId(projectId);
@@ -1478,20 +1619,7 @@ export default function App() {
 
   async function activateProjectSession(projectId, sessionId) {
     debugLog("activateProjectSession enter", { projectId, sessionId, status: piSessionStatusRef.current[sessionId] });
-    const willStartWithContinue = !piSessionStatusRef.current[sessionId]?.running && shouldContinueSession(
-      projectsRef.current.find((p) => p.id === projectId)?.sessions?.find((s) => s.id === sessionId)
-    );
-    const selected = selectProjectSession(projectId, sessionId, { skipReplay: willStartWithContinue });
-    if (!selected) return;
-    if (piSessionStatusRef.current[sessionId]?.running) {
-      debugLog("activateProjectSession already running", { sessionId });
-      return;
-    }
-    await startPi({
-      sessionId,
-      workdir: selected.project.path,
-      continueSession: shouldContinueSession(selected.session)
-    });
+    selectProjectSession(projectId, sessionId);
   }
 
   function updateActiveProjectSessionAfterCommand(commandText) {
@@ -1571,7 +1699,7 @@ export default function App() {
       debugLog("startPi invoke", { sessionId, workdir: runWorkdir, continueSession });
       await invoke("start_pi_session", { sessionId, piCommand: legacyPiCommandRef.current, workdir: runWorkdir, continueSession });
       debugLog("startPi done", { sessionId });
-      setSessionRuntimeStatus(sessionId, { running: true, starting: false, processing: false, status: "Pi 已启动" });
+      touchPiSessionActivity(sessionId, { running: true, starting: false, processing: false, status: "Pi 已启动" });
     } catch (error) {
       debugLog("startPi failed", { sessionId, error: String(error) });
       setSessionRuntimeStatus(sessionId, { running: false, starting: false, processing: false, status: `Pi 启动失败：${String(error)}` });
@@ -1585,20 +1713,44 @@ export default function App() {
     const sessionId = activeProjectSessionIdRef.current;
     debugLog("ensureActivePiRunning", { sessionId, status: piSessionStatusRef.current[sessionId] });
     if (!sessionId) throw new Error("请先选择或创建一个会话");
-    if (piSessionStatusRef.current[sessionId]?.running) return;
-    const { project, session } = getSessionById(sessionId);
-    if (!project || !session) throw new Error("当前会话不存在");
-    await startPi({
-      sessionId,
-      workdir: project.path,
-      continueSession: shouldContinueSession(session)
-    });
+    if (!piSessionStatusRef.current[sessionId]?.running) {
+      const { project, session } = getSessionById(sessionId);
+      if (!project || !session) throw new Error("当前会话不存在");
+      await startPi({
+        sessionId,
+        workdir: project.path,
+        continueSession: shouldContinueSession(session)
+      });
+    }
+    await applyPendingModel(sessionId);
+  }
+
+  async function sendToRunningPi(sessionId, input) {
+    if (!sessionId) throw new Error("请先选择或创建一个会话");
+    if (!piSessionStatusRef.current[sessionId]?.running) throw new Error("当前会话 Pi 尚未启动");
+    touchPiSessionActivity(sessionId);
+    await invoke("send_pi_input", { sessionId, input });
+  }
+
+  async function applyPendingModel(sessionId) {
+    const { session } = getSessionById(sessionId);
+    const pending = normalizeModelInfo(session?.pending_model);
+    if (!pending) return;
+    const payload = JSON.stringify({ provider: pending.provider, id: pending.id });
+    setStatus(`正在应用待切换模型：${formatModelInfo(pending)}`);
+    await sendToRunningPi(sessionId, `/pi-ide-switch-model ${payload}\r`);
+    updateSessionById(sessionId, (current) => ({
+      ...current,
+      pending_model: null,
+      current_model: pending,
+      updated_at: new Date().toISOString()
+    }));
   }
 
   async function sendToActivePi(input) {
     const sessionId = activeProjectSessionIdRef.current;
     await ensureActivePiRunning();
-    await invoke("send_pi_input", { sessionId, input });
+    await sendToRunningPi(sessionId, input);
   }
 
   async function handleTerminalInput(data) {
@@ -1612,10 +1764,35 @@ export default function App() {
     }
   }
 
+  async function loadConfiguredModelCandidates(sessionId = activeProjectSessionIdRef.current) {
+    if (!sessionId) throw new Error("请先选择或创建一个会话");
+    const projectPath = getSessionById(sessionId).project?.path || activeProject?.path || workdir;
+    const result = await invoke("load_pi_model_config", { workdir: projectPath || null });
+    const models = (Array.isArray(result?.models) ? result.models : []).map(normalizeModelInfo).filter(Boolean);
+    const defaultModel = normalizeModelInfo(result?.defaultModel || result?.default_model);
+    updateSessionById(sessionId, (session) => ({
+      ...session,
+      available_models: models.length > 0 ? models : session.available_models || [],
+      current_model: session.current_model || defaultModel || null,
+      model_list_source: "pi-config",
+      updated_at: new Date().toISOString()
+    }));
+    if (defaultModel && !piSessionStatusRef.current[sessionId]?.model) {
+      setSessionRuntimeStatus(sessionId, { model: defaultModel });
+    }
+    return { models, defaultModel };
+  }
+
   async function refreshModels() {
+    const sessionId = activeProjectSessionIdRef.current;
     try {
-      await sendToActivePi("/pi-ide-list-models\r");
-      setStatus("正在刷新模型列表...");
+      if (sessionId && piSessionStatusRef.current[sessionId]?.running) {
+        await sendToRunningPi(sessionId, "/pi-ide-list-models\r");
+        setStatus("正在刷新模型列表...");
+      } else {
+        const result = await loadConfiguredModelCandidates(sessionId);
+        setStatus(result.models.length > 0 || result.defaultModel ? "已读取 Pi 配置模型候选" : "未找到 Pi 配置模型候选");
+      }
     } catch (error) {
       setStatus(`刷新模型列表失败：${String(error)}`);
     }
@@ -1623,10 +1800,23 @@ export default function App() {
 
   async function switchModel(model) {
     const label = formatModelInfo(model);
+    const sessionId = activeProjectSessionIdRef.current;
     try {
+      if (!sessionId) throw new Error("请先选择或创建一个会话");
       const payload = JSON.stringify({ provider: model.provider, id: model.id });
-      setStatus(`正在切换模型：${label}`);
-      await sendToActivePi(`/pi-ide-switch-model ${payload}\r`);
+      if (piSessionStatusRef.current[sessionId]?.running) {
+        setStatus(`正在切换模型：${label}`);
+        await sendToRunningPi(sessionId, `/pi-ide-switch-model ${payload}\r`);
+        updateSessionById(sessionId, (session) => ({ ...session, pending_model: null, updated_at: new Date().toISOString() }));
+      } else {
+        const pending = normalizeModelInfo(model);
+        updateSessionById(sessionId, (session) => ({
+          ...session,
+          pending_model: pending,
+          updated_at: new Date().toISOString()
+        }));
+        setStatus(`已选择模型，发送任务时应用：${label}`);
+      }
       setModelMenuOpen(false);
     } catch (error) {
       setStatus(`模型切换失败：${String(error)}`);
@@ -1639,17 +1829,22 @@ export default function App() {
     if (next) await refreshModels();
   }
 
-  async function stopAllPi() {
-    await invoke("stop_all_pi_sessions");
-    Object.keys(outputIdleTimersRef.current).forEach(clearSessionIdleTimer);
-    const next = {};
-    for (const sessionId of Object.keys(piSessionStatusRef.current)) {
-      next[sessionId] = { ...(piSessionStatusRef.current[sessionId] || {}), running: false, processing: false, status: "Pi 已停止" };
+  async function stopProjectSessionPi(sessionId, { reason = "manual" } = {}) {
+    if (!sessionId) return;
+    clearSessionIdleTimer(sessionId);
+    setSessionRuntimeStatus(sessionId, { idleStopping: true });
+    try {
+      await invoke("stop_pi_session", { sessionId });
+    } finally {
+      setSessionRuntimeStatus(sessionId, {
+        running: false,
+        starting: false,
+        processing: false,
+        idleStopping: false,
+        backgroundSinceAt: null,
+        status: reason === "idle" ? "Pi 已因后台空闲自动关闭" : "Pi 已停止"
+      });
     }
-    piSessionStatusRef.current = next;
-    setPiSessionStatus(next);
-    setStatus("所有 Pi 已停止");
-    persistCurrentSessionOutput();
   }
 
   function clearTerminal() {
@@ -1832,6 +2027,7 @@ export default function App() {
           onNewSession={(projectId) => createAndStartProjectSession(projectId).catch((e) => setStatus(String(e)))}
           onSelectSession={(projectId, sessionId) => activateProjectSession(projectId, sessionId).catch((e) => setStatus(String(e)))}
           onToggleProject={toggleProject}
+          onStopSessionPi={(sessionId) => stopProjectSessionPi(sessionId).catch((e) => setStatus(String(e)))}
           onArchiveProject={archiveProject}
           onArchiveSession={archiveProjectSession}
           onRenameSession={renameProjectSession}
@@ -1850,11 +2046,7 @@ export default function App() {
               <TerminalSquare size={15}/> 终端视图
             </button>
           </div>
-          <button className={terminalInputEnabled ? "primary" : ""} onClick={() => setTerminalInputEnabled((value) => !value)}>
-            {terminalInputEnabled ? "原生终端：开" : "原生终端：关"}
-          </button>
           {debugLogEnabled && <button onClick={openDebugLog} title="打开调试日志所在目录"><FileText size={15}/> 调试日志</button>}
-          <button className="danger" onClick={() => stopAllPi().catch((e) => setStatus(String(e)))}>停止全部 Pi</button>
         </header>
         <div className="center-view-wrap">
           {centerView === "session" ? (
@@ -1871,7 +2063,6 @@ export default function App() {
               clearSignal={clearTerminalSignal}
               replaySignal={terminalReplaySignal}
               replayContent={terminalReplayContent}
-              terminalInputEnabled={terminalInputEnabled}
               debugEnabled={debugLogEnabled}
               debugWorkdir={activeProject?.path || workdir}
               onTerminalInput={handleTerminalInput}
@@ -1905,18 +2096,19 @@ export default function App() {
             <div className="composer-action-buttons">
               <div className="model-picker">
                 <button className="model-picker-button" onClick={() => toggleModelMenu().catch((e) => setStatus(String(e)))} title="切换当前 Pi 会话模型">
-                  模型：{activeModelLabel || "未获取"} <ChevronDown size={13}/>
+                  模型：{activeModelLabel ? `${activeModelLabel}${activeModelPending ? "（待应用）" : ""}` : "未获取"} <ChevronDown size={13}/>
                 </button>
                 {modelMenuOpen && (
                   <div className="model-menu">
                     <button className="model-menu-refresh" onClick={() => refreshModels().catch((e) => setStatus(String(e)))}><RefreshCw size={13}/> 刷新模型列表</button>
-                    {(activeProjectSession?.available_models || []).length === 0 && <div className="model-menu-empty">暂无可用模型</div>}
-                    {(activeProjectSession?.available_models || []).map((model) => {
-                      const selected = model.id === (piSessionStatus[activeProjectSessionId]?.model || activeProjectSession?.current_model)?.id && model.provider === (piSessionStatus[activeProjectSessionId]?.model || activeProjectSession?.current_model)?.provider;
+                    {sessionModelOptions(activeProjectSession).length === 0 && <div className="model-menu-empty">暂无可用模型，首次运行后会刷新完整列表</div>}
+                    {sessionModelOptions(activeProjectSession).map((model) => {
+                      const selectedModel = activeProjectSession?.pending_model || piSessionStatus[activeProjectSessionId]?.model || activeProjectSession?.current_model;
+                      const selected = sameModel(model, selectedModel);
                       return (
                         <button key={`${model.provider}:${model.id}`} className={`model-menu-item ${selected ? "active" : ""}`} onClick={() => switchModel(model)}>
                           <span>{formatModelInfo(model)}</span>
-                          {selected && <small>当前</small>}
+                          {selected && <small>{sameModel(model, activeProjectSession?.pending_model) ? "待应用" : "当前"}</small>}
                         </button>
                       );
                     })}
@@ -1940,6 +2132,7 @@ export default function App() {
           directoryTreeLoading={directoryTreeLoading}
           directoryTreeError={directoryTreeError}
           expandedDirectoryPaths={expandedDirectoryPaths}
+          directoryTreeNodeLoadingPaths={directoryTreeNodeLoadingPaths}
           directoryTreeSearch={directoryTreeSearch}
           onDirectoryTreeSearchChange={setDirectoryTreeSearch}
           onToggleToolList={() => setToolListCollapsed((value) => !value)}
