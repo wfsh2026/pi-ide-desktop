@@ -7,6 +7,7 @@ import { Square, Send, FolderOpen, Plus, Folder, X, File, FileText, FolderTree, 
 import PiTerminal from "./components/PiTerminal.jsx";
 import SessionTimeline from "./components/SessionTimeline.jsx";
 import { applyPiIdeTimelineEvent } from "./piIdeEventMapper.js";
+import { DEFAULT_STORAGE_LIMITS, limitTextValue, normalizeStoredProjects, positiveInteger } from "./projectStorageModel.js";
 
 const DEFAULT_COMMAND = "pi";
 const PROJECTS_STORAGE_KEY = "piIdeProjects";
@@ -14,6 +15,10 @@ const ACTIVE_PROJECT_STORAGE_KEY = "piIdeActiveProjectId";
 const ACTIVE_SESSION_STORAGE_KEY = "piIdeActiveProjectSessionId";
 const EXE_SESSION_STORAGE_KEY = "piIdeExeSessionId";
 const CENTER_VIEW_STORAGE_KEY = "piIdeCenterView";
+const TERMINAL_PREVIEW_CHARS_STORAGE_KEY = "piIdeTerminalPreviewChars";
+const SESSION_TEXT_PREVIEW_CHARS_STORAGE_KEY = "piIdeSessionTextPreviewChars";
+const SESSION_TURN_LIMIT_STORAGE_KEY = "piIdeSessionTurnLimit";
+const SESSION_FILE_RECORD_LIMIT_STORAGE_KEY = "piIdeSessionFileRecordLimit";
 
 function insertAtCursor(text, insert) {
   const start = text.selectionStart ?? 0;
@@ -27,6 +32,23 @@ function insertAtCursor(text, insert) {
 
 function makeId(prefix) {
   return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function configuredPositiveNumber(key, fallback) {
+  return positiveInteger(localStorage.getItem(key), fallback);
+}
+
+function storageLimits() {
+  return {
+    terminalPreviewChars: configuredPositiveNumber(TERMINAL_PREVIEW_CHARS_STORAGE_KEY, DEFAULT_STORAGE_LIMITS.terminalPreviewChars),
+    sessionTextPreviewChars: configuredPositiveNumber(SESSION_TEXT_PREVIEW_CHARS_STORAGE_KEY, DEFAULT_STORAGE_LIMITS.sessionTextPreviewChars),
+    sessionTurnLimit: configuredPositiveNumber(SESSION_TURN_LIMIT_STORAGE_KEY, DEFAULT_STORAGE_LIMITS.sessionTurnLimit),
+    sessionFileRecordLimit: configuredPositiveNumber(SESSION_FILE_RECORD_LIMIT_STORAGE_KEY, DEFAULT_STORAGE_LIMITS.sessionFileRecordLimit)
+  };
+}
+
+function limitTerminalPreview(text) {
+  return limitTextValue(text, storageLimits().terminalPreviewChars);
 }
 
 function basename(path) {
@@ -230,16 +252,26 @@ function appendFileItemToLatestTurn(turns, kind, files, now) {
   } : turn);
 }
 
+let debugLogContext = { enabled: false, workdir: "" };
+
+function setDebugLogContext(context) {
+  debugLogContext = {
+    enabled: Boolean(context?.enabled),
+    workdir: String(context?.workdir || "")
+  };
+}
+
 function debugLog(message, data = undefined) {
+  if (!debugLogContext.enabled) return;
   const suffix = data === undefined ? "" : ` ${JSON.stringify(data, (_key, value) => typeof value === "string" && value.length > 300 ? `${value.slice(0, 300)}…` : value)}`;
-  invoke("append_debug_log", { source: "frontend", message: `${message}${suffix}` }).catch(() => {});
+  invoke("append_debug_log", { source: "frontend", message: `${message}${suffix}`, workdir: debugLogContext.workdir || null }).catch(() => {});
 }
 
 function loadProjects() {
   try {
     const raw = localStorage.getItem(PROJECTS_STORAGE_KEY);
     const parsed = raw ? JSON.parse(raw) : [];
-    return Array.isArray(parsed) ? parsed : [];
+    return normalizeStoredProjects(Array.isArray(parsed) ? parsed : [], storageLimits());
   } catch {
     return [];
   }
@@ -655,6 +687,7 @@ export default function App() {
   const [directoryTreeLoading, setDirectoryTreeLoading] = useState(false);
   const [directoryTreeError, setDirectoryTreeError] = useState("");
   const [workdir, setWorkdir] = useState(localStorage.getItem("workdir") || "");
+  const [debugLogEnabled, setDebugLogEnabled] = useState(false);
   const [projects, setProjects] = useState(() => loadProjects());
   const [activeProjectId, setActiveProjectId] = useState(null);
   const [activeProjectSessionId, setActiveProjectSessionId] = useState(null);
@@ -690,13 +723,45 @@ export default function App() {
   );
 
   useEffect(() => {
+    const projectPath = activeProject?.path || workdir || "";
+    let cancelled = false;
+    invoke("get_debug_logging_config", { workdir: projectPath || null }).then((config) => {
+      if (cancelled) return;
+      const enabled = Boolean(config?.enabled);
+      setDebugLogEnabled(enabled);
+      setDebugLogContext({ enabled, workdir: projectPath });
+    }).catch(() => {
+      if (cancelled) return;
+      setDebugLogEnabled(false);
+      setDebugLogContext({ enabled: false, workdir: projectPath });
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeProject?.path, workdir]);
+
+  function replayTerminalTail(sessionId, fallbackOutput = "") {
+    const fallback = String(fallbackOutput || "");
+    setTerminalReplayContent(fallback);
+    setTerminalReplaySignal((value) => value + 1);
+    if (!sessionId) return;
+    invoke("read_terminal_log_tail", { sessionId }).then((content) => {
+      if (activeProjectSessionIdRef.current !== sessionId) return;
+      const nextContent = String(content || fallback);
+      if (nextContent === fallback) return;
+      setTerminalReplayContent(nextContent);
+      setTerminalReplaySignal((value) => value + 1);
+      debugLog("terminal replay tail loaded", { sessionId, bytes: nextContent.length });
+    }).catch(() => {});
+  }
+
+  useEffect(() => {
     localStorage.setItem(CENTER_VIEW_STORAGE_KEY, centerView);
   }, [centerView]);
 
   useEffect(() => {
     if (centerView !== "terminal") return;
-    setTerminalReplayContent(activeProjectSession?.output || "");
-    setTerminalReplaySignal((value) => value + 1);
+    replayTerminalTail(activeProjectSessionId, activeProjectSession?.output || "");
   }, [centerView, activeProjectSessionId]);
 
   const loadDirectoryTree = useCallback(async (projectPath = activeProject?.path) => {
@@ -763,9 +828,10 @@ export default function App() {
   }
 
   function saveProjects(nextProjects) {
-    projectsRef.current = nextProjects;
-    setProjects(nextProjects);
-    localStorage.setItem(PROJECTS_STORAGE_KEY, JSON.stringify(nextProjects));
+    const compactProjects = normalizeStoredProjects(nextProjects, storageLimits());
+    projectsRef.current = compactProjects;
+    setProjects(compactProjects);
+    localStorage.setItem(PROJECTS_STORAGE_KEY, JSON.stringify(compactProjects));
   }
 
   function getSessionById(sessionId) {
@@ -808,15 +874,18 @@ export default function App() {
       })
     }));
     if (changed) {
-      projectsRef.current = nextProjects;
-      setProjects(nextProjects);
-      if (persist) localStorage.setItem(PROJECTS_STORAGE_KEY, JSON.stringify(nextProjects));
+      const compactProjects = normalizeStoredProjects(nextProjects, storageLimits());
+      projectsRef.current = compactProjects;
+      setProjects(compactProjects);
+      if (persist) localStorage.setItem(PROJECTS_STORAGE_KEY, JSON.stringify(compactProjects));
     }
     return updatedSession;
   }
 
   function persistCurrentSessionOutput() {
-    localStorage.setItem(PROJECTS_STORAGE_KEY, JSON.stringify(projectsRef.current));
+    const compactProjects = normalizeStoredProjects(projectsRef.current, storageLimits());
+    projectsRef.current = compactProjects;
+    localStorage.setItem(PROJECTS_STORAGE_KEY, JSON.stringify(compactProjects));
   }
 
   function schedulePersistCurrentSessionOutput() {
@@ -1029,16 +1098,21 @@ export default function App() {
       sessions: (project.sessions || []).map((session) => {
         if (session.id !== sessionId) return session;
         changed = true;
+        const preview = limitTerminalPreview(`${session.output || ""}${data}`);
         return {
           ...session,
-          output: `${session.output || ""}${data}`,
+          output: preview.text,
+          output_truncated: Boolean(session.output_truncated || preview.truncated),
+          output_bytes: (Number(session.output_bytes) || 0) + data.length,
           updated_at: now
         };
       })
     }));
     if (!changed) return;
-    projectsRef.current = nextProjects;
-    if (sessionId === activeProjectSessionIdRef.current) outputBufferRef.current += data;
+    projectsRef.current = normalizeStoredProjects(nextProjects, storageLimits());
+    if (sessionId === activeProjectSessionIdRef.current) {
+      outputBufferRef.current = limitTerminalPreview(`${outputBufferRef.current || ""}${data}`).text;
+    }
     scheduleProjectsRenderAndPersist();
   }
 
@@ -1086,7 +1160,6 @@ export default function App() {
 
     const unsubs = [];
     debugLog("app mounted");
-    invoke("get_debug_log_path").then((path) => setStatus(`调试日志：${path}`)).catch(() => {});
     listen("pi-status", (event) => {
       debugLog("pi-status event", event.payload);
       const payload = event.payload;
@@ -1359,8 +1432,7 @@ export default function App() {
     setCommand(session.draft_command || "");
     setAttachments(session.attachments || []);
     if (!sameSession && !options.skipReplay) {
-      setTerminalReplayContent(session.output || "");
-      setTerminalReplaySignal((value) => value + 1);
+      replayTerminalTail(sessionId, session.output || "");
       debugLog("selectProjectSession replay", { sessionId, outputBytes: (session.output || "").length });
     } else if (!sameSession && options.skipReplay) {
       setTerminalReplayContent("");
@@ -1551,6 +1623,7 @@ export default function App() {
   function clearTerminal() {
     const sessionId = activeProjectSessionIdRef.current;
     if (sessionId) {
+      invoke("clear_terminal_log", { sessionId }).catch(() => {});
       updateSessionById(sessionId, (session) => ({ ...session, output: "", updated_at: new Date().toISOString() }));
     }
     outputBufferRef.current = "";
@@ -1748,7 +1821,7 @@ export default function App() {
           <button className={terminalInputEnabled ? "primary" : ""} onClick={() => setTerminalInputEnabled((value) => !value)}>
             {terminalInputEnabled ? "原生终端：开" : "原生终端：关"}
           </button>
-          <button onClick={openDebugLog} title="打开调试日志所在目录"><FileText size={15}/> 调试日志</button>
+          {debugLogEnabled && <button onClick={openDebugLog} title="打开调试日志所在目录"><FileText size={15}/> 调试日志</button>}
           <button className="danger" onClick={() => stopAllPi().catch((e) => setStatus(String(e)))}>停止全部 Pi</button>
         </header>
         <div className="center-view-wrap">
@@ -1767,6 +1840,8 @@ export default function App() {
               replaySignal={terminalReplaySignal}
               replayContent={terminalReplayContent}
               terminalInputEnabled={terminalInputEnabled}
+              debugEnabled={debugLogEnabled}
+              debugWorkdir={activeProject?.path || workdir}
               onTerminalInput={handleTerminalInput}
             />
           )}

@@ -4,9 +4,22 @@ import { listen } from "@tauri-apps/api/event";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 
-function debugLog(message, data = undefined) {
+const TERMINAL_SCROLLBACK_STORAGE_KEY = "piIdeTerminalScrollback";
+const DEFAULT_TERMINAL_SCROLLBACK = 10000;
+
+function configuredPositiveNumber(key, fallback) {
+  const value = Number(localStorage.getItem(key));
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+}
+
+function terminalScrollbackLimit() {
+  return configuredPositiveNumber(TERMINAL_SCROLLBACK_STORAGE_KEY, DEFAULT_TERMINAL_SCROLLBACK);
+}
+
+function debugLog(enabled, workdir, message, data = undefined) {
+  if (!enabled) return;
   const suffix = data === undefined ? "" : ` ${JSON.stringify(data)}`;
-  invoke("append_debug_log", { source: "terminal", message: `${message}${suffix}` }).catch(() => {});
+  invoke("append_debug_log", { source: "terminal", message: `${message}${suffix}`, workdir: workdir || null }).catch(() => {});
 }
 
 function normalizeForScrollableTerminal(data) {
@@ -16,7 +29,7 @@ function normalizeForScrollableTerminal(data) {
     .replace(/\x1b\[3J/g, "");
 }
 
-export default function PiTerminal({ activeSessionId, clearSignal, replaySignal = 0, replayContent = "", terminalInputEnabled = true, onTerminalInput }) {
+export default function PiTerminal({ activeSessionId, clearSignal, replaySignal = 0, replayContent = "", terminalInputEnabled = true, debugEnabled = false, debugWorkdir = "", onTerminalInput }) {
   const hostRef = useRef(null);
   const scrollbarRef = useRef(null);
   const thumbRef = useRef(null);
@@ -30,9 +43,17 @@ export default function PiTerminal({ activeSessionId, clearSignal, replaySignal 
   const activeSessionIdRef = useRef(activeSessionId);
   const terminalInputEnabledRef = useRef(terminalInputEnabled);
   const onTerminalInputRef = useRef(onTerminalInput);
+  const debugEnabledRef = useRef(debugEnabled);
+  const debugWorkdirRef = useRef(debugWorkdir);
+  const logDebug = (message, data) => debugLog(debugEnabledRef.current, debugWorkdirRef.current, message, data);
 
   useEffect(() => {
-    debugLog("activeSession changed", { from: activeSessionIdRef.current, to: activeSessionId });
+    debugEnabledRef.current = debugEnabled;
+    debugWorkdirRef.current = debugWorkdir;
+  }, [debugEnabled, debugWorkdir]);
+
+  useEffect(() => {
+    logDebug("activeSession changed", { from: activeSessionIdRef.current, to: activeSessionId });
     activeSessionIdRef.current = activeSessionId;
   }, [activeSessionId]);
 
@@ -55,12 +76,12 @@ export default function PiTerminal({ activeSessionId, clearSignal, replaySignal 
     const thumb = thumbRef.current;
     if (!host || !scrollbar || !thumb) return;
 
-    debugLog("PiTerminal mount", { activeSessionId: activeSessionIdRef.current });
+    logDebug("PiTerminal mount", { activeSessionId: activeSessionIdRef.current });
     const term = new Terminal({
       cursorBlink: true,
       convertEol: false,
       disableStdin: !terminalInputEnabledRef.current,
-      scrollback: 100000,
+      scrollback: terminalScrollbackLimit(),
       scrollOnUserInput: false,
       smoothScrollDuration: 0,
       fontFamily: "Menlo, Monaco, Consolas, 'Courier New', monospace",
@@ -183,7 +204,7 @@ export default function PiTerminal({ activeSessionId, clearSignal, replaySignal 
 
     const dataDisposable = term.onData((data) => {
       if (isReplayingRef.current) {
-        debugLog("terminal onData ignored during replay", { activeSessionId: activeSessionIdRef.current, bytes: data.length });
+        logDebug("terminal onData ignored during replay", { activeSessionId: activeSessionIdRef.current, bytes: data.length });
         return;
       }
       if (!terminalInputEnabledRef.current) return;
@@ -205,7 +226,7 @@ export default function PiTerminal({ activeSessionId, clearSignal, replaySignal 
       const payload = event.payload || {};
       const sessionId = payload.sessionId || payload.session_id;
       const data = String(payload.data ?? "");
-      debugLog("terminal pi-output", { sessionId, active: activeSessionIdRef.current, bytes: data.length, accepted: Boolean(sessionId && sessionId === activeSessionIdRef.current) });
+      logDebug("terminal pi-output", { sessionId, active: activeSessionIdRef.current, bytes: data.length, accepted: Boolean(sessionId && sessionId === activeSessionIdRef.current) });
       if (!sessionId || sessionId !== activeSessionIdRef.current) return;
       writeTerminal(data);
     }).then((unsubscribe) => {
@@ -222,7 +243,7 @@ export default function PiTerminal({ activeSessionId, clearSignal, replaySignal 
       dataDisposable.dispose();
       scrollDisposable.dispose();
       window.removeEventListener("resize", fitAndNotify);
-      debugLog("PiTerminal unmount", { activeSessionId: activeSessionIdRef.current });
+      logDebug("PiTerminal unmount", { activeSessionId: activeSessionIdRef.current });
       unsubscribeOutput?.();
       term.dispose();
       terminalRef.current = null;
@@ -245,7 +266,7 @@ export default function PiTerminal({ activeSessionId, clearSignal, replaySignal 
     if (!term) return;
     pendingRef.current = "";
     writingRef.current = false;
-    debugLog("terminal replay", { activeSessionId: activeSessionIdRef.current, replaySignal, bytes: String(replayContent || "").length });
+    logDebug("terminal replay", { activeSessionId: activeSessionIdRef.current, replaySignal, bytes: String(replayContent || "").length });
     isReplayingRef.current = true;
     term.options.disableStdin = true;
     let finished = false;
@@ -256,7 +277,7 @@ export default function PiTerminal({ activeSessionId, clearSignal, replaySignal 
       replayTimeoutRef.current = null;
       isReplayingRef.current = false;
       term.options.disableStdin = !terminalInputEnabledRef.current;
-      debugLog("terminal replay end", { activeSessionId: activeSessionIdRef.current, replaySignal, reason });
+      logDebug("terminal replay end", { activeSessionId: activeSessionIdRef.current, replaySignal, reason });
     };
     replayTimeoutRef.current = setTimeout(() => finishReplay("timeout"), 5000);
     term.reset();

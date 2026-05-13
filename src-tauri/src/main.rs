@@ -3,7 +3,7 @@
 use once_cell::sync::Lazy;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, env, fs, io::{Read, Write}, path::{Path, PathBuf}, process::Command};
+use std::{collections::HashMap, env, fs, io::{Read, Seek, SeekFrom, Write}, path::{Path, PathBuf}, process::Command, sync::Mutex as StdMutex};
 use tauri::Emitter;
 use tokio::sync::Mutex;
 
@@ -11,9 +11,11 @@ struct PiRuntime {
   writer: Box<dyn Write + Send>,
   child: Box<dyn Child + Send + Sync>,
   master: Box<dyn MasterPty + Send>,
+  debug_enabled: bool,
 }
 
 static PI_SESSIONS: Lazy<Mutex<HashMap<String, PiRuntime>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static PI_EVENT_OFFSETS: Lazy<StdMutex<HashMap<String, u64>>> = Lazy::new(|| StdMutex::new(HashMap::new()));
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct HistoryItem {
@@ -66,7 +68,7 @@ fn debug_log_path() -> Result<PathBuf, String> { Ok(storage_dir()?.join("debug.l
 fn global_config_path() -> Result<PathBuf, String> { Ok(storage_dir()?.join("config.json")) }
 fn project_config_path(workdir: &Path) -> PathBuf { workdir.join(".pi.ide").join("config.json") }
 
-fn append_debug_line(line: &str) {
+fn append_debug_line_raw(line: &str) {
   if let Ok(path) = debug_log_path() {
     if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
       let _ = writeln!(file, "{} {}", now_iso(), line);
@@ -74,9 +76,22 @@ fn append_debug_line(line: &str) {
   }
 }
 
+fn append_debug_line_when(enabled: bool, line: &str) {
+  if enabled {
+    append_debug_line_raw(line);
+  }
+}
+
 #[tauri::command]
-fn append_debug_log(source: String, message: String) -> Result<(), String> {
-  append_debug_line(&format!("[{source}] {message}"));
+fn append_debug_log(source: String, message: String, workdir: Option<String>) -> Result<(), String> {
+  let workdir_path = workdir
+    .as_deref()
+    .map(str::trim)
+    .filter(|s| !s.is_empty())
+    .map(PathBuf::from);
+  if resolve_debug_logging_enabled(workdir_path.as_deref(), None)? {
+    append_debug_line_raw(&format!("[{source}] {message}"));
+  }
   Ok(())
 }
 
@@ -91,6 +106,9 @@ fn default_global_config(command: &str) -> serde_json::Value {
     "pi": {
       "command": command,
       "env": {}
+    },
+    "debug": {
+      "enabled": false
     }
   })
 }
@@ -101,6 +119,9 @@ fn default_project_config() -> serde_json::Value {
     "pi": {
       "command": "",
       "env": {}
+    },
+    "debug": {
+      "enabled": false
     }
   })
 }
@@ -122,23 +143,53 @@ fn write_json_value(path: &Path, value: &serde_json::Value) -> Result<(), String
   fs::write(path, format!("{raw}\n")).map_err(|e| format!("写入配置失败 {:?}: {e}", path))
 }
 
+fn ensure_debug_config(value: &mut serde_json::Value) -> bool {
+  let Some(map) = value.as_object_mut() else {
+    return false;
+  };
+  let Some(debug) = map.get_mut("debug") else {
+    map.insert("debug".to_string(), serde_json::json!({ "enabled": false }));
+    return true;
+  };
+  let Some(debug_map) = debug.as_object_mut() else {
+    *debug = serde_json::json!({ "enabled": false });
+    return true;
+  };
+  if !matches!(debug_map.get("enabled"), Some(value) if value.is_boolean()) {
+    debug_map.insert("enabled".to_string(), serde_json::Value::Bool(false));
+    return true;
+  }
+  false
+}
+
+fn ensure_config_file_defaults(path: &Path, default_value: serde_json::Value) -> Result<(), String> {
+  if !path.exists() {
+    write_json_value(path, &default_value)?;
+    return Ok(());
+  }
+  let Some(mut value) = read_json_value(path)? else {
+    write_json_value(path, &default_value)?;
+    return Ok(());
+  };
+  if ensure_debug_config(&mut value) {
+    write_json_value(path, &value)?;
+  }
+  Ok(())
+}
+
 fn ensure_pi_ide_config_files(workdir: Option<&Path>, legacy_command: Option<&str>) -> Result<(PathBuf, Option<PathBuf>), String> {
   let global_path = global_config_path()?;
-  if !global_path.exists() {
-    let fallback_command = std::env::var("PI_IDE_PI_BIN").unwrap_or_else(|_| "pi".to_string());
-    let command = legacy_command
-      .map(str::trim)
-      .filter(|s| !s.is_empty())
-      .map(ToString::to_string)
-      .unwrap_or(fallback_command);
-    write_json_value(&global_path, &default_global_config(&command))?;
-  }
+  let fallback_command = std::env::var("PI_IDE_PI_BIN").unwrap_or_else(|_| "pi".to_string());
+  let command = legacy_command
+    .map(str::trim)
+    .filter(|s| !s.is_empty())
+    .map(ToString::to_string)
+    .unwrap_or(fallback_command);
+  ensure_config_file_defaults(&global_path, default_global_config(&command))?;
 
   let project_path = if let Some(dir) = workdir.filter(|p| p.exists() && p.is_dir()) {
     let path = project_config_path(dir);
-    if !path.exists() {
-      write_json_value(&path, &default_project_config())?;
-    }
+    ensure_config_file_defaults(&path, default_project_config())?;
     Some(path)
   } else {
     None
@@ -173,6 +224,48 @@ fn config_env(value: Option<&serde_json::Value>) -> HashMap<String, String> {
   envs
 }
 
+fn config_debug_enabled(value: Option<&serde_json::Value>) -> Option<bool> {
+  value
+    .and_then(|v| v.get("debug"))
+    .and_then(|debug| debug.get("enabled"))
+    .and_then(|enabled| enabled.as_bool())
+}
+
+fn resolve_debug_logging_enabled(workdir: Option<&Path>, legacy_command: Option<&str>) -> Result<bool, String> {
+  let (global_path, project_path) = ensure_pi_ide_config_files(workdir, legacy_command)?;
+  let global_config = read_json_value(&global_path)?;
+  let project_config = match &project_path {
+    Some(path) => read_json_value(path)?,
+    None => None,
+  };
+  Ok(config_debug_enabled(project_config.as_ref())
+    .or_else(|| config_debug_enabled(global_config.as_ref()))
+    .unwrap_or(false))
+}
+
+#[tauri::command]
+fn get_debug_logging_config(workdir: Option<String>) -> Result<serde_json::Value, String> {
+  let workdir_path = workdir
+    .as_deref()
+    .map(str::trim)
+    .filter(|s| !s.is_empty())
+    .map(PathBuf::from);
+  let (global_path, project_path) = ensure_pi_ide_config_files(workdir_path.as_deref(), None)?;
+  let global_config = read_json_value(&global_path)?;
+  let project_config = match &project_path {
+    Some(path) => read_json_value(path)?,
+    None => None,
+  };
+  let enabled = config_debug_enabled(project_config.as_ref())
+    .or_else(|| config_debug_enabled(global_config.as_ref()))
+    .unwrap_or(false);
+  Ok(serde_json::json!({
+    "enabled": enabled,
+    "globalConfig": global_path.to_string_lossy(),
+    "projectConfig": project_path.map(|path| path.to_string_lossy().to_string())
+  }))
+}
+
 fn resolve_pi_launch_config(workdir: Option<&Path>, legacy_command: Option<&str>) -> Result<(String, HashMap<String, String>, serde_json::Value), String> {
   let (global_path, project_path) = ensure_pi_ide_config_files(workdir, legacy_command)?;
   let global_config = read_json_value(&global_path)?;
@@ -204,7 +297,16 @@ fn ensure_pi_ide_config(workdir: Option<String>, legacy_command: Option<String>)
     .filter(|s| !s.is_empty())
     .map(PathBuf::from);
   let (global_path, project_path) = ensure_pi_ide_config_files(workdir_path.as_deref(), legacy_command.as_deref())?;
+  let global_config = read_json_value(&global_path)?;
+  let project_config = match &project_path {
+    Some(path) => read_json_value(path)?,
+    None => None,
+  };
+  let debug_enabled = config_debug_enabled(project_config.as_ref())
+    .or_else(|| config_debug_enabled(global_config.as_ref()))
+    .unwrap_or(false);
   Ok(serde_json::json!({
+    "debugEnabled": debug_enabled,
     "globalConfig": global_path.to_string_lossy(),
     "projectConfig": project_path.map(|path| path.to_string_lossy().to_string())
   }))
@@ -216,6 +318,148 @@ import { execFileSync } from "node:child_process";
 
 const bashBefore = new Map();
 let sequence = 0;
+
+function eventTextLimit() {
+  const value = Number(process.env.PI_IDE_EVENT_TEXT_LIMIT || "50000");
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : 50000;
+}
+
+function positiveEnvNumber(name, fallback) {
+  const value = Number(process.env[name] || "");
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+}
+
+function envRegex(name, fallback, flags = "i") {
+  try {
+    return new RegExp(process.env[name] || fallback, flags);
+  } catch {
+    return new RegExp(fallback, flags);
+  }
+}
+
+function limitText(value) {
+  const text = String(value || "");
+  const limit = eventTextLimit();
+  if (text.length <= limit) return text;
+  return `${text.slice(0, limit)}\n[Pi IDE truncated ${text.length - limit} chars]`;
+}
+
+function toolResultTextLimit() {
+  return positiveEnvNumber("PI_IDE_TOOL_RESULT_TEXT_LIMIT", 50000);
+}
+
+function readLineLimit() {
+  return positiveEnvNumber("PI_IDE_READ_LIMIT", 1200);
+}
+
+function dangerousCommandPattern() {
+  return envRegex(
+    "PI_IDE_DANGEROUS_COMMAND_PATTERN",
+    String.raw`(?:\brm\s+-[^ \n\r;]*r[^ \n\r;]*f|\bgit\s+reset\s+--hard|\bgit\s+clean\s+-[^ \n\r;]*f|\bdel\s+/[sq]|\bformat\b|\bmkfs\b|\bRemove-Item\b[^\n\r;]*\b-Recurse\b)`
+  );
+}
+
+function protectedPathPattern() {
+  return envRegex(
+    "PI_IDE_PROTECTED_PATH_PATTERN",
+    String.raw`(^|[\\/])(?:\.env(?:\..*)?|\.git|node_modules)([\\/]|$)`
+  );
+}
+
+function compactJson(value) {
+  if (typeof value === "string") return limitText(value);
+  if (Array.isArray(value)) return value.map(compactJson);
+  if (value && typeof value === "object") {
+    const next = {};
+    for (const [key, item] of Object.entries(value)) {
+      next[key] = compactJson(item);
+    }
+    return next;
+  }
+  return value;
+}
+
+function limitToolText(value) {
+  const text = String(value || "");
+  const limit = toolResultTextLimit();
+  if (text.length <= limit) return { text, truncated: false };
+  return {
+    text: `${text.slice(0, limit)}\n[Pi IDE tool result truncated ${text.length - limit} chars]`,
+    truncated: true,
+  };
+}
+
+function compactToolContent(content) {
+  let truncated = false;
+  const next = (Array.isArray(content) ? content : []).map((item) => {
+    if (typeof item === "string") {
+      const limited = limitToolText(item);
+      truncated ||= limited.truncated;
+      return limited.text;
+    }
+    if (item?.type === "text") {
+      const limited = limitToolText(item.text || "");
+      truncated ||= limited.truncated;
+      return { ...item, text: limited.text };
+    }
+    return item;
+  });
+  return { content: next, truncated };
+}
+
+function blockTool(ctx, event, reason) {
+  appendEvent(ctx, {
+    kind: "policy",
+    source: "pi-ide-tool-policy",
+    action: "blocked",
+    toolCallId: event.toolCallId,
+    toolName: event.toolName,
+    reason,
+  });
+  return { block: true, reason };
+}
+
+function normalizeEventInput(event) {
+  if (!event.input || typeof event.input !== "object") event.input = {};
+  return event.input;
+}
+
+function applyToolPolicy(event, ctx) {
+  const input = normalizeEventInput(event);
+
+  if (event.toolName === "bash") {
+    const command = String(input.command || input.cmd || "");
+    if (dangerousCommandPattern().test(command)) {
+      return blockTool(ctx, event, "Blocked dangerous shell command by Pi IDE policy");
+    }
+  }
+
+  if (event.toolName === "write" || event.toolName === "edit") {
+    const rawPath = String(input.path || "");
+    const normalized = normalizeFilePath(ctx?.cwd || process.cwd(), rawPath);
+    if (normalized && protectedPathPattern().test(normalized)) {
+      return blockTool(ctx, event, `Blocked protected path by Pi IDE policy: ${path.basename(normalized)}`);
+    }
+  }
+
+  if (event.toolName === "read") {
+    const limit = readLineLimit();
+    if (!input.limit || Number(input.limit) > limit) {
+      input.limit = limit;
+      appendEvent(ctx, {
+        kind: "policy",
+        source: "pi-ide-tool-policy",
+        action: "patched",
+        toolCallId: event.toolCallId,
+        toolName: event.toolName,
+        field: "limit",
+        value: limit,
+      });
+    }
+  }
+
+  return undefined;
+}
 
 function eventFile(cwd) {
   return path.join(cwd, ".pi", "pi-ide-events.jsonl");
@@ -264,8 +508,8 @@ function textContent(message) {
 
 function compactResult(result) {
   return {
-    content: result?.content || [],
-    details: result?.details || {},
+    content: compactJson(result?.content || []),
+    details: compactJson(result?.details || {}),
   };
 }
 
@@ -414,7 +658,7 @@ export default function(pi) {
   pi.on("turn_end", async (event, ctx) => {
     appendTimeline(ctx, event.type, {
       turnIndex: event.turnIndex,
-      text: textContent(event.message),
+      text: limitText(textContent(event.message)),
       toolResults: event.toolResults?.map(compactResult) || [],
     });
   });
@@ -425,18 +669,15 @@ export default function(pi) {
       messageId: event.message?.id,
       deltaType: delta.type,
       contentIndex: delta.contentIndex,
-      delta: delta.delta || "",
-      content: delta.content || "",
-      reason: delta.reason || "",
-      text: textContent(event.message),
-      toolCall: delta.toolCall || undefined,
+      delta: limitText(delta.delta || ""),
+      reason: limitText(delta.reason || ""),
     });
   });
 
   pi.on("message_end", async (event, ctx) => {
     appendTimeline(ctx, event.type, {
       messageId: event.message?.id,
-      text: textContent(event.message),
+      text: limitText(textContent(event.message)),
       messageRole: event.message?.role,
       model: modelInfo(event.message),
     });
@@ -446,7 +687,7 @@ export default function(pi) {
     appendTimeline(ctx, event.type, {
       toolCallId: event.toolCallId,
       toolName: event.toolName,
-      args: event.args || {},
+      args: compactJson(event.args || {}),
     });
   });
 
@@ -454,7 +695,7 @@ export default function(pi) {
     appendTimeline(ctx, event.type, {
       toolCallId: event.toolCallId,
       toolName: event.toolName,
-      args: event.args || {},
+      args: compactJson(event.args || {}),
       partialResult: compactResult(event.partialResult),
     });
   });
@@ -469,30 +710,51 @@ export default function(pi) {
   });
 
   pi.on("tool_call", async (event, ctx) => {
+    const policyResult = applyToolPolicy(event, ctx);
+    if (policyResult) return policyResult;
+
     if (event.toolName === "bash") {
       bashBefore.set(event.toolCallId, gitChangedFiles(ctx.cwd));
     }
   });
 
   pi.on("tool_result", async (event, ctx) => {
-    if (event.isError) return;
+    const compacted = compactToolContent(event.content);
+    if (compacted.truncated) {
+      appendEvent(ctx, {
+        kind: "policy",
+        source: "pi-ide-tool-policy",
+        action: "truncated",
+        toolCallId: event.toolCallId,
+        toolName: event.toolName,
+      });
+    }
+    const resultPatch = compacted.truncated ? {
+      content: compacted.content,
+      details: {
+        ...(event.details || {}),
+        piIdeTruncated: true,
+      },
+    } : undefined;
+
+    if (event.isError) return resultPatch;
     const input = event.input || {};
     const toolName = event.toolName;
     const toolCallId = event.toolCallId;
 
     if (toolName === "read") {
       recordPath(ctx, "reference", "pi-tool-read", toolCallId, toolName, input.path);
-      return;
+      return resultPatch;
     }
 
     if (toolName === "write") {
       recordPath(ctx, "output", "pi-tool-write", toolCallId, toolName, input.path);
-      return;
+      return resultPatch;
     }
 
     if (toolName === "edit") {
       recordPath(ctx, "output", "pi-tool-edit", toolCallId, toolName, input.path);
-      return;
+      return resultPatch;
     }
 
     if (toolName === "bash") {
@@ -505,6 +767,8 @@ export default function(pi) {
         }
       }
     }
+
+    return resultPatch;
   });
 }
 "#;
@@ -1027,32 +1291,81 @@ fn session_dir(session_id: &str) -> Result<PathBuf, String> {
   Ok(dir)
 }
 
+fn env_u64(name: &str, default: u64) -> u64 {
+  std::env::var(name)
+    .ok()
+    .and_then(|value| value.trim().parse::<u64>().ok())
+    .filter(|value| *value > 0)
+    .unwrap_or(default)
+}
+
+fn terminal_log_tail_bytes() -> u64 {
+  env_u64("PI_IDE_TERMINAL_LOG_TAIL_BYTES", 1024 * 1024)
+}
+
+fn terminal_log_path(session_id: &str) -> Result<PathBuf, String> {
+  Ok(session_dir(session_id)?.join("terminal.log"))
+}
+
+fn append_terminal_log_bytes(path: &Path, data: &[u8]) -> Result<(), String> {
+  if data.is_empty() {
+    return Ok(());
+  }
+  let mut file = fs::OpenOptions::new()
+    .create(true)
+    .append(true)
+    .open(path)
+    .map_err(|e| format!("鍐欏叆缁堢鏃ュ織澶辫触 {:?}: {e}", path))?;
+  file.write_all(data)
+    .map_err(|e| format!("鍐欏叆缁堢鏃ュ織澶辫触 {:?}: {e}", path))
+}
+
+#[tauri::command]
+fn append_terminal_log(session_id: String, data: String) -> Result<(), String> {
+  if session_id.trim().is_empty() || data.is_empty() {
+    return Ok(());
+  }
+  let path = terminal_log_path(&session_id)?;
+  append_terminal_log_bytes(&path, data.as_bytes())
+}
+
+#[tauri::command]
+fn read_terminal_log_tail(session_id: String, max_bytes: Option<u64>) -> Result<String, String> {
+  if session_id.trim().is_empty() {
+    return Ok(String::new());
+  }
+  let path = terminal_log_path(&session_id)?;
+  if !path.exists() {
+    return Ok(String::new());
+  }
+  let limit = max_bytes.unwrap_or_else(terminal_log_tail_bytes);
+  if limit == 0 {
+    return Ok(String::new());
+  }
+  let mut file = fs::File::open(&path).map_err(|e| format!("璇诲彇缁堢鏃ュ織澶辫触 {:?}: {e}", path))?;
+  let len = file.metadata().map_err(|e| format!("璇诲彇缁堢鏃ュ織澶у皬澶辫触 {:?}: {e}", path))?.len();
+  if len > limit {
+    file.seek(SeekFrom::Start(len - limit))
+      .map_err(|e| format!("瀹氫綅缁堢鏃ュ織澶辫触 {:?}: {e}", path))?;
+  }
+  let mut bytes = Vec::new();
+  file.read_to_end(&mut bytes).map_err(|e| format!("璇诲彇缁堢鏃ュ織澶辫触 {:?}: {e}", path))?;
+  Ok(String::from_utf8_lossy(&bytes).to_string())
+}
+
+#[tauri::command]
+fn clear_terminal_log(session_id: String) -> Result<(), String> {
+  if session_id.trim().is_empty() {
+    return Ok(());
+  }
+  let path = terminal_log_path(&session_id)?;
+  fs::write(&path, "").map_err(|e| format!("娓呯┖缁堢鏃ュ織澶辫触 {:?}: {e}", path))
+}
+
 #[tauri::command]
 async fn start_pi_session(app: tauri::AppHandle, session_id: String, pi_command: Option<String>, workdir: Option<String>, continue_session: Option<bool>) -> Result<(), String> {
-  append_debug_line(&format!("[backend] start_pi_session request session_id={session_id} workdir={:?} continue={:?}", workdir, continue_session));
   if session_id.trim().is_empty() {
     return Err("sessionId 为空".to_string());
-  }
-
-  {
-    let mut sessions = PI_SESSIONS.lock().await;
-    if let Some(runtime) = sessions.get_mut(&session_id) {
-      match runtime.child.try_wait() {
-        Ok(None) => {
-          append_debug_line(&format!("[backend] start_pi_session already_running session_id={session_id}"));
-          let _ = app.emit("pi-status", serde_json::json!({ "sessionId": session_id, "status": "Pi 已经在运行" }));
-          return Ok(());
-        }
-        Ok(Some(status)) => {
-          append_debug_line(&format!("[backend] start_pi_session stale_child session_id={session_id} status={status}"));
-          sessions.remove(&session_id);
-        }
-        Err(e) => {
-          append_debug_line(&format!("[backend] start_pi_session try_wait_error session_id={session_id} error={e}"));
-          sessions.remove(&session_id);
-        }
-      }
-    }
   }
 
   let workdir_path = workdir
@@ -1060,13 +1373,37 @@ async fn start_pi_session(app: tauri::AppHandle, session_id: String, pi_command:
     .map(str::trim)
     .filter(|s| !s.is_empty())
     .map(PathBuf::from);
+  let debug_enabled = resolve_debug_logging_enabled(workdir_path.as_deref(), pi_command.as_deref())?;
+  append_debug_line_when(debug_enabled, &format!("[backend] start_pi_session request session_id={session_id} workdir={:?} continue={:?}", workdir, continue_session));
+
+  {
+    let mut sessions = PI_SESSIONS.lock().await;
+    if let Some(runtime) = sessions.get_mut(&session_id) {
+      match runtime.child.try_wait() {
+        Ok(None) => {
+          append_debug_line_when(runtime.debug_enabled, &format!("[backend] start_pi_session already_running session_id={session_id}"));
+          let _ = app.emit("pi-status", serde_json::json!({ "sessionId": session_id, "status": "Pi 已经在运行" }));
+          return Ok(());
+        }
+        Ok(Some(status)) => {
+          append_debug_line_when(runtime.debug_enabled, &format!("[backend] start_pi_session stale_child session_id={session_id} status={status}"));
+          sessions.remove(&session_id);
+        }
+        Err(e) => {
+          append_debug_line_when(runtime.debug_enabled, &format!("[backend] start_pi_session try_wait_error session_id={session_id} error={e}"));
+          sessions.remove(&session_id);
+        }
+      }
+    }
+  }
+
   let (raw, config_envs, config_info) = resolve_pi_launch_config(workdir_path.as_deref(), pi_command.as_deref())?;
   let extra_args = if continue_session.unwrap_or(false) && !command_has_resume_flag(&raw) {
     vec!["--continue".to_string()]
   } else {
     vec![]
   };
-  append_debug_line(&format!("[backend] start_pi_session build command session_id={session_id} command_len={} extra_args={:?} config={}", raw.len(), extra_args, config_info));
+  append_debug_line_when(debug_enabled, &format!("[backend] start_pi_session build command session_id={session_id} command_len={} extra_args={:?} config={}", raw.len(), extra_args, config_info));
   let mut cmd = build_pi_command(&raw, &extra_args)?;
   let session_dir = session_dir(&session_id)?;
   let run_id = format!("pi-run-{}-{}", chrono::Utc::now().timestamp_millis(), session_id);
@@ -1077,8 +1414,8 @@ async fn start_pi_session(app: tauri::AppHandle, session_id: String, pi_command:
     cmd.env(key, value);
   }
 
-  if let Some(dir_path) = workdir_path {
-    ensure_pi_ide_file_tracker(&dir_path)?;
+  if let Some(dir_path) = workdir_path.as_ref() {
+    ensure_pi_ide_file_tracker(dir_path)?;
     cmd.cwd(dir_path);
   }
 
@@ -1095,18 +1432,20 @@ async fn start_pi_session(app: tauri::AppHandle, session_id: String, pi_command:
   let mut reader = pair.master.try_clone_reader().map_err(|e| format!("无法打开 Pi PTY reader: {e}"))?;
   let writer = pair.master.take_writer().map_err(|e| format!("无法打开 Pi PTY writer: {e}"))?;
 
-  PI_SESSIONS.lock().await.insert(session_id.clone(), PiRuntime { writer, child, master: pair.master });
-  append_debug_line(&format!("[backend] start_pi_session spawned session_id={session_id}"));
+  PI_SESSIONS.lock().await.insert(session_id.clone(), PiRuntime { writer, child, master: pair.master, debug_enabled });
+  append_debug_line_when(debug_enabled, &format!("[backend] start_pi_session spawned session_id={session_id}"));
   let _ = app.emit("pi-status", serde_json::json!({ "sessionId": session_id, "runId": run_id, "status": format!("Pi 已启动：{}", raw) }));
 
   let out_app = app.clone();
   let out_session_id = session_id.clone();
+  let out_terminal_log_path = session_dir.join("terminal.log");
+  let out_debug_enabled = debug_enabled;
   std::thread::spawn(move || {
     let mut buf = vec![0u8; 8192];
     loop {
       match reader.read(&mut buf) {
         Ok(0) => {
-          append_debug_line(&format!("[backend] pi-output eof session_id={}", out_session_id));
+          append_debug_line_when(out_debug_enabled, &format!("[backend] pi-output eof session_id={}", out_session_id));
           let _ = out_app.emit("pi-status", serde_json::json!({
             "sessionId": out_session_id,
             "status": "Pi 已退出"
@@ -1114,14 +1453,15 @@ async fn start_pi_session(app: tauri::AppHandle, session_id: String, pi_command:
           break;
         }
         Ok(n) => {
-          append_debug_line(&format!("[backend] pi-output session_id={} bytes={}", out_session_id, n));
+          let _ = append_terminal_log_bytes(&out_terminal_log_path, &buf[..n]);
+          append_debug_line_when(out_debug_enabled, &format!("[backend] pi-output session_id={} bytes={}", out_session_id, n));
           let _ = out_app.emit("pi-output", serde_json::json!({
             "sessionId": out_session_id,
             "data": String::from_utf8_lossy(&buf[..n]).to_string()
           }));
         }
         Err(e) => {
-          append_debug_line(&format!("[backend] pi-output error session_id={} error={}", out_session_id, e));
+          append_debug_line_when(out_debug_enabled, &format!("[backend] pi-output error session_id={} error={}", out_session_id, e));
           let _ = out_app.emit("pi-output", serde_json::json!({
             "sessionId": out_session_id,
             "data": format!("\r\n[PTY 读取错误] {e}\r\n")
@@ -1141,25 +1481,25 @@ async fn start_pi_session(app: tauri::AppHandle, session_id: String, pi_command:
 
 #[tauri::command]
 async fn send_pi_input(session_id: String, input: String) -> Result<(), String> {
-  append_debug_line(&format!("[backend] send_pi_input session_id={session_id} bytes={}", input.len()));
   let mut sessions = PI_SESSIONS.lock().await;
   let runtime = sessions.get_mut(&session_id).ok_or("当前会话 Pi 尚未启动")?;
+  append_debug_line_when(runtime.debug_enabled, &format!("[backend] send_pi_input session_id={session_id} bytes={}", input.len()));
   runtime.writer.write_all(input.as_bytes()).map_err(|e| format!("写入 Pi PTY 失败: {e}"))?;
   runtime.writer.flush().map_err(|e| format!("刷新 Pi PTY 失败: {e}"))
 }
 
 async fn stop_pi_session_runtime(session_id: &str) {
-  append_debug_line(&format!("[backend] stop_pi_session_runtime session_id={session_id}"));
   let mut sessions = PI_SESSIONS.lock().await;
   if let Some(mut runtime) = sessions.remove(session_id) {
+    append_debug_line_when(runtime.debug_enabled, &format!("[backend] stop_pi_session_runtime session_id={session_id}"));
     let _ = runtime.child.kill();
   }
 }
 
 async fn stop_all_pi_sessions_runtime() {
-  append_debug_line("[backend] stop_all_pi_sessions_runtime");
   let mut sessions = PI_SESSIONS.lock().await;
-  for (_, mut runtime) in sessions.drain() {
+  for (session_id, mut runtime) in sessions.drain() {
+    append_debug_line_when(runtime.debug_enabled, &format!("[backend] stop_all_pi_sessions_runtime session_id={session_id}"));
     let _ = runtime.child.kill();
   }
 }
@@ -1271,13 +1611,70 @@ fn read_jsonl_values(path: PathBuf) -> Result<Vec<serde_json::Value>, String> {
   Ok(events)
 }
 
+fn read_jsonl_values_incremental(path: PathBuf) -> Result<Vec<serde_json::Value>, String> {
+  if !path.exists() {
+    return Ok(vec![]);
+  }
+
+  let key = path.to_string_lossy().to_string();
+  let len = fs::metadata(&path).map_err(|e| format!("璇诲彇 JSONL 澶у皬澶辫触 {:?}: {e}", path))?.len();
+  let start = {
+    let mut offsets = PI_EVENT_OFFSETS.lock().map_err(|_| "JSONL offset lock poisoned".to_string())?;
+    let saved = *offsets.get(&key).unwrap_or(&0);
+    if len < saved {
+      offsets.insert(key.clone(), 0);
+      0
+    } else {
+      saved
+    }
+  };
+
+  if start == len {
+    return Ok(vec![]);
+  }
+
+  if start == 0 {
+    let events = read_jsonl_values(path.clone())?;
+    let mut offsets = PI_EVENT_OFFSETS.lock().map_err(|_| "JSONL offset lock poisoned".to_string())?;
+    offsets.insert(key, len);
+    return Ok(events);
+  }
+
+  let mut file = fs::File::open(&path).map_err(|e| format!("璇诲彇 JSONL 澶辫触 {:?}: {e}", path))?;
+  file.seek(SeekFrom::Start(start)).map_err(|e| format!("瀹氫綅 JSONL 澶辫触 {:?}: {e}", path))?;
+  let mut raw = String::new();
+  file.read_to_string(&mut raw).map_err(|e| format!("璇诲彇 JSONL 澶辫触 {:?}: {e}", path))?;
+
+  let mut next_offset = start + raw.len() as u64;
+  if !raw.is_empty() && !raw.ends_with('\n') {
+    if let Some(index) = raw.rfind('\n') {
+      raw.truncate(index + 1);
+      next_offset = start + index as u64 + 1;
+    } else {
+      raw.clear();
+      next_offset = start;
+    }
+  }
+
+  let mut events = Vec::new();
+  for line in raw.lines().filter(|line| !line.trim().is_empty()) {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+      events.push(value);
+    }
+  }
+
+  let mut offsets = PI_EVENT_OFFSETS.lock().map_err(|_| "JSONL offset lock poisoned".to_string())?;
+  offsets.insert(key, next_offset);
+  Ok(events)
+}
+
 #[tauri::command]
 fn load_pi_ide_file_events(workdir: String) -> Result<Vec<serde_json::Value>, String> {
   let dir = PathBuf::from(workdir.trim());
   if !dir.exists() || !dir.is_dir() {
     return Ok(vec![]);
   }
-  read_jsonl_values(pi_ide_file_events_path(&dir))
+  read_jsonl_values_incremental(pi_ide_file_events_path(&dir))
 }
 
 #[tauri::command]
@@ -1286,7 +1683,7 @@ fn load_pi_ide_events(workdir: String) -> Result<Vec<serde_json::Value>, String>
   if !dir.exists() || !dir.is_dir() {
     return Ok(vec![]);
   }
-  read_jsonl_values(pi_ide_events_path(&dir))
+  read_jsonl_values_incremental(pi_ide_events_path(&dir))
 }
 
 fn main() {
@@ -1298,9 +1695,13 @@ fn main() {
       ensure_pi_ide_config,
       append_debug_log,
       get_debug_log_path,
+      get_debug_logging_config,
       open_path_in_file_manager,
       open_file_with_default_app,
       get_directory_tree,
+      append_terminal_log,
+      read_terminal_log_tail,
+      clear_terminal_log,
       start_pi_session,
       send_pi_input,
       stop_pi_session,
