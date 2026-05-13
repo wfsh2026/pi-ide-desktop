@@ -216,6 +216,13 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 .pi-session-markdown p:last-child { margin-bottom: 0; }
 .pi-session-markdown ul, .pi-session-markdown ol { margin: 0 0 14px 22px; padding: 0; }
 .pi-session-markdown li { margin: 6px 0; }
+.pi-session-table-wrap { margin: 12px 0; overflow-x: auto; }
+.pi-session-table { width: 100%; border-collapse: collapse; font-size: 13px; color: #e8e8e8; }
+.pi-session-table thead { border-bottom: 2px solid rgba(255,255,255,.12); }
+.pi-session-table th { padding: 9px 11px; text-align: left; font-weight: 700; color: #d4d4d4; background: rgba(255,255,255,.04); white-space: nowrap; }
+.pi-session-table td { padding: 8px 11px; border-bottom: 1px solid rgba(255,255,255,.06); vertical-align: top; }
+.pi-session-table tr:last-child td { border-bottom: 0; }
+.pi-session-table tr:hover td { background: rgba(255,255,255,.03); }
 .pi-session-inline-code { padding: 2px 5px; border-radius: 5px; background: #2b2b2b; color: #f5f5f5; font: 12px/1.4 Consolas, "Courier New", monospace; }
 .pi-session-code { margin: 10px 0; padding: 12px; max-height: 260px; overflow: auto; border-radius: 9px; border: 1px solid rgba(255,255,255,.07); background: #262626; color: #f0f0f0; font: 12px/1.55 Consolas, "Courier New", monospace; white-space: pre-wrap; }
 .pi-session-code span { display: block; margin-bottom: 7px; color: #9b9b9b; font: 11px/1.2 Inter, ui-sans-serif, system-ui, sans-serif; }

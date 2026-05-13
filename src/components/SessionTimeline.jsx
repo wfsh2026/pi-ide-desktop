@@ -97,6 +97,16 @@ function InlineText({ text }) {
   );
 }
 
+function isTableBlock(lines) {
+  return lines.length >= 2
+    && lines.every((line) => /^\|.+\|\s*$/.test(line.trim()))
+    && /^\|[\s:-]+\|\s*$/.test(lines[1].trim());
+}
+
+function parseTableCells(row) {
+  return row.trim().replace(/^\|/, "").replace(/\|\s*$/, "").split("|").map((cell) => cell.trim());
+}
+
 function MarkdownText({ text }) {
   const sections = splitMarkdownSections(text);
   if (sections.length === 0) return null;
@@ -116,10 +126,32 @@ function MarkdownText({ text }) {
         return section.text.split(/\n{2,}/).map((block, blockIndex) => {
           const value = block.trim();
           if (!value) return null;
+
+          const lines = value.split("\n");
+
+          if (isTableBlock(lines)) {
+            const headerCells = parseTableCells(lines[0]);
+            const dataRows = lines.slice(2);
+            return (
+              <div className="pi-session-table-wrap" key={`${index}-${blockIndex}`}>
+                <table className="pi-session-table">
+                  <thead>
+                    <tr>{headerCells.map((cell, ci) => <th key={ci}><InlineText text={cell}/></th>)}</tr>
+                  </thead>
+                  <tbody>
+                    {dataRows.map((row, ri) => {
+                      const cells = parseTableCells(row);
+                      return <tr key={ri}>{cells.map((cell, ci) => <td key={ci}><InlineText text={cell}/></td>)}</tr>;
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            );
+          }
+
           const heading = value.match(/^(#{1,4})\s+(.+)$/);
           if (heading) return <h4 key={`${index}-${blockIndex}`}>{heading[2]}</h4>;
 
-          const lines = value.split("\n");
           const bulletLines = lines.filter((line) => /^[-*]\s+/.test(line.trim()));
           if (bulletLines.length > 0 && bulletLines.length === lines.length) {
             return (
