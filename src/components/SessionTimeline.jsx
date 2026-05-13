@@ -97,16 +97,129 @@ function InlineText({ text }) {
   );
 }
 
-function isTableBlock(lines) {
-  if (lines.length < 3) return false;
-  const pipeLines = lines.filter((line) => /^\|.+\|\s*$/.test(line.trim()));
-  const hasHeader = pipeLines.length >= 2;
-  const separatorIndex = lines.findIndex((line) => /^\|[-:\s]+(\|[-:\s]+)*\|\s*$/.test(line.trim()));
-  return hasHeader && separatorIndex === 1 && pipeLines.length >= lines.length - 1;
-}
-
 function parseTableCells(row) {
   return row.trim().replace(/^\|/, "").replace(/\|\s*$/, "").split("|").map((cell) => cell.trim());
+}
+
+function isTableRow(line) {
+  return String(line || "").includes("|") && parseTableCells(line).length >= 2;
+}
+
+function isTableSeparator(line) {
+  const cells = parseTableCells(line);
+  return cells.length >= 2 && cells.every((cell) => /^:?-{3,}:?$/.test(cell.replace(/\s+/g, "")));
+}
+
+function tableStartsAt(lines, index) {
+  return isTableRow(lines[index]) && isTableSeparator(lines[index + 1]);
+}
+
+function renderTable(lines, key) {
+  const rows = lines.map(parseTableCells);
+  const columnCount = Math.max(...rows.map((row) => row.length));
+  const hasSeparator = lines.length > 1 && isTableSeparator(lines[1]);
+  const headerCells = rows[0];
+  const dataRows = rows.slice(hasSeparator ? 2 : 1);
+
+  function cellAt(row, index) {
+    return row[index] ?? "";
+  }
+
+  return (
+    <div className="pi-session-table-wrap" key={key}>
+      <table className="pi-session-table">
+        <thead>
+          <tr>{Array.from({ length: columnCount }, (_, ci) => <th key={ci}><InlineText text={cellAt(headerCells, ci)}/></th>)}</tr>
+        </thead>
+        <tbody>
+          {dataRows.map((row, ri) => (
+            <tr key={ri}>{Array.from({ length: columnCount }, (_, ci) => <td key={ci}><InlineText text={cellAt(row, ci)}/></td>)}</tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function renderPlainMarkdownBlock(value, key) {
+  const lines = value.split("\n");
+  const heading = value.match(/^(#{1,4})\s+(.+)$/);
+  if (heading) return <h4 key={key}>{heading[2]}</h4>;
+
+  const bulletLines = lines.filter((line) => /^[-*]\s+/.test(line.trim()));
+  if (bulletLines.length > 0 && bulletLines.length === lines.length) {
+    return (
+      <ul key={key}>
+        {bulletLines.map((line, lineIndex) => <li key={lineIndex}><InlineText text={line.trim().replace(/^[-*]\s+/, "")}/></li>)}
+      </ul>
+    );
+  }
+
+  const orderedLines = lines.filter((line) => /^\d+\.\s+/.test(line.trim()));
+  if (orderedLines.length > 0 && orderedLines.length === lines.length) {
+    return (
+      <ol key={key}>
+        {orderedLines.map((line, lineIndex) => <li key={lineIndex}><InlineText text={line.trim().replace(/^\d+\.\s+/, "")}/></li>)}
+      </ol>
+    );
+  }
+
+  return <p key={key}><InlineText text={value}/></p>;
+}
+
+function renderTextSection(text, keyPrefix) {
+  const lines = String(text || "").split("\n");
+  const rendered = [];
+  let paragraph = [];
+  let index = 0;
+
+  function flushParagraph() {
+    const value = paragraph.join("\n").trim();
+    if (value) rendered.push(renderPlainMarkdownBlock(value, `${keyPrefix}-p-${rendered.length}`));
+    paragraph = [];
+  }
+
+  while (index < lines.length) {
+    const line = lines[index];
+    if (!line.trim()) {
+      flushParagraph();
+      index += 1;
+      continue;
+    }
+
+    if (tableStartsAt(lines, index)) {
+      flushParagraph();
+      const tableLines = [lines[index], lines[index + 1]];
+      index += 2;
+      while (index < lines.length && isTableRow(lines[index]) && !isTableSeparator(lines[index])) {
+        tableLines.push(lines[index]);
+        index += 1;
+      }
+      rendered.push(renderTable(tableLines, `${keyPrefix}-table-${rendered.length}`));
+      continue;
+    }
+
+    if (isTableRow(line)) {
+      const tableLines = [];
+      let cursor = index;
+      while (cursor < lines.length && isTableRow(lines[cursor]) && !isTableSeparator(lines[cursor])) {
+        tableLines.push(lines[cursor]);
+        cursor += 1;
+      }
+      if (tableLines.length >= 2) {
+        flushParagraph();
+        rendered.push(renderTable(tableLines, `${keyPrefix}-pipe-table-${rendered.length}`));
+        index = cursor;
+        continue;
+      }
+    }
+
+    paragraph.push(line);
+    index += 1;
+  }
+
+  flushParagraph();
+  return rendered;
 }
 
 function MarkdownText({ text }) {
@@ -125,55 +238,7 @@ function MarkdownText({ text }) {
           );
         }
 
-        return section.text.split(/\n{2,}/).map((block, blockIndex) => {
-          const value = block.trim();
-          if (!value) return null;
-
-          const lines = value.split("\n");
-
-          if (isTableBlock(lines)) {
-            const headerCells = parseTableCells(lines[0]);
-            const dataRows = lines.slice(2);
-            return (
-              <div className="pi-session-table-wrap" key={`${index}-${blockIndex}`}>
-                <table className="pi-session-table">
-                  <thead>
-                    <tr>{headerCells.map((cell, ci) => <th key={ci}><InlineText text={cell}/></th>)}</tr>
-                  </thead>
-                  <tbody>
-                    {dataRows.map((row, ri) => {
-                      const cells = parseTableCells(row);
-                      return <tr key={ri}>{cells.map((cell, ci) => <td key={ci}><InlineText text={cell}/></td>)}</tr>;
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            );
-          }
-
-          const heading = value.match(/^(#{1,4})\s+(.+)$/);
-          if (heading) return <h4 key={`${index}-${blockIndex}`}>{heading[2]}</h4>;
-
-          const bulletLines = lines.filter((line) => /^[-*]\s+/.test(line.trim()));
-          if (bulletLines.length > 0 && bulletLines.length === lines.length) {
-            return (
-              <ul key={`${index}-${blockIndex}`}>
-                {bulletLines.map((line, lineIndex) => <li key={lineIndex}><InlineText text={line.trim().replace(/^[-*]\s+/, "")}/></li>)}
-              </ul>
-            );
-          }
-
-          const orderedLines = lines.filter((line) => /^\d+\.\s+/.test(line.trim()));
-          if (orderedLines.length > 0 && orderedLines.length === lines.length) {
-            return (
-              <ol key={`${index}-${blockIndex}`}>
-                {orderedLines.map((line, lineIndex) => <li key={lineIndex}><InlineText text={line.trim().replace(/^\d+\.\s+/, "")}/></li>)}
-              </ol>
-            );
-          }
-
-          return <p key={`${index}-${blockIndex}`}><InlineText text={value}/></p>;
-        });
+        return renderTextSection(section.text, `${section.type}-${index}`);
       })}
     </div>
   );

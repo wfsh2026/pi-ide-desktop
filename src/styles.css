@@ -149,11 +149,13 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 .pi-setup-form-wide { grid-column: 1 / -1; }
 .xterm-frame { position: relative; width: 100%; height: 100%; min-width: 0; min-height: 0; border-radius: 18px; overflow: hidden; border: 1px solid var(--border-subtle); background: var(--terminal-bg); }
 .xterm-frame.terminal-native { border-color: var(--border-strong); box-shadow: 0 0 0 2px rgba(255,255,255,.04) inset; }
-.xterm-host { width: 100%; height: 100%; min-width: 0; min-height: 0; background: var(--terminal-bg); padding: 10px; user-select: text; }
+.xterm-host { width: calc(100% - 16px); height: 100%; min-width: 0; min-height: 0; overflow: hidden; background: var(--terminal-bg); padding: 10px; user-select: text; }
 .xterm-host .xterm, .xterm-host .xterm-viewport, .xterm-host .xterm-screen { user-select: text; }
-.xterm-host .xterm-viewport { scrollbar-width: thin; scrollbar-color: rgba(232,232,232,.45) transparent; }
-.xterm-host .xterm-viewport::-webkit-scrollbar { width: 10px; height: 10px; }
-.xterm-host .xterm-viewport::-webkit-scrollbar-thumb { background: rgba(232,232,232,.45); border-radius: 999px; }
+.xterm-host .xterm-viewport { scrollbar-width: none; }
+.xterm-host .xterm-viewport::-webkit-scrollbar { width: 0; height: 0; }
+.terminal-scrollbar { position: absolute; top: 10px; right: 6px; bottom: 10px; width: 10px; border-radius: 999px; background: var(--border-subtle); z-index: 50; cursor: pointer; }
+.terminal-scrollbar-thumb { position: absolute; left: 1px; top: 0; width: 8px; min-height: 28px; border-radius: 999px; background: rgba(232,232,232,.70); box-shadow: 0 0 0 1px rgba(0,0,0,.35); cursor: grab; }
+.terminal-scrollbar-thumb:active { cursor: grabbing; background: #f2f2f2; }
 .session-view { width: 100%; height: 100%; min-width: 0; min-height: 0; display: grid; grid-template-rows: auto minmax(0, 1fr); border: 1px solid var(--border-subtle); border-radius: 18px; overflow: hidden; background: var(--bg-main); }
 .session-view-header { min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 14px; border-bottom: 1px solid var(--border-subtle); background: var(--bg-panel); }
 .session-view-header strong, .session-view-header small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
