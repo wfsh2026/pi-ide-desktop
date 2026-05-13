@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
-import { Square, Send, FolderOpen, Plus, Folder, X, File, FileText, FolderTree, ChevronDown, ChevronRight, RefreshCw, MessageSquare, TerminalSquare } from "lucide-react";
+import { Square, Send, FolderOpen, Plus, Folder, X, File, FileText, FolderTree, ChevronDown, ChevronRight, RefreshCw, MessageSquare, TerminalSquare, Settings } from "lucide-react";
 import PiTerminal from "./components/PiTerminal.jsx";
 import SessionTimeline from "./components/SessionTimeline.jsx";
 import { applyPiIdeTimelineEvent } from "./piIdeEventMapper.js";
@@ -19,8 +19,27 @@ const TERMINAL_PREVIEW_CHARS_STORAGE_KEY = "piIdeTerminalPreviewChars";
 const SESSION_TEXT_PREVIEW_CHARS_STORAGE_KEY = "piIdeSessionTextPreviewChars";
 const SESSION_TURN_LIMIT_STORAGE_KEY = "piIdeSessionTurnLimit";
 const SESSION_FILE_RECORD_LIMIT_STORAGE_KEY = "piIdeSessionFileRecordLimit";
-const BACKGROUND_PI_IDLE_STOP_MINUTES_STORAGE_KEY = "piIdeBackgroundPiIdleStopMinutes";
 const DEFAULT_BACKGROUND_PI_IDLE_STOP_MINUTES = 5;
+const MODEL_TEMPLATE_DEFAULTS = {
+  "openai-compatible": {
+    template: "openai-compatible",
+    provider: "openai-compatible",
+    modelId: "",
+    modelName: "",
+    baseUrl: "",
+    api: "openai-responses",
+    apiKey: "OPENAI_API_KEY"
+  },
+  ollama: {
+    template: "ollama",
+    provider: "ollama",
+    modelId: "qwen2.5-coder:7b",
+    modelName: "",
+    baseUrl: "http://localhost:11434/v1",
+    api: "openai-completions",
+    apiKey: "ollama"
+  }
+};
 
 function insertAtCursor(text, insert) {
   const start = text.selectionStart ?? 0;
@@ -40,13 +59,6 @@ function configuredPositiveNumber(key, fallback) {
   return positiveInteger(localStorage.getItem(key), fallback);
 }
 
-function configuredNonNegativeNumber(key, fallback) {
-  const raw = localStorage.getItem(key);
-  if (raw == null) return fallback;
-  const value = Number(raw);
-  return Number.isFinite(value) && value >= 0 ? Math.floor(value) : fallback;
-}
-
 function storageLimits() {
   return {
     terminalPreviewChars: configuredPositiveNumber(TERMINAL_PREVIEW_CHARS_STORAGE_KEY, DEFAULT_STORAGE_LIMITS.terminalPreviewChars),
@@ -56,8 +68,9 @@ function storageLimits() {
   };
 }
 
-function backgroundPiIdleStopMs() {
-  return configuredNonNegativeNumber(BACKGROUND_PI_IDLE_STOP_MINUTES_STORAGE_KEY, DEFAULT_BACKGROUND_PI_IDLE_STOP_MINUTES) * 60 * 1000;
+function normalizeBackgroundPiIdleStopMinutes(value) {
+  const minutes = Number(value);
+  return Number.isFinite(minutes) && minutes >= 0 ? Math.floor(minutes) : DEFAULT_BACKGROUND_PI_IDLE_STOP_MINUTES;
 }
 
 function limitTerminalPreview(text) {
@@ -621,6 +634,118 @@ function SessionFilesSection({ title, files, emptyText, onOpenFile, onOpenDirect
   );
 }
 
+function PiSetupPanel({
+  environment,
+  checking,
+  installing,
+  modelDraft,
+  onModelDraftChange,
+  onCheck,
+  onInstall,
+  onSaveModel,
+  onOpenDebugLog,
+  onClose
+}) {
+  const ready = Boolean(environment?.ready);
+  const issues = Array.isArray(environment?.issues) ? environment.issues : [];
+  const modelConfigPath = environment?.modelsConfig || "";
+  const command = environment?.command || DEFAULT_COMMAND;
+
+  function updateDraft(patch) {
+    onModelDraftChange({ ...modelDraft, ...patch });
+  }
+
+  function changeTemplate(template) {
+    onModelDraftChange({ ...MODEL_TEMPLATE_DEFAULTS[template] });
+  }
+
+  return (
+    <div className="pi-setup-view">
+      <div className="pi-setup-card">
+        <div className="pi-setup-header">
+          <div>
+            <h2>Pi 环境设置</h2>
+            <p>{ready ? "Pi 环境已就绪，可以正常发送任务。" : "完成 Pi 安装和模型配置后即可发送任务。"}</p>
+          </div>
+          {ready && <button className="icon" title="关闭环境设置" onClick={onClose}><X size={15}/></button>}
+        </div>
+
+        <div className="pi-setup-status-grid">
+          <div className={`pi-setup-status ${environment?.installed ? "ok" : "danger"}`}>
+            <strong>Pi CLI</strong>
+            <span>{environment?.installed ? environment?.version || "已安装" : "未检测到"}</span>
+            <small>{command}</small>
+          </div>
+          <div className={`pi-setup-status ${environment?.hasModels || environment?.hasAuth ? "ok" : "danger"}`}>
+            <strong>模型配置</strong>
+            <span>{environment?.hasModels ? `${environment?.modelCount || 0} 个模型` : (environment?.hasAuth ? "已有认证信息" : "未配置")}</span>
+            <small>{modelConfigPath || "models.json 未创建"}</small>
+          </div>
+        </div>
+
+        {issues.length > 0 && (
+          <div className="pi-setup-issues">
+            {issues.map((issue) => <div key={issue.code || issue.message}>{issue.message || String(issue)}</div>)}
+          </div>
+        )}
+
+        <div className="pi-setup-actions">
+          <button onClick={onInstall} disabled={installing}>
+            {installing ? "正在安装..." : "安装 Pi"}
+          </button>
+          <button onClick={onCheck} disabled={checking}>
+            <RefreshCw size={14}/> {checking ? "检测中..." : "重新检测"}
+          </button>
+          <button onClick={onOpenDebugLog}><FileText size={14}/> 调试日志</button>
+        </div>
+
+        <div className="pi-setup-form">
+          <div className="pi-setup-form-head">
+            <strong>配置模型</strong>
+            <small>写入 ~/.pi/agent/models.json 和当前项目默认模型</small>
+          </div>
+          <div className="pi-setup-form-grid">
+            <label>
+              模板
+              <select value={modelDraft.template} onChange={(event) => changeTemplate(event.target.value)}>
+                <option value="openai-compatible">OpenAI-compatible</option>
+                <option value="ollama">Ollama</option>
+              </select>
+            </label>
+            <label>
+              Provider
+              <input value={modelDraft.provider} onChange={(event) => updateDraft({ provider: event.target.value })}/>
+            </label>
+            <label>
+              模型 ID
+              <input value={modelDraft.modelId} onChange={(event) => updateDraft({ modelId: event.target.value })} placeholder="例如 gpt-4.1 或 qwen2.5-coder:7b"/>
+            </label>
+            <label>
+              显示名称
+              <input value={modelDraft.modelName} onChange={(event) => updateDraft({ modelName: event.target.value })} placeholder="可选"/>
+            </label>
+            <label>
+              Base URL
+              <input value={modelDraft.baseUrl} onChange={(event) => updateDraft({ baseUrl: event.target.value })} placeholder="例如 https://api.openai.com/v1"/>
+            </label>
+            <label>
+              API
+              <input value={modelDraft.api} onChange={(event) => updateDraft({ api: event.target.value })}/>
+            </label>
+            <label className="pi-setup-form-wide">
+              API Key / 环境变量名
+              <input value={modelDraft.apiKey} onChange={(event) => updateDraft({ apiKey: event.target.value })} placeholder="例如 OPENAI_API_KEY 或 sk-..."/>
+            </label>
+          </div>
+          <div className="pi-setup-actions">
+            <button className="primary" onClick={onSaveModel}>写入模型配置</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function RightToolPanel({
   activeProject,
   activeSession,
@@ -761,6 +886,11 @@ export default function App() {
   const [directoryTreeError, setDirectoryTreeError] = useState("");
   const [workdir, setWorkdir] = useState(localStorage.getItem("workdir") || "");
   const [debugLogEnabled, setDebugLogEnabled] = useState(false);
+  const [piEnvironment, setPiEnvironment] = useState(null);
+  const [piEnvironmentChecking, setPiEnvironmentChecking] = useState(false);
+  const [piSetupOpen, setPiSetupOpen] = useState(false);
+  const [piInstalling, setPiInstalling] = useState(false);
+  const [modelTemplateDraft, setModelTemplateDraft] = useState(() => ({ ...MODEL_TEMPLATE_DEFAULTS["openai-compatible"] }));
   const [projects, setProjects] = useState(() => loadProjects());
   const [activeProjectId, setActiveProjectId] = useState(null);
   const [activeProjectSessionId, setActiveProjectSessionId] = useState(null);
@@ -776,6 +906,7 @@ export default function App() {
   const activeProjectIdRef = useRef(activeProjectId);
   const activeProjectSessionIdRef = useRef(activeProjectSessionId);
   const piSessionStatusRef = useRef(piSessionStatus);
+  const backgroundPiIdleStopMinutesRef = useRef(DEFAULT_BACKGROUND_PI_IDLE_STOP_MINUTES);
   const launchHandledRef = useRef(false);
   const legacyPiCommandRef = useRef(localStorage.getItem("piCommand") || DEFAULT_COMMAND);
 
@@ -797,17 +928,21 @@ export default function App() {
     [activeRuntimeModel, activePendingModel, activeProjectSession?.current_model]
   );
   const activeModelPending = Boolean(activePendingModel && !activeRuntimeModel);
+  const piEnvironmentReady = Boolean(piEnvironment?.ready);
+  const showPiSetupPanel = piSetupOpen || (piEnvironment && !piEnvironment.ready);
 
   useEffect(() => {
     const projectPath = activeProject?.path || workdir || "";
     let cancelled = false;
-    invoke("get_debug_logging_config", { workdir: projectPath || null }).then((config) => {
+    invoke("ensure_pi_ide_config", { workdir: projectPath || null, legacyCommand: legacyPiCommandRef.current }).then((config) => {
       if (cancelled) return;
-      const enabled = Boolean(config?.enabled);
+      const enabled = Boolean(config?.debugEnabled ?? config?.enabled);
+      backgroundPiIdleStopMinutesRef.current = normalizeBackgroundPiIdleStopMinutes(config?.backgroundIdleStopMinutes);
       setDebugLogEnabled(enabled);
       setDebugLogContext({ enabled, workdir: projectPath });
     }).catch(() => {
       if (cancelled) return;
+      backgroundPiIdleStopMinutesRef.current = DEFAULT_BACKGROUND_PI_IDLE_STOP_MINUTES;
       setDebugLogEnabled(false);
       setDebugLogContext({ enabled: false, workdir: projectPath });
     });
@@ -940,6 +1075,92 @@ export default function App() {
       setStatus(`打开调试日志失败：${String(error)}`);
     }
   }
+
+  const checkPiEnvironment = useCallback(async (projectPath = activeProject?.path || workdir, { showStatus = false } = {}) => {
+    setPiEnvironmentChecking(true);
+    try {
+      const result = await invoke("check_pi_environment", {
+        workdir: projectPath || null,
+        legacyCommand: legacyPiCommandRef.current
+      });
+      setPiEnvironment(result);
+      if (!result?.ready) {
+        setPiSetupOpen(true);
+        if (showStatus) setStatus("Pi 环境未就绪，请先完成安装或模型配置");
+      } else if (showStatus) {
+        setStatus("Pi 环境已就绪");
+      }
+      return result;
+    } catch (error) {
+      const result = {
+        ready: false,
+        installed: false,
+        hasModels: false,
+        hasAuth: false,
+        command: legacyPiCommandRef.current,
+        issues: [{ code: "PI_ENV_CHECK_FAILED", message: String(error) }]
+      };
+      setPiEnvironment(result);
+      setPiSetupOpen(true);
+      if (showStatus) setStatus(`Pi 环境检测失败：${String(error)}`);
+      return result;
+    } finally {
+      setPiEnvironmentChecking(false);
+    }
+  }, [activeProject?.path, workdir]);
+
+  async function ensurePiEnvironmentReady(projectPath = activeProject?.path || workdir) {
+    if (piEnvironment?.ready) return;
+    const result = await checkPiEnvironment(projectPath, { showStatus: true });
+    if (!result?.ready) {
+      setPiSetupOpen(true);
+      throw new Error("Pi 环境未就绪，请先完成安装或模型配置");
+    }
+  }
+
+  async function installPiCli() {
+    if (!window.confirm("将通过 npm 全局安装 @earendil-works/pi-coding-agent。是否继续？")) return;
+    setPiInstalling(true);
+    try {
+      setStatus("正在安装 Pi...");
+      await invoke("install_pi_cli");
+      setStatus("Pi 安装完成，正在重新检测环境");
+      await checkPiEnvironment(activeProject?.path || workdir, { showStatus: true });
+    } catch (error) {
+      setStatus(`Pi 安装失败：${String(error)}`);
+    } finally {
+      setPiInstalling(false);
+    }
+  }
+
+  async function savePiModelTemplate() {
+    try {
+      if (!String(modelTemplateDraft.modelId || "").trim()) throw new Error("模型 ID 不能为空");
+      if (!String(modelTemplateDraft.provider || "").trim()) throw new Error("Provider 不能为空");
+      setStatus("正在写入模型配置...");
+      await invoke("save_pi_model_template", {
+        workdir: activeProject?.path || workdir || null,
+        template: modelTemplateDraft.template,
+        provider: modelTemplateDraft.provider,
+        modelId: modelTemplateDraft.modelId,
+        modelName: modelTemplateDraft.modelName || null,
+        baseUrl: modelTemplateDraft.baseUrl || null,
+        apiKey: modelTemplateDraft.apiKey || null,
+        api: modelTemplateDraft.api || null
+      });
+      setStatus("模型配置已写入，正在重新检测环境");
+      await checkPiEnvironment(activeProject?.path || workdir, { showStatus: true });
+      if (activeProjectSessionIdRef.current) {
+        await loadConfiguredModelCandidates(activeProjectSessionIdRef.current).catch(() => {});
+      }
+    } catch (error) {
+      setStatus(`写入模型配置失败：${String(error)}`);
+    }
+  }
+
+  useEffect(() => {
+    checkPiEnvironment(activeProject?.path || workdir, { showStatus: false }).catch(() => {});
+  }, [activeProject?.path, workdir, checkPiEnvironment]);
 
   function saveProjects(nextProjects) {
     const compactProjects = normalizeStoredProjects(nextProjects, storageLimits());
@@ -1284,7 +1505,7 @@ export default function App() {
 
   useEffect(() => {
     const timer = window.setInterval(() => {
-      const limitMs = backgroundPiIdleStopMs();
+      const limitMs = backgroundPiIdleStopMinutesRef.current * 60 * 1000;
       if (limitMs <= 0) return;
       const now = Date.now();
       const activeSessionId = activeProjectSessionIdRef.current;
@@ -1680,6 +1901,7 @@ export default function App() {
     }
 
     if (!sessionId) throw new Error("请先选择或创建一个会话");
+    await ensurePiEnvironmentReady(runWorkdir);
     if (piSessionStatusRef.current[sessionId]?.running) {
       debugLog("startPi skip running", { sessionId });
       return;
@@ -1860,7 +2082,7 @@ export default function App() {
   async function stopCurrentRun() {
     const sessionId = activeProjectSessionIdRef.current;
     if (!sessionId) return;
-    await invoke("send_pi_input", { sessionId, input: "\x03" });
+    await sendToRunningPi(sessionId, "\x03");
     clearSessionIdleTimer(sessionId);
     setSessionRuntimeStatus(sessionId, { processing: false });
     markLatestTurnStatus(sessionId, "cancelled");
@@ -1874,9 +2096,9 @@ export default function App() {
     const projectPath = activeProject?.path || workdir;
     const attachmentFiles = fileRecordsFromPaths(attachments.map((item) => item.path), "user-attachment");
     const inputPathFiles = fileRecordsFromPaths(extractFilePathsFromText(userText, projectPath), "user-input");
-    await ensureActivePiRunning();
     const sessionId = activeProjectSessionIdRef.current;
     if (!sessionId) throw new Error("请先选择或创建一个会话");
+    await ensureActivePiRunning();
     const turn = createTimelineTurn({
       userText: userText || titleSource,
       finalPrompt,
@@ -1886,7 +2108,7 @@ export default function App() {
     addSessionFiles("referenced", [...attachmentFiles, ...inputPathFiles]);
     setSessionRuntimeStatus(sessionId, { processing: true });
     try {
-      await invoke("send_pi_input", { sessionId, input: `${finalPrompt}\r` });
+      await sendToRunningPi(sessionId, `${finalPrompt}\r`);
     } catch (error) {
       setSessionRuntimeStatus(sessionId, { processing: false });
       markLatestTurnStatus(sessionId, "failed", String(error));
@@ -1994,7 +2216,12 @@ export default function App() {
 
   function handleComposerAction() {
     if (isProcessing) stopCurrentRun().catch((err) => setStatus(String(err)));
-    else sendCommand().catch((err) => setStatus(String(err)));
+    else if (!piEnvironmentReady) {
+      setPiSetupOpen(true);
+      checkPiEnvironment(activeProject?.path || workdir, { showStatus: true }).catch((err) => setStatus(String(err)));
+    } else {
+      sendCommand().catch((err) => setStatus(String(err)));
+    }
   }
 
   function handleCommandChange(e) {
@@ -2046,10 +2273,26 @@ export default function App() {
               <TerminalSquare size={15}/> 终端视图
             </button>
           </div>
+          <button className={piEnvironmentReady ? "" : "danger"} onClick={() => setPiSetupOpen((value) => !value)} title="检查和配置 Pi 环境">
+            <Settings size={15}/> 环境设置
+          </button>
           {debugLogEnabled && <button onClick={openDebugLog} title="打开调试日志所在目录"><FileText size={15}/> 调试日志</button>}
         </header>
         <div className="center-view-wrap">
-          {centerView === "session" ? (
+          {showPiSetupPanel ? (
+            <PiSetupPanel
+              environment={piEnvironment}
+              checking={piEnvironmentChecking}
+              installing={piInstalling}
+              modelDraft={modelTemplateDraft}
+              onModelDraftChange={setModelTemplateDraft}
+              onCheck={() => checkPiEnvironment(activeProject?.path || workdir, { showStatus: true })}
+              onInstall={installPiCli}
+              onSaveModel={savePiModelTemplate}
+              onOpenDebugLog={openDebugLog}
+              onClose={() => setPiSetupOpen(false)}
+            />
+          ) : centerView === "session" ? (
             <SessionTimeline
               project={activeProject}
               session={activeProjectSession}
@@ -2115,7 +2358,9 @@ export default function App() {
                   </div>
                 )}
               </div>
-              <button className={isProcessing ? "danger" : "primary"} onClick={handleComposerAction}>{isProcessing ? <Square size={16}/> : <Send size={16}/>} {isProcessing ? "停止" : "发送"}</button>
+              <button className={isProcessing || !piEnvironmentReady ? "danger" : "primary"} onClick={handleComposerAction}>
+                {isProcessing ? <Square size={16}/> : <Send size={16}/>} {isProcessing ? "停止" : (piEnvironmentReady ? "发送" : "配置 Pi")}
+              </button>
             </div>
           </div>
         </div>

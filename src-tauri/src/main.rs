@@ -76,6 +76,7 @@ const DEFAULT_DIRECTORY_TREE_INITIAL_DEPTH: usize = 1;
 const DEFAULT_DIRECTORY_TREE_MAX_ENTRIES_PER_DIRECTORY: usize = 160;
 const DEFAULT_DIRECTORY_TREE_PREVIEW_MAX_DEPTH: usize = 2;
 const DEFAULT_DIRECTORY_TREE_PREVIEW_MAX_LINES: usize = 220;
+const DEFAULT_BACKGROUND_PI_IDLE_STOP_MINUTES: u64 = 5;
 
 fn storage_dir() -> Result<PathBuf, String> {
   let home = dirs::home_dir().ok_or("无法定位用户 Home 目录")?;
@@ -95,6 +96,7 @@ fn pi_agent_dir() -> Result<PathBuf, String> {
 }
 fn global_pi_settings_path() -> Result<PathBuf, String> { Ok(pi_agent_dir()?.join("settings.json")) }
 fn global_pi_models_path() -> Result<PathBuf, String> { Ok(pi_agent_dir()?.join("models.json")) }
+fn global_pi_auth_path() -> Result<PathBuf, String> { Ok(pi_agent_dir()?.join("auth.json")) }
 fn project_pi_settings_path(workdir: &Path) -> PathBuf { workdir.join(".pi").join("settings.json") }
 
 fn append_debug_line_raw(line: &str) {
@@ -139,6 +141,9 @@ fn default_global_config(command: &str) -> serde_json::Value {
     "debug": {
       "enabled": false
     },
+    "piSession": {
+      "backgroundIdleStopMinutes": DEFAULT_BACKGROUND_PI_IDLE_STOP_MINUTES
+    },
     "directoryTree": {
       "initialDepth": DEFAULT_DIRECTORY_TREE_INITIAL_DEPTH,
       "maxEntriesPerDirectory": DEFAULT_DIRECTORY_TREE_MAX_ENTRIES_PER_DIRECTORY,
@@ -157,6 +162,9 @@ fn default_project_config() -> serde_json::Value {
     },
     "debug": {
       "enabled": false
+    },
+    "piSession": {
+      "backgroundIdleStopMinutes": DEFAULT_BACKGROUND_PI_IDLE_STOP_MINUTES
     },
     "directoryTree": {
       "initialDepth": DEFAULT_DIRECTORY_TREE_INITIAL_DEPTH,
@@ -241,6 +249,28 @@ fn ensure_directory_tree_config(value: &mut serde_json::Value) -> bool {
   changed
 }
 
+fn ensure_pi_session_config(value: &mut serde_json::Value) -> bool {
+  let Some(map) = value.as_object_mut() else {
+    return false;
+  };
+  let default_value = serde_json::json!({
+    "backgroundIdleStopMinutes": DEFAULT_BACKGROUND_PI_IDLE_STOP_MINUTES
+  });
+  let Some(pi_session) = map.get_mut("piSession") else {
+    map.insert("piSession".to_string(), default_value);
+    return true;
+  };
+  let Some(pi_session_map) = pi_session.as_object_mut() else {
+    *pi_session = default_value;
+    return true;
+  };
+  if !matches!(pi_session_map.get("backgroundIdleStopMinutes"), Some(value) if value.as_u64().is_some()) {
+    pi_session_map.insert("backgroundIdleStopMinutes".to_string(), serde_json::json!(DEFAULT_BACKGROUND_PI_IDLE_STOP_MINUTES));
+    return true;
+  }
+  false
+}
+
 fn ensure_config_file_defaults(path: &Path, default_value: serde_json::Value) -> Result<(), String> {
   if !path.exists() {
     write_json_value(path, &default_value)?;
@@ -250,7 +280,10 @@ fn ensure_config_file_defaults(path: &Path, default_value: serde_json::Value) ->
     write_json_value(path, &default_value)?;
     return Ok(());
   };
-  let changed = ensure_debug_config(&mut value) || ensure_directory_tree_config(&mut value);
+  let debug_changed = ensure_debug_config(&mut value);
+  let directory_tree_changed = ensure_directory_tree_config(&mut value);
+  let pi_session_changed = ensure_pi_session_config(&mut value);
+  let changed = debug_changed || directory_tree_changed || pi_session_changed;
   if changed {
     write_json_value(path, &value)?;
   }
@@ -309,6 +342,13 @@ fn config_debug_enabled(value: Option<&serde_json::Value>) -> Option<bool> {
     .and_then(|v| v.get("debug"))
     .and_then(|debug| debug.get("enabled"))
     .and_then(|enabled| enabled.as_bool())
+}
+
+fn config_background_idle_stop_minutes(value: Option<&serde_json::Value>) -> Option<u64> {
+  value
+    .and_then(|v| v.get("piSession"))
+    .and_then(|pi_session| pi_session.get("backgroundIdleStopMinutes"))
+    .and_then(|minutes| minutes.as_u64())
 }
 
 fn config_usize(value: Option<&serde_json::Value>, section: &str, key: &str) -> Option<usize> {
@@ -427,8 +467,12 @@ fn ensure_pi_ide_config(workdir: Option<String>, legacy_command: Option<String>)
   let debug_enabled = config_debug_enabled(project_config.as_ref())
     .or_else(|| config_debug_enabled(global_config.as_ref()))
     .unwrap_or(false);
+  let background_idle_stop_minutes = config_background_idle_stop_minutes(project_config.as_ref())
+    .or_else(|| config_background_idle_stop_minutes(global_config.as_ref()))
+    .unwrap_or(DEFAULT_BACKGROUND_PI_IDLE_STOP_MINUTES);
   Ok(serde_json::json!({
     "debugEnabled": debug_enabled,
+    "backgroundIdleStopMinutes": background_idle_stop_minutes,
     "globalConfig": global_path.to_string_lossy(),
     "projectConfig": project_path.map(|path| path.to_string_lossy().to_string())
   }))
@@ -477,7 +521,9 @@ fn collect_configured_models(models_config: Option<&serde_json::Value>, models: 
     let provider_api = json_string(Some(config), "api");
     if let Some(list) = config.get("models").and_then(|value| value.as_array()) {
       for model in list {
-        if let Some(id) = json_string(Some(model), "id") {
+        if let Some(id) = model.as_str().map(str::trim).filter(|value| !value.is_empty()) {
+          push_pi_model(models, seen, provider, id, None, provider_api.as_deref(), "models.json");
+        } else if let Some(id) = json_string(Some(model), "id") {
           let name = json_string(Some(model), "name");
           let api = json_string(Some(model), "api").or_else(|| provider_api.clone());
           push_pi_model(models, seen, provider, &id, name.as_deref(), api.as_deref(), "models.json");
@@ -535,6 +581,321 @@ fn load_pi_model_config(workdir: Option<String>) -> Result<serde_json::Value, St
     "projectSettings": project_settings_path.map(|path| path.to_string_lossy().to_string()),
     "modelsConfig": global_models_path.to_string_lossy()
   }))
+}
+
+fn json_file_has_content(path: &Path) -> bool {
+  let Ok(Some(value)) = read_json_value(path) else {
+    return false;
+  };
+  match value {
+    serde_json::Value::Null => false,
+    serde_json::Value::Object(map) => !map.is_empty(),
+    serde_json::Value::Array(list) => !list.is_empty(),
+    serde_json::Value::String(text) => !text.trim().is_empty(),
+    _ => true,
+  }
+}
+
+#[cfg(windows)]
+fn is_windows_batch_command(path: &Path) -> bool {
+  path.extension()
+    .and_then(|value| value.to_str())
+    .map(|value| matches!(value.to_ascii_lowercase().as_str(), "cmd" | "bat"))
+    .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn quote_windows_cmd_arg(value: &str) -> String {
+  if value.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':' | '\\' | '/' | '@')) {
+    return value.to_string();
+  }
+  format!("\"{}\"", value.replace('"', "\\\""))
+}
+
+#[cfg(windows)]
+fn build_process_command(raw: &str, extra_args: &[&str], envs: &HashMap<String, String>) -> Result<Command, String> {
+  let raw = raw.trim();
+  if raw.is_empty() {
+    return Err("Pi 命令为空".to_string());
+  }
+  let parts = split_windows_command_line(raw);
+  let (program, args) = parts.split_first().ok_or("Pi 命令为空")?;
+  let resolved_program = if program.eq_ignore_ascii_case("pi") {
+    find_windows_pi_command().unwrap_or_else(|| PathBuf::from(program))
+  } else {
+    PathBuf::from(program)
+  };
+
+  let mut command = if is_pi_wrapper(&resolved_program) {
+    if let Some(cli_js) = pi_cli_js_from_wrapper(&resolved_program) {
+      let node = find_windows_node_command().unwrap_or_else(|| PathBuf::from("node.exe"));
+      let mut command = Command::new(node);
+      command.arg(cli_js);
+      command.args(args);
+      command.args(extra_args);
+      command
+    } else {
+      let mut shell_args = vec![quote_windows_cmd_arg(&resolved_program.to_string_lossy())];
+      shell_args.extend(args.iter().map(|value| quote_windows_cmd_arg(value)));
+      shell_args.extend(extra_args.iter().map(|value| quote_windows_cmd_arg(value)));
+      let mut command = Command::new("cmd.exe");
+      command.arg("/D").arg("/C").arg(shell_args.join(" "));
+      command
+    }
+  } else if is_windows_batch_command(&resolved_program) {
+    let mut shell_args = vec![quote_windows_cmd_arg(&resolved_program.to_string_lossy())];
+    shell_args.extend(args.iter().map(|value| quote_windows_cmd_arg(value)));
+    shell_args.extend(extra_args.iter().map(|value| quote_windows_cmd_arg(value)));
+    let mut command = Command::new("cmd.exe");
+    command.arg("/D").arg("/C").arg(shell_args.join(" "));
+    command
+  } else {
+    let mut command = Command::new(&resolved_program);
+    command.args(args);
+    command.args(extra_args);
+    command
+  };
+
+  if let Some(path) = windows_augmented_path() {
+    command.env("PATH", path);
+  }
+  for (key, value) in envs {
+    command.env(key, value);
+  }
+  Ok(command)
+}
+
+#[cfg(not(windows))]
+fn build_process_command(raw: &str, extra_args: &[&str], envs: &HashMap<String, String>) -> Result<Command, String> {
+  let parts = shell_words::split(raw).map_err(|e| format!("Pi 命令解析失败: {e}"))?;
+  let (program, args) = parts.split_first().ok_or("Pi 命令为空")?;
+  let mut command = Command::new(program);
+  command.args(args);
+  command.args(extra_args);
+  for (key, value) in envs {
+    command.env(key, value);
+  }
+  Ok(command)
+}
+
+fn check_pi_version(command_text: &str, envs: &HashMap<String, String>) -> (bool, Option<String>, Option<String>) {
+  let mut command = match build_process_command(command_text, &["--version"], envs) {
+    Ok(command) => command,
+    Err(error) => return (false, None, Some(error)),
+  };
+  match command.output() {
+    Ok(output) if output.status.success() => {
+      let stdout = String::from_utf8_lossy(&output.stdout);
+      let stderr = String::from_utf8_lossy(&output.stderr);
+      let text = stdout.lines().chain(stderr.lines()).find(|line| !line.trim().is_empty()).unwrap_or("").trim().to_string();
+      (true, (!text.is_empty()).then_some(text), None)
+    }
+    Ok(output) => {
+      let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+      let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+      let detail = if !stderr.is_empty() { stderr } else { stdout };
+      (false, None, Some(if detail.is_empty() { format!("Pi 命令退出码：{}", output.status) } else { detail }))
+    }
+    Err(error) => (false, None, Some(format!("执行 Pi 命令失败：{error}"))),
+  }
+}
+
+#[tauri::command]
+fn check_pi_environment(workdir: Option<String>, legacy_command: Option<String>) -> Result<serde_json::Value, String> {
+  let workdir_path = workdir
+    .as_deref()
+    .map(str::trim)
+    .filter(|s| !s.is_empty())
+    .map(PathBuf::from);
+  let (command_text, envs, config_info) = resolve_pi_launch_config(workdir_path.as_deref(), legacy_command.as_deref())?;
+  let (installed, version, command_error) = check_pi_version(&command_text, &envs);
+
+  let auth_path = global_pi_auth_path()?;
+  let has_auth = json_file_has_content(&auth_path);
+  let model_config = load_pi_model_config(workdir.clone()).unwrap_or_else(|error| {
+    serde_json::json!({
+      "models": [],
+      "defaultModel": serde_json::Value::Null,
+      "error": error
+    })
+  });
+  let model_count = model_config
+    .get("models")
+    .and_then(|value| value.as_array())
+    .map(|list| list.len())
+    .unwrap_or(0);
+  let has_default_model = model_config.get("defaultModel").is_some_and(|value| !value.is_null());
+  let has_models = model_count > 0 || has_default_model;
+
+  let mut issues = Vec::new();
+  if !installed {
+    issues.push(serde_json::json!({
+      "code": "PI_NOT_INSTALLED",
+      "message": command_error.clone().unwrap_or_else(|| "未找到可用 Pi 命令".to_string())
+    }));
+  }
+  if !has_models && !has_auth {
+    issues.push(serde_json::json!({
+      "code": "PI_MODEL_NOT_CONFIGURED",
+      "message": "未发现模型配置或已有认证信息"
+    }));
+  }
+
+  Ok(serde_json::json!({
+    "ready": installed && (has_models || has_auth),
+    "installed": installed,
+    "command": command_text,
+    "version": version,
+    "hasModels": has_models,
+    "modelCount": model_count,
+    "hasDefaultModel": has_default_model,
+    "hasAuth": has_auth,
+    "issues": issues,
+    "config": config_info,
+    "modelsConfig": model_config.get("modelsConfig").cloned().unwrap_or(serde_json::Value::Null),
+    "globalSettings": model_config.get("globalSettings").cloned().unwrap_or(serde_json::Value::Null),
+    "projectSettings": model_config.get("projectSettings").cloned().unwrap_or(serde_json::Value::Null),
+    "authConfig": auth_path.to_string_lossy()
+  }))
+}
+
+fn upsert_model(models: &mut Vec<serde_json::Value>, model_id: &str, model_name: Option<&str>) {
+  let next_model = if let Some(name) = model_name.map(str::trim).filter(|value| !value.is_empty()) {
+    serde_json::json!({ "id": model_id, "name": name })
+  } else {
+    serde_json::json!({ "id": model_id })
+  };
+  for model in models.iter_mut() {
+    let existing_id = model
+      .as_str()
+      .map(str::trim)
+      .filter(|value| !value.is_empty())
+      .map(ToString::to_string)
+      .or_else(|| json_string(Some(model), "id"));
+    if existing_id.as_deref() == Some(model_id) {
+      *model = next_model;
+      return;
+    }
+  }
+  models.push(next_model);
+}
+
+fn update_default_model_settings(path: &Path, provider: &str, model_id: &str) -> Result<(), String> {
+  let mut value = read_json_value(path)?.unwrap_or_else(|| serde_json::json!({}));
+  if !value.is_object() {
+    value = serde_json::json!({});
+  }
+  if let Some(map) = value.as_object_mut() {
+    map.insert("defaultProvider".to_string(), serde_json::Value::String(provider.to_string()));
+    map.insert("defaultModel".to_string(), serde_json::Value::String(model_id.to_string()));
+  }
+  write_json_value(path, &value)
+}
+
+#[tauri::command]
+fn save_pi_model_template(
+  workdir: Option<String>,
+  template: String,
+  provider: String,
+  model_id: String,
+  model_name: Option<String>,
+  base_url: Option<String>,
+  api_key: Option<String>,
+  api: Option<String>,
+) -> Result<serde_json::Value, String> {
+  let provider = provider.trim();
+  let model_id = model_id.trim();
+  if provider.is_empty() {
+    return Err("Provider 不能为空".to_string());
+  }
+  if model_id.is_empty() {
+    return Err("模型 ID 不能为空".to_string());
+  }
+
+  let models_path = global_pi_models_path()?;
+  let mut value = read_json_value(&models_path)?.unwrap_or_else(|| serde_json::json!({ "providers": {} }));
+  if !value.is_object() {
+    value = serde_json::json!({ "providers": {} });
+  }
+  let root = value.as_object_mut().ok_or("模型配置格式无效")?;
+  if !matches!(root.get("providers"), Some(value) if value.is_object()) {
+    root.insert("providers".to_string(), serde_json::json!({}));
+  }
+  let providers = root.get_mut("providers").and_then(|value| value.as_object_mut()).ok_or("模型 Provider 配置格式无效")?;
+  if !matches!(providers.get(provider), Some(value) if value.is_object()) {
+    providers.insert(provider.to_string(), serde_json::json!({}));
+  }
+  let provider_config = providers.get_mut(provider).and_then(|value| value.as_object_mut()).ok_or("模型 Provider 配置格式无效")?;
+
+  if let Some(value) = base_url.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+    provider_config.insert("baseUrl".to_string(), serde_json::Value::String(value.to_string()));
+  }
+  if let Some(value) = api.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+    provider_config.insert("api".to_string(), serde_json::Value::String(value.to_string()));
+  }
+  if let Some(value) = api_key.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+    provider_config.insert("apiKey".to_string(), serde_json::Value::String(value.to_string()));
+  }
+  if template.trim() == "ollama" {
+    provider_config.insert("compat".to_string(), serde_json::json!({
+      "supportsDeveloperRole": false,
+      "supportsReasoningEffort": false
+    }));
+  }
+
+  let mut models = provider_config
+    .remove("models")
+    .and_then(|value| value.as_array().cloned())
+    .unwrap_or_default();
+  upsert_model(&mut models, model_id, model_name.as_deref());
+  provider_config.insert("models".to_string(), serde_json::Value::Array(models));
+  write_json_value(&models_path, &value)?;
+
+  let workdir_path = workdir
+    .as_deref()
+    .map(str::trim)
+    .filter(|s| !s.is_empty())
+    .map(PathBuf::from);
+  update_default_model_settings(&global_pi_settings_path()?, provider, model_id)?;
+  if let Some(path) = workdir_path.as_deref().filter(|path| path.exists() && path.is_dir()).map(project_pi_settings_path) {
+    update_default_model_settings(&path, provider, model_id)?;
+  }
+
+  load_pi_model_config(workdir)
+}
+
+#[tauri::command]
+async fn install_pi_cli() -> Result<serde_json::Value, String> {
+  tauri::async_runtime::spawn_blocking(|| {
+    #[cfg(windows)]
+    let mut command = {
+      let mut command = Command::new("cmd.exe");
+      command.arg("/D").arg("/C").arg("npm install -g @earendil-works/pi-coding-agent");
+      if let Some(path) = windows_augmented_path() {
+        command.env("PATH", path);
+      }
+      command
+    };
+
+    #[cfg(not(windows))]
+    let mut command = {
+      let mut command = Command::new("npm");
+      command.args(["install", "-g", "@earendil-works/pi-coding-agent"]);
+      command
+    };
+
+    let output = command.output().map_err(|e| format!("启动 npm 安装失败：{e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !output.status.success() {
+      return Err(if stderr.is_empty() { format!("npm 安装失败：{}", output.status) } else { stderr });
+    }
+    Ok(serde_json::json!({
+      "success": true,
+      "stdout": stdout,
+      "stderr": stderr
+    }))
+  }).await.map_err(|e| format!("安装任务失败：{e}"))?
 }
 
 const PI_IDE_BRIDGE_EXTENSION: &str = r#"import * as fs from "node:fs";
@@ -1500,14 +1861,17 @@ fn is_pi_wrapper(path: &PathBuf) -> bool {
 
 #[cfg(windows)]
 fn pi_cli_js_from_wrapper(wrapper: &PathBuf) -> Option<PathBuf> {
-  let cli = wrapper
-    .parent()?
-    .join("node_modules")
-    .join("@mariozechner")
-    .join("pi-coding-agent")
-    .join("dist")
-    .join("cli.js");
-  cli.exists().then_some(cli)
+  let npm_root = wrapper.parent()?.join("node_modules");
+  for package_path in [
+    npm_root.join("@earendil-works").join("pi-coding-agent"),
+    npm_root.join("@mariozechner").join("pi-coding-agent"),
+  ] {
+    let cli = package_path.join("dist").join("cli.js");
+    if cli.exists() {
+      return Some(cli);
+    }
+  }
+  None
 }
 
 fn command_has_resume_flag(raw: &str) -> bool {
@@ -2008,7 +2372,10 @@ fn main() {
       append_debug_log,
       get_debug_log_path,
       get_debug_logging_config,
+      check_pi_environment,
       load_pi_model_config,
+      save_pi_model_template,
+      install_pi_cli,
       open_path_in_file_manager,
       open_file_with_default_app,
       get_directory_tree,
