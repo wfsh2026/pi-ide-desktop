@@ -102,4 +102,4 @@ Pi 官方支持 RPC 模式，适合 IDE 或自定义 UI 作为结构化主通道
 - 验证通过：`node src/projectStorageModel.test.mjs`、`node src/sessionTimelineModel.test.mjs`、`node src/piIdeEventMapper.test.mjs`、`npm run build`。
 - 2026-05-13：针对打开项目卡顿风险进一步收紧目录树加载规则：移除切换项目时自动加载目录树的 effect，`get_directory_tree` 首次只返回根节点且不预扫描 preview lines；用户展开目录时再调用 `get_directory_children`。验证通过：`npm run build`、`node src/projectStorageModel.test.mjs`、`node src/sessionTimelineModel.test.mjs`、`node src/piIdeEventMapper.test.mjs`、`cargo check`。
 - 2026-05-13：继续优化默认启动内容：项目打开/切换时不再自动执行 Pi 环境检测，只重置环境状态并等待用户点击“环境设置”或发送任务时检测；配置 ensure 延迟执行；非终端视图切换会话时延迟读取终端日志尾部。
-- 2026-05-13：完成 P2-2 会话视图虚拟化。`SessionTimeline` 改为按滚动位置只渲染可视区附近 turn，并使用 spacer 保持滚动高度；终端历史 replay 改为 16KB 分块写入 xterm，避免切换终端视图时一次性写入大文本造成 UI 冻结。
+- 2026-05-13：完成会话切换体验修复。点击左侧会话后立即预启动对应 Pi 实例，避免用户输入后才启动导致首条消息丢失；`SessionTimeline` 改为稳定的最近记录窗口和“加载更早记录”按钮，避免按估算高度虚拟滚动造成滚动位置跳动；终端历史 replay 保持 16KB 分块写入 xterm，避免切换终端视图时一次性写入大文本造成 UI 冻结。

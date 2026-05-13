@@ -1865,7 +1865,17 @@ export default function App() {
 
   async function activateProjectSession(projectId, sessionId) {
     debugLog("activateProjectSession enter", { projectId, sessionId, status: piSessionStatusRef.current[sessionId] });
-    selectProjectSession(projectId, sessionId);
+    const selected = selectProjectSession(projectId, sessionId);
+    if (!selected?.project || !selected?.session) return;
+    if (piSessionStatusRef.current[sessionId]?.running || piSessionStatusRef.current[sessionId]?.starting) return;
+    startPi({
+      sessionId,
+      workdir: selected.project.path,
+      continueSession: shouldContinueSession(selected.session)
+    }).catch((error) => {
+      debugLog("activateProjectSession start failed", { sessionId, error: String(error) });
+      setStatus(`启动 Pi 失败：${String(error)}`);
+    });
   }
 
   function updateActiveProjectSessionAfterCommand(commandText) {
