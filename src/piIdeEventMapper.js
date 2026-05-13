@@ -24,6 +24,30 @@ function messageText(message) {
   }).filter(Boolean).join("");
 }
 
+function looksLikeReasoningText(text) {
+  const value = String(text || "").trim();
+  if (!value) return false;
+  const englishReasoningMarkers = [
+    /^The user (?:is|wants|asked|provided|mentioned|needs)\b/i,
+    /^User (?:is|wants|asked|provided|mentioned|needs)\b/i,
+    /\bI should\b/i,
+    /\bI need to\b/i,
+    /\bI(?:'ll| will) (?:respond|answer|keep|provide|explain)\b/i,
+    /\bLet's (?:keep|provide|answer|respond|craft)\b/i,
+    /\bwhich translates to\b/i
+  ];
+  const chineseReasoningMarkers = [
+    /^用户(?:只是|正在|想要|需要|要求|提供)/,
+    /^我(?:应该|需要|会|将)/,
+    /^这里(?:应该|需要|可以)/,
+    /^看起来(?:像|是)/,
+    /^表格行列合法状态/,
+    /^[-*]\s*\*\*格式\*\*/
+  ];
+  return englishReasoningMarkers.some((pattern) => pattern.test(value))
+    || chineseReasoningMarkers.some((pattern) => pattern.test(value));
+}
+
 function commandText(event) {
   if (event?.args?.command) return String(event.args.command);
   if (event?.args?.cmd) return String(event.args.cmd);
@@ -127,6 +151,27 @@ function appendThinkingText(items, delta, now, makeId) {
   }];
 }
 
+function routeMessageDelta(items, delta, now, makeId) {
+  if (looksLikeReasoningText(delta)) {
+    return upsertProgress(appendThinkingText(items, delta, now, makeId), "progress-thinking", {
+      title: "正在思考",
+      detail: "",
+      status: "running"
+    }, now, makeId);
+  }
+  return upsertProgress(appendAssistantText(items, delta, now, makeId), "progress-output", {
+    title: "正在输出结果",
+    detail: "",
+    status: "running"
+  }, now, makeId);
+}
+
+function setRoutedMessageText(items, text, now, makeId) {
+  if (!text) return items;
+  if (looksLikeReasoningText(text)) return appendThinkingText(items, text, now, makeId);
+  return setAssistantText(items, text, now, makeId);
+}
+
 function upsertCommand(items, event, patch, now, makeId) {
   if (event.toolName && event.toolName !== "bash") return items;
   const id = event.toolCallId ? `command-${event.toolCallId}` : makeId("command");
@@ -191,11 +236,7 @@ function applyEventToItems(items, event, now, makeId) {
 
   if (eventType === "message_update") {
     if (event.deltaType === "text_delta") {
-      return upsertProgress(appendAssistantText(items, event.delta || "", now, makeId), "progress-output", {
-        title: "正在输出结果",
-        detail: "",
-        status: "running"
-      }, now, makeId);
+      return routeMessageDelta(items, event.delta || "", now, makeId);
     }
     if (event.deltaType === "thinking_delta") {
       return upsertProgress(appendThinkingText(items, event.delta || "", now, makeId), "progress-thinking", {
@@ -209,11 +250,11 @@ function applyEventToItems(items, event, now, makeId) {
   if (eventType === "message_end") {
     if (event.messageRole && event.messageRole !== "assistant") return items;
     const text = event.text || messageText(event.message);
-    return text ? setAssistantText(items, text, now, makeId) : items;
+    return setRoutedMessageText(items, text, now, makeId);
   }
 
   if (eventType === "turn_end" && event.text) {
-    return setAssistantText(items, event.text, now, makeId);
+    return setRoutedMessageText(items, event.text, now, makeId);
   }
 
   if (eventType === "tool_execution_start") {
