@@ -906,8 +906,8 @@ const bashBefore = new Map();
 let sequence = 0;
 
 function eventTextLimit() {
-  const value = Number(process.env.PI_IDE_EVENT_TEXT_LIMIT || "50000");
-  return Number.isFinite(value) && value > 0 ? Math.floor(value) : 50000;
+  const value = Number(process.env.PI_IDE_EVENT_TEXT_LIMIT || "10000000");
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : 10000000;
 }
 
 function positiveEnvNumber(name, fallback) {
@@ -931,7 +931,7 @@ function limitText(value) {
 }
 
 function toolResultTextLimit() {
-  return positiveEnvNumber("PI_IDE_TOOL_RESULT_TEXT_LIMIT", 50000);
+  return positiveEnvNumber("PI_IDE_TOOL_RESULT_TEXT_LIMIT", 10000000);
 }
 
 function readLineLimit() {
@@ -2021,6 +2021,8 @@ async fn start_pi_session(app: tauri::AppHandle, session_id: String, pi_command:
   cmd.env("PI_CODING_AGENT_SESSION_DIR", session_dir.to_string_lossy().to_string());
   cmd.env("PI_IDE_SESSION_ID", session_id.clone());
   cmd.env("PI_IDE_RUN_ID", run_id.clone());
+  cmd.env("PI_IDE_EVENT_TEXT_LIMIT", "10000000");
+  cmd.env("PI_IDE_TOOL_RESULT_TEXT_LIMIT", "10000000");
   for (key, value) in config_envs {
     cmd.env(key, value);
   }

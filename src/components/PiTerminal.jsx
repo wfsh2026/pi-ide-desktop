@@ -23,11 +23,11 @@ function debugLog(enabled, workdir, message, data = undefined) {
 }
 
 function normalizeForScrollableTerminal(data) {
-  return String(data || "")
-    .replace(/\x1bc/g, "")
-    .replace(/\x1b\[\?(?:1000|1002|1003|1005|1006|1015|1007|2004)[hl]/g, "")
-    .replace(/\x1b\[\?(?:1047|1048|1049)[hl]/g, "")
-    .replace(/\x1b\[(?:2|3)J/g, "");
+  // 终端视图必须保持真实 PTY 字节流语义。
+  // 之前为了把 TUI 输出强行变成“可滚动文本”，过滤了 alt-screen / clear-screen
+  // 等控制序列，导致 Pi/Codex 类 TUI 的重绘帧被追加到 scrollback，出现回复文本错乱、
+  // 重复和滚动长度异常。这里不再改写 ANSI 控制序列，交给 xterm 正确解释。
+  return String(data || "");
 }
 
 export default function PiTerminal({ activeSessionId, clearSignal, replaySignal = 0, replayContent = "", debugEnabled = false, debugWorkdir = "", onTerminalInput }) {
@@ -130,9 +130,6 @@ export default function PiTerminal({ activeSessionId, clearSignal, replaySignal 
         resizeFrameRef.current = null;
         try {
           fit.fit();
-          // 右侧为自定义滚动条和边距预留约 4 列，真正缩小终端列数。
-          const safeCols = Math.max(1, term.cols - 4);
-          if (safeCols !== term.cols) term.resize(safeCols, term.rows);
           const sessionId = activeSessionIdRef.current;
           if (sessionId) invoke("resize_pi", { sessionId, cols: term.cols, rows: term.rows }).catch(() => {});
           updateCustomScrollbar();
