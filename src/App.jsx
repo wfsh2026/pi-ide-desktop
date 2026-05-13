@@ -102,7 +102,10 @@ function titleFromPromptAndAttachments(text, attachments) {
 }
 
 function shouldContinueSession(session) {
-  return Boolean(session?.first_prompt || String(session?.output || "").trim());
+  return Boolean(
+    session?.first_prompt
+    || (Array.isArray(session?.turns) && session.turns.length > 0)
+  );
 }
 
 function stripAnsiForDetection(text) {
@@ -899,6 +902,9 @@ export default function App() {
   const outputBufferRef = useRef("");
   const outputIdleTimersRef = useRef({});
   const startingSessionsRef = useRef(new Set());
+  const sessionWarmupTimersRef = useRef({});
+  const pendingPiInputsRef = useRef({});
+  const piEnvironmentCacheRef = useRef({});
   const persistOutputTimerRef = useRef(null);
   const projectsRenderTimerRef = useRef(null);
   const fileEventSeenRef = useRef(new Set());
@@ -1092,13 +1098,22 @@ export default function App() {
     }
   }
 
-  const checkPiEnvironment = useCallback(async (projectPath = activeProject?.path || workdir, { showStatus = false } = {}) => {
+  const checkPiEnvironment = useCallback(async (projectPath = activeProject?.path || workdir, { showStatus = false, force = false } = {}) => {
+    const cacheKey = projectPath || "__global__";
+    const cached = piEnvironmentCacheRef.current[cacheKey];
+    if (!force && cached && Date.now() - cached.checkedAt < 5 * 60 * 1000) {
+      setPiEnvironment(cached.result);
+      if (!cached.result?.ready) setPiSetupOpen(true);
+      return cached.result;
+    }
+
     setPiEnvironmentChecking(true);
     try {
       const result = await invoke("check_pi_environment", {
         workdir: projectPath || null,
         legacyCommand: legacyPiCommandRef.current
       });
+      piEnvironmentCacheRef.current[cacheKey] = { result, checkedAt: Date.now() };
       setPiEnvironment(result);
       if (!result?.ready) {
         setPiSetupOpen(true);
@@ -1116,6 +1131,7 @@ export default function App() {
         command: legacyPiCommandRef.current,
         issues: [{ code: "PI_ENV_CHECK_FAILED", message: String(error) }]
       };
+      piEnvironmentCacheRef.current[cacheKey] = { result, checkedAt: Date.now() };
       setPiEnvironment(result);
       setPiSetupOpen(true);
       if (showStatus) setStatus(`Pi 环境检测失败：${String(error)}`);
@@ -1141,7 +1157,7 @@ export default function App() {
       setStatus("正在安装 Pi...");
       await invoke("install_pi_cli");
       setStatus("Pi 安装完成，正在重新检测环境");
-      await checkPiEnvironment(activeProject?.path || workdir, { showStatus: true });
+      await checkPiEnvironment(activeProject?.path || workdir, { showStatus: true, force: true });
     } catch (error) {
       setStatus(`Pi 安装失败：${String(error)}`);
     } finally {
@@ -1165,7 +1181,7 @@ export default function App() {
         api: modelTemplateDraft.api || null
       });
       setStatus("模型配置已写入，正在重新检测环境");
-      await checkPiEnvironment(activeProject?.path || workdir, { showStatus: true });
+      await checkPiEnvironment(activeProject?.path || workdir, { showStatus: true, force: true });
       if (activeProjectSessionIdRef.current) {
         await loadConfiguredModelCandidates(activeProjectSessionIdRef.current).catch(() => {});
       }
@@ -1579,6 +1595,12 @@ export default function App() {
           runId: payload.runId || payload.run_id || previous.runId,
           status: text
         });
+        if (running && !stopped) {
+          flushPendingPiInputs(sessionId).catch((error) => {
+            debugLog("flush pending inputs after status failed", { sessionId, error: String(error) });
+            setStatus(`发送排队消息失败：${String(error)}`);
+          });
+        }
       }
     }).then((f) => unsubs.push(f));
     listen("pi-output", (event) => {
@@ -1614,6 +1636,8 @@ export default function App() {
     return () => {
       Object.values(outputIdleTimersRef.current).forEach((timer) => clearTimeout(timer));
       outputIdleTimersRef.current = {};
+      Object.values(sessionWarmupTimersRef.current).forEach((timer) => clearTimeout(timer));
+      sessionWarmupTimersRef.current = {};
       if (persistOutputTimerRef.current) clearTimeout(persistOutputTimerRef.current);
       if (projectsRenderTimerRef.current) clearTimeout(projectsRenderTimerRef.current);
       setProjects(projectsRef.current);
@@ -1867,15 +1891,7 @@ export default function App() {
     debugLog("activateProjectSession enter", { projectId, sessionId, status: piSessionStatusRef.current[sessionId] });
     const selected = selectProjectSession(projectId, sessionId);
     if (!selected?.project || !selected?.session) return;
-    if (piSessionStatusRef.current[sessionId]?.running || piSessionStatusRef.current[sessionId]?.starting) return;
-    startPi({
-      sessionId,
-      workdir: selected.project.path,
-      continueSession: shouldContinueSession(selected.session)
-    }).catch((error) => {
-      debugLog("activateProjectSession start failed", { sessionId, error: String(error) });
-      setStatus(`启动 Pi 失败：${String(error)}`);
-    });
+    scheduleSessionWarmup(sessionId, selected.project.path, selected.session);
   }
 
   function updateActiveProjectSessionAfterCommand(commandText) {
@@ -1957,6 +1973,10 @@ export default function App() {
       await invoke("start_pi_session", { sessionId, piCommand: legacyPiCommandRef.current, workdir: runWorkdir, continueSession });
       debugLog("startPi done", { sessionId });
       touchPiSessionActivity(sessionId, { running: true, starting: false, processing: false, status: "Pi 已启动" });
+      flushPendingPiInputs(sessionId).catch((error) => {
+        debugLog("flush pending inputs after start failed", { sessionId, error: String(error) });
+        setStatus(`发送排队消息失败：${String(error)}`);
+      });
     } catch (error) {
       debugLog("startPi failed", { sessionId, error: String(error) });
       setSessionRuntimeStatus(sessionId, { running: false, starting: false, processing: false, status: `Pi 启动失败：${String(error)}` });
@@ -1966,6 +1986,42 @@ export default function App() {
     }
   }
 
+  function queuePiInput(sessionId, input) {
+    if (!sessionId || !input) return;
+    pendingPiInputsRef.current[sessionId] = [...(pendingPiInputsRef.current[sessionId] || []), input];
+    setSessionRuntimeStatus(sessionId, { processing: true, status: "Pi 启动中，消息已排队" });
+    setStatus("Pi 正在启动，消息已排队，启动完成后会自动发送");
+  }
+
+  async function flushPendingPiInputs(sessionId) {
+    if (!sessionId || !piSessionStatusRef.current[sessionId]?.running) return;
+    const queued = pendingPiInputsRef.current[sessionId] || [];
+    if (queued.length === 0) return;
+    pendingPiInputsRef.current[sessionId] = [];
+    await applyPendingModel(sessionId);
+    for (const input of queued) {
+      await sendToRunningPi(sessionId, input);
+    }
+    setStatus(`已发送 ${queued.length} 条排队消息`);
+  }
+
+  function scheduleSessionWarmup(sessionId, projectPath, session) {
+    if (!sessionId || !projectPath) return;
+    if (piSessionStatusRef.current[sessionId]?.running || piSessionStatusRef.current[sessionId]?.starting) return;
+    if (sessionWarmupTimersRef.current[sessionId]) clearTimeout(sessionWarmupTimersRef.current[sessionId]);
+    sessionWarmupTimersRef.current[sessionId] = window.setTimeout(() => {
+      delete sessionWarmupTimersRef.current[sessionId];
+      startPi({
+        sessionId,
+        workdir: projectPath,
+        continueSession: shouldContinueSession(session)
+      }).catch((error) => {
+        debugLog("session warmup failed", { sessionId, error: String(error) });
+        setStatus(`启动 Pi 失败：${String(error)}`);
+      });
+    }, 250);
+  }
+
   async function ensureActivePiRunning() {
     const sessionId = activeProjectSessionIdRef.current;
     debugLog("ensureActivePiRunning", { sessionId, status: piSessionStatusRef.current[sessionId] });
@@ -1973,13 +2029,14 @@ export default function App() {
     if (!piSessionStatusRef.current[sessionId]?.running) {
       const { project, session } = getSessionById(sessionId);
       if (!project || !session) throw new Error("当前会话不存在");
+      if (piSessionStatusRef.current[sessionId]?.starting || startingSessionsRef.current.has(sessionId)) return;
       await startPi({
         sessionId,
         workdir: project.path,
         continueSession: shouldContinueSession(session)
       });
     }
-    await applyPendingModel(sessionId);
+    if (piSessionStatusRef.current[sessionId]?.running) await applyPendingModel(sessionId);
   }
 
   async function sendToRunningPi(sessionId, input) {
@@ -2006,8 +2063,29 @@ export default function App() {
 
   async function sendToActivePi(input) {
     const sessionId = activeProjectSessionIdRef.current;
-    await ensureActivePiRunning();
-    await sendToRunningPi(sessionId, input);
+    if (!sessionId) throw new Error("请先选择或创建一个会话");
+    const runtime = piSessionStatusRef.current[sessionId] || {};
+    if (runtime.running) {
+      await applyPendingModel(sessionId);
+      await sendToRunningPi(sessionId, input);
+      return;
+    }
+
+    queuePiInput(sessionId, input);
+    const { project, session } = getSessionById(sessionId);
+    if (!project || !session) throw new Error("当前会话不存在");
+    if (!runtime.starting && !startingSessionsRef.current.has(sessionId)) {
+      startPi({
+        sessionId,
+        workdir: project.path,
+        continueSession: shouldContinueSession(session)
+      }).catch((error) => {
+        debugLog("sendToActivePi start failed", { sessionId, error: String(error) });
+        setSessionRuntimeStatus(sessionId, { starting: false, processing: false, status: `Pi 启动失败：${String(error)}` });
+        markLatestTurnStatus(sessionId, "failed", String(error));
+        setStatus(`启动 Pi 失败：${String(error)}`);
+      });
+    }
   }
 
   async function handleTerminalInput(data) {
@@ -2133,7 +2211,6 @@ export default function App() {
     const inputPathFiles = fileRecordsFromPaths(extractFilePathsFromText(userText, projectPath), "user-input");
     const sessionId = activeProjectSessionIdRef.current;
     if (!sessionId) throw new Error("请先选择或创建一个会话");
-    await ensureActivePiRunning();
     const turn = createTimelineTurn({
       userText: userText || titleSource,
       finalPrompt,
@@ -2143,7 +2220,7 @@ export default function App() {
     addSessionFiles("referenced", [...attachmentFiles, ...inputPathFiles]);
     setSessionRuntimeStatus(sessionId, { processing: true });
     try {
-      await sendToRunningPi(sessionId, `${finalPrompt}\r`);
+      await sendToActivePi(`${finalPrompt}\r`);
     } catch (error) {
       setSessionRuntimeStatus(sessionId, { processing: false });
       markLatestTurnStatus(sessionId, "failed", String(error));
@@ -2253,7 +2330,7 @@ export default function App() {
     if (isProcessing) stopCurrentRun().catch((err) => setStatus(String(err)));
     else if (!piEnvironmentReady) {
       setPiSetupOpen(true);
-      checkPiEnvironment(activeProject?.path || workdir, { showStatus: true }).catch((err) => setStatus(String(err)));
+      checkPiEnvironment(activeProject?.path || workdir, { showStatus: true, force: true }).catch((err) => setStatus(String(err)));
     } else {
       sendCommand().catch((err) => setStatus(String(err)));
     }
@@ -2321,7 +2398,7 @@ export default function App() {
               installing={piInstalling}
               modelDraft={modelTemplateDraft}
               onModelDraftChange={setModelTemplateDraft}
-              onCheck={() => checkPiEnvironment(activeProject?.path || workdir, { showStatus: true })}
+              onCheck={() => checkPiEnvironment(activeProject?.path || workdir, { showStatus: true, force: true })}
               onInstall={installPiCli}
               onSaveModel={savePiModelTemplate}
               onOpenDebugLog={openDebugLog}
