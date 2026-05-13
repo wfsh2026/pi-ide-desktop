@@ -98,9 +98,11 @@ function InlineText({ text }) {
 }
 
 function isTableBlock(lines) {
-  return lines.length >= 2
-    && lines.every((line) => /^\|.+\|\s*$/.test(line.trim()))
-    && /^\|[\s:-]+\|\s*$/.test(lines[1].trim());
+  if (lines.length < 3) return false;
+  const pipeLines = lines.filter((line) => /^\|.+\|\s*$/.test(line.trim()));
+  const hasHeader = pipeLines.length >= 2;
+  const separatorIndex = lines.findIndex((line) => /^\|[-:\s]+(\|[-:\s]+)*\|\s*$/.test(line.trim()));
+  return hasHeader && separatorIndex === 1 && pipeLines.length >= lines.length - 1;
 }
 
 function parseTableCells(row) {
