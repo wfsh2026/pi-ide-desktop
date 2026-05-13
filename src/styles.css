@@ -69,13 +69,23 @@ label { font-size: 12px; color: var(--text-muted); display: block; margin: 10px 
 .project-context-menu button { width: 100%; justify-content: flex-start; padding: 7px 9px; border-color: transparent; background: transparent; }
 .project-context-menu button:hover { background: var(--bg-hover); }
 .project-empty-session { color: var(--text-faint); font-size: 12px; padding: 5px 8px; }
-.session-files-card { display: flex; flex-direction: column; gap: 10px; }
-.session-files-section { display: flex; flex-direction: column; gap: 6px; min-height: 0; }
-.session-files-section h4 { margin: 0; color: var(--text-secondary); font-size: 12px; font-weight: 800; }
+.session-files-card { display: flex; flex-direction: column; gap: 10px; padding-bottom: 10px; }
+.session-files-card .directory-tree-header > div { min-width: 0; flex: 1; }
+.session-files-card .session-files-section { margin: 0 10px; }
+.session-files-section { display: flex; flex-direction: column; gap: 6px; min-height: 0; overflow: hidden; }
+.session-files-section-toggle { width: 100%; min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 2px 0; border: 0; border-radius: 7px; background: transparent; color: var(--text-secondary); }
+.session-files-section-toggle:hover { background: transparent; color: var(--text-main); }
+.session-files-section-label { min-width: 0; display: inline-flex; align-items: center; gap: 4px; }
+.session-files-section-label strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 800; }
+.session-files-section-toggle small { flex: 0 0 auto; color: var(--text-faint); font-size: 11px; }
+.session-files-list { min-height: 0; max-height: clamp(132px, 26vh, 300px); overflow-y: auto; display: flex; flex-direction: column; gap: 6px; padding-right: 4px; scrollbar-color: rgba(232,232,232,.45) transparent; scrollbar-width: thin; }
+.session-files-list::-webkit-scrollbar { width: 8px; }
+.session-files-list::-webkit-scrollbar-thumb { background: rgba(232,232,232,.38); border-radius: 999px; }
 .session-files-empty { color: var(--text-faint); font-size: 12px; padding: 7px 8px; border: 1px dashed var(--border-subtle); border-radius: 9px; }
-.session-file-item { width: 100%; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 7px; padding: 7px 8px; border-radius: 9px; text-align: left; }
+.session-file-item { width: 100%; min-width: 0; min-height: 34px; flex: 0 0 auto; overflow: hidden; display: grid; grid-template-columns: 14px minmax(0, 1fr) minmax(0, 76px); align-items: center; gap: 7px; padding: 7px 8px; border-radius: 9px; text-align: left; }
+.session-file-item svg { min-width: 14px; }
 .session-file-item span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.session-file-item small { color: var(--text-faint); font-size: 11px; }
+.session-file-item small { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; justify-self: end; color: var(--text-faint); font-size: 11px; }
 .fill-half { min-height: 0; flex: 1; display: flex; flex-direction: column; }
 .tool-panel { min-height: 0; flex: 1; display: flex; flex-direction: column; gap: 12px; overflow: hidden; }
 .tool-panel-title { padding-bottom: 10px; border-bottom: 1px solid var(--border-subtle); margin-bottom: 0; }
