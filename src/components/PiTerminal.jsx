@@ -32,8 +32,6 @@ function normalizeForScrollableTerminal(data) {
 
 export default function PiTerminal({ activeSessionId, clearSignal, replaySignal = 0, replayContent = "", debugEnabled = false, debugWorkdir = "", onTerminalInput }) {
   const hostRef = useRef(null);
-  const scrollbarRef = useRef(null);
-  const thumbRef = useRef(null);
   const terminalRef = useRef(null);
   const fitRef = useRef(null);
   const pendingRef = useRef("");
@@ -63,9 +61,7 @@ export default function PiTerminal({ activeSessionId, clearSignal, replaySignal 
 
   useEffect(() => {
     const host = hostRef.current;
-    const scrollbar = scrollbarRef.current;
-    const thumb = thumbRef.current;
-    if (!host || !scrollbar || !thumb) return;
+    if (!host) return;
 
     logDebug("PiTerminal mount", { activeSessionId: activeSessionIdRef.current });
     const term = new Terminal({
@@ -86,27 +82,6 @@ export default function PiTerminal({ activeSessionId, clearSignal, replaySignal 
     terminalRef.current = term;
     fitRef.current = fit;
 
-    const getMaxScroll = () => Math.max(0, term.buffer.active.baseY || 0);
-
-    const updateCustomScrollbar = () => {
-      const maxScroll = getMaxScroll();
-      const trackHeight = scrollbar.clientHeight || 1;
-      if (maxScroll <= 0) {
-        thumb.style.height = `${trackHeight}px`;
-        thumb.style.transform = "translateY(0px)";
-        thumb.style.opacity = "0.35";
-        return;
-      }
-
-      const totalRows = maxScroll + term.rows;
-      const thumbHeight = Math.max(28, Math.floor(trackHeight * (term.rows / Math.max(1, totalRows))));
-      const maxTop = Math.max(0, trackHeight - thumbHeight);
-      const top = Math.round(maxTop * (term.buffer.active.viewportY / maxScroll));
-      thumb.style.height = `${thumbHeight}px`;
-      thumb.style.transform = `translateY(${top}px)`;
-      thumb.style.opacity = "1";
-    };
-
     const flush = () => {
       if (writingRef.current || !pendingRef.current) return;
       const chunk = pendingRef.current;
@@ -114,7 +89,6 @@ export default function PiTerminal({ activeSessionId, clearSignal, replaySignal 
       writingRef.current = true;
       term.write(chunk, () => {
         writingRef.current = false;
-        updateCustomScrollbar();
         flush();
       });
     };
@@ -132,7 +106,6 @@ export default function PiTerminal({ activeSessionId, clearSignal, replaySignal 
           fit.fit();
           const sessionId = activeSessionIdRef.current;
           if (sessionId) invoke("resize_pi", { sessionId, cols: term.cols, rows: term.rows }).catch(() => {});
-          updateCustomScrollbar();
         } catch (_) {
           // 布局尚未稳定时忽略，下一次 ResizeObserver 会重试。
         }
@@ -140,51 +113,6 @@ export default function PiTerminal({ activeSessionId, clearSignal, replaySignal 
     };
 
     fitAndNotify();
-
-    const onWheel = (event) => {
-      const lines = Math.sign(event.deltaY) * Math.max(1, Math.ceil(Math.abs(event.deltaY) / 40));
-      term.scrollLines(lines);
-      updateCustomScrollbar();
-      event.preventDefault();
-      event.stopPropagation();
-    };
-
-    const onTrackPointerDown = (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      const maxScroll = getMaxScroll();
-      if (maxScroll <= 0) return;
-
-      const rect = scrollbar.getBoundingClientRect();
-      const thumbRect = thumb.getBoundingClientRect();
-      const trackHeight = rect.height;
-      const thumbHeight = thumbRect.height;
-      const maxTop = Math.max(1, trackHeight - thumbHeight);
-      const startY = event.clientY;
-      const currentTop = thumbRect.top - rect.top;
-      const clickedThumb = event.target === thumb;
-      const startTop = clickedThumb
-        ? currentTop
-        : Math.max(0, Math.min(maxTop, event.clientY - rect.top - thumbHeight / 2));
-
-      if (!clickedThumb) {
-        term.scrollToLine(Math.round((startTop / maxTop) * maxScroll));
-        updateCustomScrollbar();
-      }
-
-      const onMove = (moveEvent) => {
-        const nextTop = Math.max(0, Math.min(maxTop, startTop + (moveEvent.clientY - startY)));
-        term.scrollToLine(Math.round((nextTop / maxTop) * maxScroll));
-        updateCustomScrollbar();
-        moveEvent.preventDefault();
-      };
-      const onUp = () => {
-        window.removeEventListener("pointermove", onMove, true);
-        window.removeEventListener("pointerup", onUp, true);
-      };
-      window.addEventListener("pointermove", onMove, true);
-      window.addEventListener("pointerup", onUp, true);
-    };
 
     const onHostPointerDown = () => {
       term.focus();
@@ -202,10 +130,7 @@ export default function PiTerminal({ activeSessionId, clearSignal, replaySignal 
     });
     const resizeObserver = new ResizeObserver(fitAndNotify);
     resizeObserver.observe(host);
-    host.addEventListener("wheel", onWheel, { passive: false, capture: true });
     host.addEventListener("pointerdown", onHostPointerDown);
-    scrollbar.addEventListener("pointerdown", onTrackPointerDown, true);
-    const scrollDisposable = term.onScroll(updateCustomScrollbar);
     window.addEventListener("resize", fitAndNotify);
 
     let unsubscribeOutput = null;
@@ -224,11 +149,8 @@ export default function PiTerminal({ activeSessionId, clearSignal, replaySignal 
       if (resizeFrameRef.current) cancelAnimationFrame(resizeFrameRef.current);
       if (replayTimeoutRef.current) clearTimeout(replayTimeoutRef.current);
       resizeObserver.disconnect();
-      host.removeEventListener("wheel", onWheel, { capture: true });
       host.removeEventListener("pointerdown", onHostPointerDown);
-      scrollbar.removeEventListener("pointerdown", onTrackPointerDown, true);
       dataDisposable.dispose();
-      scrollDisposable.dispose();
       window.removeEventListener("resize", fitAndNotify);
       logDebug("PiTerminal unmount", { activeSessionId: activeSessionIdRef.current });
       unsubscribeOutput?.();
@@ -278,9 +200,6 @@ export default function PiTerminal({ activeSessionId, clearSignal, replaySignal 
   return (
     <div className="xterm-frame terminal-native">
       <div className="xterm-host" ref={hostRef} />
-      <div className="terminal-scrollbar" ref={scrollbarRef}>
-        <div className="terminal-scrollbar-thumb" ref={thumbRef} />
-      </div>
     </div>
   );
 }
