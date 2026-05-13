@@ -44,6 +44,19 @@ assert.equal(turns[0].items.find((item) => item.type === "assistant_message").te
 
 turns = applyPiIdeTimelineEvent(turns, {
   kind: "timeline",
+  eventType: "message_update",
+  deltaType: "text_delta",
+  delta: "\nThe user is simply testing table output rendering, and I should keep this concise."
+}, { now: "2026-05-12T00:00:01.500Z", makeId });
+
+assert.equal(turns[0].items.find((item) => item.type === "assistant_message").text, "会话窗口正常");
+assert.equal(
+  turns[0].items.find((item) => item.type === "thinking").text.includes("The user is simply testing"),
+  true
+);
+
+turns = applyPiIdeTimelineEvent(turns, {
+  kind: "timeline",
   eventType: "tool_execution_start",
   toolCallId: "call-1",
   toolName: "bash",
