@@ -102,4 +102,4 @@ Pi 官方支持 RPC 模式，适合 IDE 或自定义 UI 作为结构化主通道
 - 验证通过：`node src/projectStorageModel.test.mjs`、`node src/sessionTimelineModel.test.mjs`、`node src/piIdeEventMapper.test.mjs`、`npm run build`。
 - 2026-05-13：针对打开项目卡顿风险进一步收紧目录树加载规则：移除切换项目时自动加载目录树的 effect，`get_directory_tree` 首次只返回根节点且不预扫描 preview lines；用户展开目录时再调用 `get_directory_children`。验证通过：`npm run build`、`node src/projectStorageModel.test.mjs`、`node src/sessionTimelineModel.test.mjs`、`node src/piIdeEventMapper.test.mjs`、`cargo check`。
 - 2026-05-13：继续优化默认启动内容：项目打开/切换时不再自动执行 Pi 环境检测，只重置环境状态并等待用户点击“环境设置”或发送任务时检测；配置 ensure 延迟执行；非终端视图切换会话时延迟读取终端日志尾部。
-- 2026-05-13：完成会话切换体验修复和终端滚动方案重构。会话视图移除最近记录窗口限制，恢复完整 turn 渲染；终端视图移除自定义滚动条和 wheel 事件拦截，改为完全信任 xterm 原生 viewport 滚动，同时停止过滤 ANSI 控制序列，保证终端显示和滚动行为一致可靠；Pi IDE bridge 事件文本上限提升到 10000000，避免会话文本截断。
+- 2026-05-13：完成会话切换体验修复和终端滚动方案重构。会话视图移除最近记录窗口限制，恢复完整 turn 渲染，并新增 Markdown 表格渲染支持；终端视图移除自定义滚动条和 wheel 事件拦截，改为完全信任 xterm 原生 viewport 滚动，同时停止过滤 ANSI 控制序列；Pi IDE bridge 事件文本上限提升到 10000000。
