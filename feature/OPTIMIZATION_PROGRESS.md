@@ -92,7 +92,7 @@ Pi 官方支持 RPC 模式，适合 IDE 或自定义 UI 作为结构化主通道
 - 完成延迟启动策略：切换项目或会话不再自动启动 Pi，用户发送任务或在终端输入时才启动。
 - 完成模型选择解耦：未启动 Pi 时优先从 `~/.pi/agent/settings.json` 和 `~/.pi/agent/models.json` 读取默认模型和候选模型；未运行时选择模型会记录为待应用，发送任务启动 Pi 后再应用。
 - 完成顶部入口清理：移除“停止全部 Pi”和“原生终端”切换按钮；终端视图固定支持直接输入，下方输入框仍可发送任务。
-- 完成目录树懒加载落地：P2-3 当前已实现，展开目录时按需读取 children，并由 `.pi.ide/config.json` 的 `directoryTree` 配置控制深度和单层条目上限。
+- 完成目录树懒加载落地：P2-3 当前已实现，打开/切换项目时不自动读取目录树；只有用户点击右侧“目录树”工具时才加载根节点，展开目录时再按需读取 children，并由 `.pi.ide/config.json` 的 `directoryTree` 配置控制单层条目上限。
 - 验证通过：`node src/projectStorageModel.test.mjs`、`node src/sessionTimelineModel.test.mjs`、`node src/piIdeEventMapper.test.mjs`、`npm run build`、`cargo check`。
 
 ## 2026-05-13 增量进度：会话视图输出与滚动优化
@@ -100,3 +100,4 @@ Pi 官方支持 RPC 模式，适合 IDE 或自定义 UI 作为结构化主通道
 - 修复会话级 `output_files` 兜底总是挂到最新 turn 的问题：未绑定到结构化 timeline 的输出文件固定归属到最近一个已完成 turn，开启新一轮对话后不会继续停留在底部。
 - 优化会话视图自动滚动：仅当用户原本位于底部附近时跟随新增输出；用户手动滚动查看历史内容后，新增文本不再强制把滚动条拉到底。
 - 验证通过：`node src/projectStorageModel.test.mjs`、`node src/sessionTimelineModel.test.mjs`、`node src/piIdeEventMapper.test.mjs`、`npm run build`。
+- 2026-05-13：针对打开项目卡顿风险进一步收紧目录树加载规则：移除切换项目时自动加载目录树的 effect，`get_directory_tree` 首次只返回根节点且不预扫描 preview lines；用户展开目录时再调用 `get_directory_children`。验证通过：`npm run build`、`node src/projectStorageModel.test.mjs`、`node src/sessionTimelineModel.test.mjs`、`node src/piIdeEventMapper.test.mjs`、`cargo check`。

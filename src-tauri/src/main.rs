@@ -72,10 +72,10 @@ struct DirectoryTreeConfig {
   preview_max_lines: usize,
 }
 
-const DEFAULT_DIRECTORY_TREE_INITIAL_DEPTH: usize = 1;
+const DEFAULT_DIRECTORY_TREE_INITIAL_DEPTH: usize = 0;
 const DEFAULT_DIRECTORY_TREE_MAX_ENTRIES_PER_DIRECTORY: usize = 160;
-const DEFAULT_DIRECTORY_TREE_PREVIEW_MAX_DEPTH: usize = 2;
-const DEFAULT_DIRECTORY_TREE_PREVIEW_MAX_LINES: usize = 220;
+const DEFAULT_DIRECTORY_TREE_PREVIEW_MAX_DEPTH: usize = 0;
+const DEFAULT_DIRECTORY_TREE_PREVIEW_MAX_LINES: usize = 0;
 const DEFAULT_BACKGROUND_PI_IDLE_STOP_MINUTES: u64 = 5;
 
 fn storage_dir() -> Result<PathBuf, String> {
@@ -231,16 +231,16 @@ fn ensure_directory_tree_config(value: &mut serde_json::Value) -> bool {
   };
 
   let mut changed = false;
-  for (key, fallback) in [
-    ("initialDepth", DEFAULT_DIRECTORY_TREE_INITIAL_DEPTH),
-    ("maxEntriesPerDirectory", DEFAULT_DIRECTORY_TREE_MAX_ENTRIES_PER_DIRECTORY),
-    ("previewMaxDepth", DEFAULT_DIRECTORY_TREE_PREVIEW_MAX_DEPTH),
-    ("previewMaxLines", DEFAULT_DIRECTORY_TREE_PREVIEW_MAX_LINES),
+  for (key, fallback, allow_zero) in [
+    ("initialDepth", DEFAULT_DIRECTORY_TREE_INITIAL_DEPTH, true),
+    ("maxEntriesPerDirectory", DEFAULT_DIRECTORY_TREE_MAX_ENTRIES_PER_DIRECTORY, false),
+    ("previewMaxDepth", DEFAULT_DIRECTORY_TREE_PREVIEW_MAX_DEPTH, true),
+    ("previewMaxLines", DEFAULT_DIRECTORY_TREE_PREVIEW_MAX_LINES, true),
   ] {
     let valid = directory_tree_map
       .get(key)
       .and_then(|value| value.as_u64())
-      .is_some_and(|value| value > 0);
+      .is_some_and(|value| if allow_zero { true } else { value > 0 });
     if !valid {
       directory_tree_map.insert(key.to_string(), serde_json::json!(fallback));
       changed = true;
@@ -1445,64 +1445,6 @@ fn limited_sorted_directory_entries(dir: &Path, max_entries: usize) -> Result<(V
   Ok((entries, truncated))
 }
 
-fn push_directory_tree_lines(
-  dir: &Path,
-  prefix: &str,
-  depth: usize,
-  max_depth: usize,
-  max_lines: usize,
-  max_entries_per_directory: usize,
-  lines: &mut Vec<String>,
-  truncated: &mut bool,
-) -> Result<(), String> {
-  if *truncated || depth >= max_depth {
-    return Ok(());
-  }
-
-  let (entries, entries_truncated) = limited_sorted_directory_entries(dir, max_entries_per_directory)?;
-
-  for (index, entry) in entries.iter().enumerate() {
-    if lines.len() >= max_lines {
-      lines.push(format!("{}… 已省略更多条目", prefix));
-      *truncated = true;
-      break;
-    }
-
-    let name = entry.file_name().to_string_lossy().to_string();
-    let is_last = index + 1 == entries.len();
-    let connector = if is_last { "└─ " } else { "├─ " };
-    let child_prefix = if is_last { "   " } else { "│  " };
-    let file_type = entry.file_type().map_err(|e| format!("读取文件类型失败 {:?}: {e}", entry.path()))?;
-
-    if file_type.is_dir() {
-      if should_omit_dir(&name) {
-        lines.push(format!("{}{}{}/（已省略）", prefix, connector, name));
-      } else {
-        lines.push(format!("{}{}{}/", prefix, connector, name));
-        push_directory_tree_lines(
-          &entry.path(),
-          &format!("{}{}", prefix, child_prefix),
-          depth + 1,
-          max_depth,
-          max_lines,
-          max_entries_per_directory,
-          lines,
-          truncated,
-        )?;
-      }
-    } else {
-      lines.push(format!("{}{}{}", prefix, connector, name));
-    }
-  }
-
-  if entries_truncated && !*truncated && lines.len() < max_lines {
-    lines.push(format!("{}… 已省略更多条目", prefix));
-    *truncated = true;
-  }
-
-  Ok(())
-}
-
 fn build_directory_tree_node(
   path: &Path,
   name: String,
@@ -1679,25 +1621,18 @@ fn get_directory_tree(path: String) -> Result<DirectoryTreeResponse, String> {
     .unwrap_or("当前项目")
     .to_string();
   let config = resolve_directory_tree_config(Some(&root))?;
-  let mut lines = vec![format!("{}/", root_name)];
-  let mut lines_truncated = false;
-  push_directory_tree_lines(
-    &root,
-    "",
-    0,
-    config.preview_max_depth,
-    config.preview_max_lines,
-    config.max_entries_per_directory,
-    &mut lines,
-    &mut lines_truncated,
-  )?;
+  // 首次打开目录树时只返回根节点，不预扫描子目录。
+  // 子目录内容统一在用户点击展开目录时通过 get_directory_children 按需加载，
+  // 避免打开项目或切换项目时因为大目录遍历造成 UI 卡顿。
+  let lines = vec![format!("{}/", root_name)];
+  let lines_truncated = false;
 
   let mut tree_truncated = false;
   let tree = build_directory_tree_node(
     &root,
     root_name,
     0,
-    config.initial_depth,
+    0,
     config.max_entries_per_directory,
     &mut tree_truncated,
   )?;

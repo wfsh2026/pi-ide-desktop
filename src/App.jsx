@@ -989,7 +989,7 @@ export default function App() {
     try {
       const result = await invoke("get_directory_tree", { path: projectPath });
       setDirectoryTree(result);
-      setExpandedDirectoryPaths(new Set(result?.tree?.path ? [result.tree.path] : []));
+      setExpandedDirectoryPaths(new Set());
     } catch (error) {
       setDirectoryTree(null);
       setExpandedDirectoryPaths(new Set());
@@ -1001,9 +1001,22 @@ export default function App() {
   }, [activeProject?.path]);
 
   useEffect(() => {
-    if (!directoryTreeOpen) return;
-    loadDirectoryTree(activeProject?.path);
-  }, [directoryTreeOpen, activeProject?.path, loadDirectoryTree]);
+    setDirectoryTreeOpen(false);
+    setDirectoryTree(null);
+    setExpandedDirectoryPaths(new Set());
+    setDirectoryTreeNodeLoadingPaths(new Set());
+    setDirectoryTreeSearch("");
+    setDirectoryTreeError("");
+  }, [activeProject?.path]);
+
+  function handleDirectoryTreeToolClick() {
+    if (directoryTreeOpen) {
+      setDirectoryTreeOpen(false);
+      return;
+    }
+    setDirectoryTreeOpen(true);
+    loadDirectoryTree(activeProject?.path).catch((error) => setDirectoryTreeError(String(error)));
+  }
 
   async function loadDirectoryNodeChildren(path) {
     if (!activeProject?.path || !path) return;
@@ -2381,7 +2394,7 @@ export default function App() {
           directoryTreeSearch={directoryTreeSearch}
           onDirectoryTreeSearchChange={setDirectoryTreeSearch}
           onToggleToolList={() => setToolListCollapsed((value) => !value)}
-          onToggleDirectoryTree={() => setDirectoryTreeOpen((value) => !value)}
+          onToggleDirectoryTree={handleDirectoryTreeToolClick}
           onToggleSessionFiles={() => setSessionFilesOpen((value) => !value)}
           onRefreshDirectoryTree={() => loadDirectoryTree().catch((e) => setDirectoryTreeError(String(e)))}
           onToggleDirectoryNode={toggleDirectoryNode}
