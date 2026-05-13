@@ -27,7 +27,7 @@
 | P1 | P1-2 | Pi 原生 session 对齐 | 桌面端重复维护大量会话内容 | 保存 UI 元数据，完整会话交给 Pi session JSONL | 阶段 1 已完成，已通过验证 | 重启后可以从 Pi session 恢复 |
 | P1 | P1-3 | Pi extension 权限与工具治理 | bash/read/write/edit 缺少统一限制 | extension 拦截危险命令、大文件读取和大输出 | 阶段 1 已完成，已通过验证 | 危险命令可被拦截或确认 |
 | P2 | P2-1 | 上下文 compaction UI | 长任务上下文成本不可见 | 显示上下文使用量，支持触发 compact | 未开始 | UI 能显示并触发压缩 |
-| P2 | P2-2 | 会话视图虚拟化 | 长会话一次性渲染所有 turn | 只渲染可视区附近内容 | 未开始 | 长会话滚动不卡顿 |
+| P2 | P2-2 | 会话视图虚拟化 | 长会话一次性渲染所有 turn | 只渲染可视区附近内容 | 已完成，已通过验证 | 长会话滚动不卡顿 |
 | P2 | P2-3 | 目录树懒加载 | 当前目录树一次性读取固定深度 | 点击目录时再读取 children | 未开始 | 大项目打开目录树不卡顿 |
 | P3 | P3-1 | debug 日志开关与入口屏蔽 | 高频 debug 放大 I/O 和磁盘占用，长时间使用可能加剧崩溃 | 默认关闭日志输出；通过全局或项目配置 `debug.enabled` 开启；按钮仅开启时显示 | 已完成，已通过当前验证 | 默认无 debug 写入；开启配置后按钮出现并可打开日志目录 |
 | P3 | P3-2 | debug 日志按大小轮转 | 开启 debug 后日志文件仍可能持续增长 | 增加最大文件大小和轮转数量配置 | 未开始 | 日志文件大小受控 |
@@ -101,3 +101,5 @@ Pi 官方支持 RPC 模式，适合 IDE 或自定义 UI 作为结构化主通道
 - 优化会话视图自动滚动：仅当用户原本位于底部附近时跟随新增输出；用户手动滚动查看历史内容后，新增文本不再强制把滚动条拉到底。
 - 验证通过：`node src/projectStorageModel.test.mjs`、`node src/sessionTimelineModel.test.mjs`、`node src/piIdeEventMapper.test.mjs`、`npm run build`。
 - 2026-05-13：针对打开项目卡顿风险进一步收紧目录树加载规则：移除切换项目时自动加载目录树的 effect，`get_directory_tree` 首次只返回根节点且不预扫描 preview lines；用户展开目录时再调用 `get_directory_children`。验证通过：`npm run build`、`node src/projectStorageModel.test.mjs`、`node src/sessionTimelineModel.test.mjs`、`node src/piIdeEventMapper.test.mjs`、`cargo check`。
+- 2026-05-13：继续优化默认启动内容：项目打开/切换时不再自动执行 Pi 环境检测，只重置环境状态并等待用户点击“环境设置”或发送任务时检测；配置 ensure 延迟执行；非终端视图切换会话时延迟读取终端日志尾部。
+- 2026-05-13：完成 P2-2 会话视图虚拟化。`SessionTimeline` 改为按滚动位置只渲染可视区附近 turn，并使用 spacer 保持滚动高度；终端历史 replay 改为 16KB 分块写入 xterm，避免切换终端视图时一次性写入大文本造成 UI 冻结。

@@ -195,6 +195,7 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 .pi-session-view { background: #181818; border-color: rgba(255,255,255,.06); }
 .pi-session-view .session-view-header { background: #181818; border-bottom-color: rgba(255,255,255,.06); }
 .pi-session-stream { align-items: center; gap: 26px; padding: 26px 24px 40px; background: #181818; }
+.timeline-virtual-spacer { flex: 0 0 auto; width: 100%; pointer-events: none; }
 .pi-session-turn { width: min(760px, 100%); display: flex; flex-direction: column; gap: 14px; color: #f2f2f2; }
 .pi-session-user-message { display: flex; justify-content: flex-end; align-items: flex-end; gap: 8px; width: 100%; }
 .pi-session-user-bubble { max-width: min(560px, 86%); padding: 12px 14px; border-radius: 13px; background: #242424; color: #f2f2f2; box-shadow: inset 0 0 0 1px rgba(255,255,255,.025); }

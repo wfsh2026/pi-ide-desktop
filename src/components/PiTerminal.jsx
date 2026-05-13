@@ -271,8 +271,22 @@ export default function PiTerminal({ activeSessionId, clearSignal, replaySignal 
     replayTimeoutRef.current = setTimeout(() => finishReplay("timeout"), 5000);
     term.reset();
     const content = normalizeForScrollableTerminal(replayContent);
-    if (content) term.write(content, () => finishReplay("callback"));
-    else finishReplay("empty");
+    if (!content) {
+      finishReplay("empty");
+      return;
+    }
+    const chunkSize = 16 * 1024;
+    let offset = 0;
+    const writeNextChunk = () => {
+      if (finished) return;
+      const chunk = content.slice(offset, offset + chunkSize);
+      offset += chunk.length;
+      term.write(chunk, () => {
+        if (offset >= content.length) finishReplay("callback");
+        else window.requestAnimationFrame(writeNextChunk);
+      });
+    };
+    writeNextChunk();
   }, [replaySignal, replayContent]);
 
   return (

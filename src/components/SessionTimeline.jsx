@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Bot, Check, ChevronDown, ChevronRight, Clock3, Copy, ExternalLink, File, FileText, Loader2, MoreHorizontal, RotateCcw, Terminal } from "lucide-react";
 import { buildSessionTimeline, splitMarkdownSections } from "../sessionTimelineModel.js";
 
@@ -38,9 +38,25 @@ function latestCompletedTurnId(turns) {
   return list[list.length - 1]?.id || null;
 }
 
+const TIMELINE_ESTIMATED_TURN_HEIGHT = 220;
+const TIMELINE_OVERSCAN = 6;
+
 function isNearScrollBottom(element) {
   if (!element) return true;
   return element.scrollHeight - element.scrollTop - element.clientHeight <= 24;
+}
+
+function timelineWindowRange(scrollTop, viewportHeight, count) {
+  if (count <= 0) return { start: 0, end: 0, before: 0, after: 0 };
+  const visible = Math.ceil(Math.max(1, viewportHeight) / TIMELINE_ESTIMATED_TURN_HEIGHT);
+  const start = Math.max(0, Math.floor(scrollTop / TIMELINE_ESTIMATED_TURN_HEIGHT) - TIMELINE_OVERSCAN);
+  const end = Math.min(count, start + visible + TIMELINE_OVERSCAN * 2);
+  return {
+    start,
+    end,
+    before: start * TIMELINE_ESTIMATED_TURN_HEIGHT,
+    after: Math.max(0, (count - end) * TIMELINE_ESTIMATED_TURN_HEIGHT)
+  };
 }
 
 function fileExt(file) {
@@ -363,6 +379,7 @@ function TurnView({ turn, runtimeStatus, fallbackOutputFiles, expanded, expanded
 export default function SessionTimeline({ project, session, runtimeStatus, onOpenFile, onOpenDirectory }) {
   const viewportRef = useRef(null);
   const shouldAutoScrollRef = useRef(true);
+  const [visibleRange, setVisibleRange] = useState(() => timelineWindowRange(0, 800, 0));
   const [expandedTurns, setExpandedTurns] = useState(() => new Set());
   const [expandedCommands, setExpandedCommands] = useState(() => new Set());
   const [now, setNow] = useState(Date.now());
@@ -373,6 +390,21 @@ export default function SessionTimeline({ project, session, runtimeStatus, onOpe
     .filter((file) => !turnOutputFileKeys.has(fileKey(file))), [session?.output_files, turnOutputFileKeys]);
   const fallbackOutputTurnId = useMemo(() => latestCompletedTurnId(turns), [turns]);
   const modelLabel = formatModel(runtimeStatus?.model || session?.current_model);
+  const visibleTurns = useMemo(() => turns.slice(visibleRange.start, visibleRange.end), [turns, visibleRange.start, visibleRange.end]);
+
+  function updateVisibleRange() {
+    const el = viewportRef.current;
+    if (!el) {
+      setVisibleRange(timelineWindowRange(0, 800, turns.length));
+      return;
+    }
+    const next = timelineWindowRange(el.scrollTop, el.clientHeight, turns.length);
+    setVisibleRange((prev) => (
+      prev.start === next.start && prev.end === next.end && prev.before === next.before && prev.after === next.after
+        ? prev
+        : next
+    ));
+  }
 
   useEffect(() => {
     if (!active) return;
@@ -380,20 +412,29 @@ export default function SessionTimeline({ project, session, runtimeStatus, onOpe
     return () => window.clearInterval(timer);
   }, [active]);
 
+  useLayoutEffect(() => {
+    updateVisibleRange();
+  }, [turns.length]);
+
   useEffect(() => {
     shouldAutoScrollRef.current = true;
     window.requestAnimationFrame(() => {
-      if (viewportRef.current) viewportRef.current.scrollTop = viewportRef.current.scrollHeight;
+      if (viewportRef.current) {
+        viewportRef.current.scrollTop = viewportRef.current.scrollHeight;
+        updateVisibleRange();
+      }
     });
   }, [session?.id]);
 
   useEffect(() => {
     if (!active || !viewportRef.current || !shouldAutoScrollRef.current) return;
     viewportRef.current.scrollTop = viewportRef.current.scrollHeight;
+    updateVisibleRange();
   }, [active, session?.output, session?.updated_at, turns.length]);
 
   function handleViewportScroll(event) {
     shouldAutoScrollRef.current = isNearScrollBottom(event.currentTarget);
+    updateVisibleRange();
   }
 
   function toggleTurn(id) {
@@ -447,21 +488,28 @@ export default function SessionTimeline({ project, session, runtimeStatus, onOpe
             <span>在下方输入任务后，这里会按结构化风格整理展示。</span>
           </div>
         ) : (
-          turns.map((turn, index) => (
-            <TurnView
-              key={turn.id}
-              turn={turn}
-              runtimeStatus={index === turns.length - 1 ? runtimeStatus : null}
-              fallbackOutputFiles={turn.id === fallbackOutputTurnId ? fallbackOutputFiles : []}
-              expanded={expandedTurns.has(turn.id)}
-              expandedCommands={expandedCommands}
-              onToggleTurn={() => toggleTurn(turn.id)}
-              onToggleCommand={toggleCommand}
-              onOpenFile={onOpenFile}
-              onOpenDirectory={onOpenDirectory}
-              now={now}
-            />
-          ))
+          <>
+            {visibleRange.before > 0 && <div className="timeline-virtual-spacer" style={{ height: visibleRange.before }} />}
+            {visibleTurns.map((turn, localIndex) => {
+              const index = visibleRange.start + localIndex;
+              return (
+                <TurnView
+                  key={turn.id}
+                  turn={turn}
+                  runtimeStatus={index === turns.length - 1 ? runtimeStatus : null}
+                  fallbackOutputFiles={turn.id === fallbackOutputTurnId ? fallbackOutputFiles : []}
+                  expanded={expandedTurns.has(turn.id)}
+                  expandedCommands={expandedCommands}
+                  onToggleTurn={() => toggleTurn(turn.id)}
+                  onToggleCommand={toggleCommand}
+                  onOpenFile={onOpenFile}
+                  onOpenDirectory={onOpenDirectory}
+                  now={now}
+                />
+              );
+            })}
+            {visibleRange.after > 0 && <div className="timeline-virtual-spacer" style={{ height: visibleRange.after }} />}
+          </>
         )}
       </div>
     </div>
