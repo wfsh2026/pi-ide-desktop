@@ -135,6 +135,8 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 .pi-setup-header p { margin: 6px 0 0; color: var(--text-muted); font-size: 13px; }
 .pi-setup-status-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
 .pi-setup-status { min-width: 0; display: flex; flex-direction: column; gap: 5px; padding: 12px; border-radius: 12px; border: 1px solid var(--border-default); background: var(--bg-panel); }
+.pi-setup-status[role="button"] { cursor: pointer; }
+.pi-setup-status[role="button"]:hover { background: var(--bg-panel-elevated); }
 .pi-setup-status.ok { border-color: rgba(63,185,80,.35); }
 .pi-setup-status.danger { border-color: var(--danger-muted); }
 .pi-setup-status strong { color: var(--text-secondary); font-size: 12px; }

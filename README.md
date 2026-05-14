@@ -31,10 +31,12 @@ pi --version
 Pi IDE 要求 Pi CLI >= `0.74.0`，推荐使用官方新包名安装或更新：
 
 ```bash
-npm install -g @earendil-works/pi-coding-agent
+npm install -g --force @earendil-works/pi-coding-agent
 ```
 
 如果仍在使用旧包 `@mariozechner/pi-coding-agent`，请迁移到上面的新包。旧包路径只用于检测和提示，不作为正式启动路径。
+
+模型配置不再由 Pi IDE 写入。点击环境设置里的“模型配置”栏会打开 `~/.pi/agent`，用户可以手动编辑 Pi 的 `models.json` / `settings.json`。
 
 如果你的 Pi 命令不是 `pi`，可以在软件左侧的“Pi 命令”里填完整路径，例如：
 
