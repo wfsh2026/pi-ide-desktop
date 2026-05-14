@@ -1110,9 +1110,9 @@ fn package_detection_json(detection: &PiPackageDetection) -> serde_json::Value {
 
 fn pi_version_error(version: Option<&str>, min_version: &str) -> String {
   match version {
-    Some(raw) if extract_semver(raw).is_some() => format!("Pi CLI 版本过低：当前 {raw}，最低需要 {min_version}。请运行 npm install -g {PI_PACKAGE_NAME}"),
-    Some(raw) => format!("无法识别 Pi CLI 版本：{raw}。最低需要 {min_version}，请运行 npm install -g {PI_PACKAGE_NAME}"),
-    None => format!("无法读取 Pi CLI 版本。最低需要 {min_version}，请运行 npm install -g {PI_PACKAGE_NAME}"),
+    Some(raw) if extract_semver(raw).is_some() => format!("Pi CLI 版本过低：当前 {raw}，最低需要 {min_version}。请运行 npm install -g --force {PI_PACKAGE_NAME}"),
+    Some(raw) => format!("无法识别 Pi CLI 版本：{raw}。最低需要 {min_version}，请运行 npm install -g --force {PI_PACKAGE_NAME}"),
+    None => format!("无法读取 Pi CLI 版本。最低需要 {min_version}，请运行 npm install -g --force {PI_PACKAGE_NAME}"),
   }
 }
 
@@ -1124,7 +1124,7 @@ fn assert_pi_runtime_supported(command_text: &str, envs: &HashMap<String, String
   let detection = detect_pi_package(command_text);
   if detection.uses_legacy_package() {
     return Err(format!(
-      "当前 Pi CLI 指向旧包 {PI_LEGACY_PACKAGE_NAME}，请迁移到 {PI_PACKAGE_NAME}：npm install -g {PI_PACKAGE_NAME}"
+      "当前 Pi CLI 指向旧包 {PI_LEGACY_PACKAGE_NAME}，请迁移到 {PI_PACKAGE_NAME}：npm install -g --force {PI_PACKAGE_NAME}"
     ));
   }
   if version_meets_min(version.as_deref(), min_version) != Some(true) {
@@ -1181,7 +1181,7 @@ fn check_pi_environment(workdir: Option<String>, legacy_command: Option<String>)
   if installed && !package_ok {
     issues.push(serde_json::json!({
       "code": "PI_LEGACY_PACKAGE",
-      "message": format!("当前 Pi CLI 指向旧包 {PI_LEGACY_PACKAGE_NAME}，请迁移到 {PI_PACKAGE_NAME}")
+      "message": format!("当前 Pi CLI 指向旧包 {PI_LEGACY_PACKAGE_NAME}，请迁移到 {PI_PACKAGE_NAME}。可点击安装/更新 Pi")
     }));
   }
   if !has_models && !has_auth {
@@ -1216,118 +1216,13 @@ fn check_pi_environment(workdir: Option<String>, legacy_command: Option<String>)
   }))
 }
 
-fn upsert_model(models: &mut Vec<serde_json::Value>, model_id: &str, model_name: Option<&str>) {
-  let next_model = if let Some(name) = model_name.map(str::trim).filter(|value| !value.is_empty()) {
-    serde_json::json!({ "id": model_id, "name": name })
-  } else {
-    serde_json::json!({ "id": model_id })
-  };
-  for model in models.iter_mut() {
-    let existing_id = model
-      .as_str()
-      .map(str::trim)
-      .filter(|value| !value.is_empty())
-      .map(ToString::to_string)
-      .or_else(|| json_string(Some(model), "id"));
-    if existing_id.as_deref() == Some(model_id) {
-      *model = next_model;
-      return;
-    }
-  }
-  models.push(next_model);
-}
-
-fn update_default_model_settings(path: &Path, provider: &str, model_id: &str) -> Result<(), String> {
-  let mut value = read_json_value(path)?.unwrap_or_else(|| serde_json::json!({}));
-  if !value.is_object() {
-    value = serde_json::json!({});
-  }
-  if let Some(map) = value.as_object_mut() {
-    map.insert("defaultProvider".to_string(), serde_json::Value::String(provider.to_string()));
-    map.insert("defaultModel".to_string(), serde_json::Value::String(model_id.to_string()));
-  }
-  write_json_value(path, &value)
-}
-
-#[tauri::command]
-fn save_pi_model_template(
-  workdir: Option<String>,
-  template: String,
-  provider: String,
-  model_id: String,
-  model_name: Option<String>,
-  base_url: Option<String>,
-  api_key: Option<String>,
-  api: Option<String>,
-) -> Result<serde_json::Value, String> {
-  let provider = provider.trim();
-  let model_id = model_id.trim();
-  if provider.is_empty() {
-    return Err("Provider 不能为空".to_string());
-  }
-  if model_id.is_empty() {
-    return Err("模型 ID 不能为空".to_string());
-  }
-
-  let models_path = global_pi_models_path()?;
-  let mut value = read_json_value(&models_path)?.unwrap_or_else(|| serde_json::json!({ "providers": {} }));
-  if !value.is_object() {
-    value = serde_json::json!({ "providers": {} });
-  }
-  let root = value.as_object_mut().ok_or("模型配置格式无效")?;
-  if !matches!(root.get("providers"), Some(value) if value.is_object()) {
-    root.insert("providers".to_string(), serde_json::json!({}));
-  }
-  let providers = root.get_mut("providers").and_then(|value| value.as_object_mut()).ok_or("模型 Provider 配置格式无效")?;
-  if !matches!(providers.get(provider), Some(value) if value.is_object()) {
-    providers.insert(provider.to_string(), serde_json::json!({}));
-  }
-  let provider_config = providers.get_mut(provider).and_then(|value| value.as_object_mut()).ok_or("模型 Provider 配置格式无效")?;
-
-  if let Some(value) = base_url.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
-    provider_config.insert("baseUrl".to_string(), serde_json::Value::String(value.to_string()));
-  }
-  if let Some(value) = api.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
-    provider_config.insert("api".to_string(), serde_json::Value::String(value.to_string()));
-  }
-  if let Some(value) = api_key.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
-    provider_config.insert("apiKey".to_string(), serde_json::Value::String(value.to_string()));
-  }
-  if template.trim() == "ollama" {
-    provider_config.insert("compat".to_string(), serde_json::json!({
-      "supportsDeveloperRole": false,
-      "supportsReasoningEffort": false
-    }));
-  }
-
-  let mut models = provider_config
-    .remove("models")
-    .and_then(|value| value.as_array().cloned())
-    .unwrap_or_default();
-  upsert_model(&mut models, model_id, model_name.as_deref());
-  provider_config.insert("models".to_string(), serde_json::Value::Array(models));
-  write_json_value(&models_path, &value)?;
-
-  let workdir_path = workdir
-    .as_deref()
-    .map(str::trim)
-    .filter(|s| !s.is_empty())
-    .map(PathBuf::from);
-  update_default_model_settings(&global_pi_settings_path()?, provider, model_id)?;
-  if let Some(path) = workdir_path.as_deref().filter(|path| path.exists() && path.is_dir()).map(project_pi_settings_path) {
-    update_default_model_settings(&path, provider, model_id)?;
-  }
-
-  load_pi_model_config(workdir)
-}
-
 #[tauri::command]
 async fn install_pi_cli() -> Result<serde_json::Value, String> {
   tauri::async_runtime::spawn_blocking(|| {
     #[cfg(windows)]
     let mut command = {
       let mut command = Command::new("cmd.exe");
-      command.arg("/D").arg("/C").arg("npm install -g @earendil-works/pi-coding-agent");
+      command.arg("/D").arg("/C").arg("npm install -g --force @earendil-works/pi-coding-agent");
       if let Some(path) = windows_augmented_path() {
         command.env("PATH", path);
       }
@@ -1337,7 +1232,7 @@ async fn install_pi_cli() -> Result<serde_json::Value, String> {
     #[cfg(not(windows))]
     let mut command = {
       let mut command = Command::new("npm");
-      command.args(["install", "-g", "@earendil-works/pi-coding-agent"]);
+      command.args(["install", "-g", "--force", "@earendil-works/pi-coding-agent"]);
       command
     };
 
@@ -2172,6 +2067,14 @@ fn open_path_in_file_manager(path: String) -> Result<(), String> {
   }
 
   Ok(())
+}
+
+#[tauri::command]
+fn open_pi_model_config_dir() -> Result<String, String> {
+  let dir = pi_agent_dir()?;
+  fs::create_dir_all(&dir).map_err(|e| format!("创建 Pi 配置目录失败：{e}"))?;
+  open_path_in_file_manager(dir.to_string_lossy().to_string())?;
+  Ok(dir.to_string_lossy().to_string())
 }
 
 #[tauri::command]
@@ -3098,8 +3001,8 @@ fn main() {
       get_debug_logging_config,
       check_pi_environment,
       load_pi_model_config,
-      save_pi_model_template,
       install_pi_cli,
+      open_pi_model_config_dir,
       open_path_in_file_manager,
       open_file_with_default_app,
       get_directory_tree,

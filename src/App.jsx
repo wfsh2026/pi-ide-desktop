@@ -20,26 +20,6 @@ const SESSION_TEXT_PREVIEW_CHARS_STORAGE_KEY = "piIdeSessionTextPreviewChars";
 const SESSION_TURN_LIMIT_STORAGE_KEY = "piIdeSessionTurnLimit";
 const SESSION_FILE_RECORD_LIMIT_STORAGE_KEY = "piIdeSessionFileRecordLimit";
 const DEFAULT_BACKGROUND_PI_IDLE_STOP_MINUTES = 5;
-const MODEL_TEMPLATE_DEFAULTS = {
-  "openai-compatible": {
-    template: "openai-compatible",
-    provider: "openai-compatible",
-    modelId: "",
-    modelName: "",
-    baseUrl: "",
-    api: "openai-responses",
-    apiKey: "OPENAI_API_KEY"
-  },
-  ollama: {
-    template: "ollama",
-    provider: "ollama",
-    modelId: "qwen2.5-coder:7b",
-    modelName: "",
-    baseUrl: "http://localhost:11434/v1",
-    api: "openai-completions",
-    apiKey: "ollama"
-  }
-};
 
 function insertAtCursor(text, insert) {
   const start = text.selectionStart ?? 0;
@@ -679,11 +659,9 @@ function PiSetupPanel({
   environment,
   checking,
   installing,
-  modelDraft,
-  onModelDraftChange,
   onCheck,
   onInstall,
-  onSaveModel,
+  onOpenModelConfig,
   onOpenDebugLog,
   onCleanCache,
   cacheCleaning,
@@ -699,14 +677,7 @@ function PiSetupPanel({
   const packageOk = environment?.packageOk !== false;
   const minVersion = environment?.minVersion || "0.74.0";
   const activePackage = environment?.package?.activePackage || environment?.packageName || "";
-
-  function updateDraft(patch) {
-    onModelDraftChange({ ...modelDraft, ...patch });
-  }
-
-  function changeTemplate(template) {
-    onModelDraftChange({ ...MODEL_TEMPLATE_DEFAULTS[template] });
-  }
+  const installLabel = installed && (!versionOk || !packageOk) ? "更新/迁移 Pi" : "安装/更新 Pi";
 
   return (
     <div className="pi-setup-view">
@@ -725,10 +696,19 @@ function PiSetupPanel({
             <span>{environment?.installed ? environment?.version || "已安装" : "未检测到"}</span>
             <small>{activePackage ? `${command} · ${activePackage}` : command} · 最低 {minVersion}</small>
           </div>
-          <div className={`pi-setup-status ${environment?.hasModels || environment?.hasAuth ? "ok" : "danger"}`}>
+          <div
+            className={`pi-setup-status ${environment?.hasModels || environment?.hasAuth ? "ok" : "danger"}`}
+            role="button"
+            tabIndex={0}
+            title="打开 Pi 模型配置目录"
+            onClick={onOpenModelConfig}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" || event.key === " ") onOpenModelConfig();
+            }}
+          >
             <strong>模型配置</strong>
             <span>{environment?.hasModels ? `${environment?.modelCount || 0} 个模型` : (environment?.hasAuth ? "已有认证信息" : "未配置")}</span>
-            <small>{modelConfigPath || "models.json 未创建"}</small>
+            <small>{modelConfigPath || "models.json 未创建"} · 点击打开配置目录</small>
           </div>
         </div>
 
@@ -740,7 +720,7 @@ function PiSetupPanel({
 
         <div className="pi-setup-actions">
           <button onClick={onInstall} disabled={installing}>
-            {installing ? "正在安装..." : "安装 Pi"}
+            {installing ? "正在安装/更新..." : installLabel}
           </button>
           <button onClick={onCheck} disabled={checking}>
             <RefreshCw size={14}/> {checking ? "检测中..." : "重新检测"}
@@ -770,48 +750,6 @@ function PiSetupPanel({
           )}
         </div>
 
-        <div className="pi-setup-form">
-          <div className="pi-setup-form-head">
-            <strong>配置模型</strong>
-            <small>写入 ~/.pi/agent/models.json 和当前项目默认模型</small>
-          </div>
-          <div className="pi-setup-form-grid">
-            <label>
-              模板
-              <select value={modelDraft.template} onChange={(event) => changeTemplate(event.target.value)}>
-                <option value="openai-compatible">OpenAI-compatible</option>
-                <option value="ollama">Ollama</option>
-              </select>
-            </label>
-            <label>
-              Provider
-              <input value={modelDraft.provider} onChange={(event) => updateDraft({ provider: event.target.value })}/>
-            </label>
-            <label>
-              模型 ID
-              <input value={modelDraft.modelId} onChange={(event) => updateDraft({ modelId: event.target.value })} placeholder="例如 gpt-4.1 或 qwen2.5-coder:7b"/>
-            </label>
-            <label>
-              显示名称
-              <input value={modelDraft.modelName} onChange={(event) => updateDraft({ modelName: event.target.value })} placeholder="可选"/>
-            </label>
-            <label>
-              Base URL
-              <input value={modelDraft.baseUrl} onChange={(event) => updateDraft({ baseUrl: event.target.value })} placeholder="例如 https://api.openai.com/v1"/>
-            </label>
-            <label>
-              API
-              <input value={modelDraft.api} onChange={(event) => updateDraft({ api: event.target.value })}/>
-            </label>
-            <label className="pi-setup-form-wide">
-              API Key / 环境变量名
-              <input value={modelDraft.apiKey} onChange={(event) => updateDraft({ apiKey: event.target.value })} placeholder="例如 OPENAI_API_KEY 或 sk-..."/>
-            </label>
-          </div>
-          <div className="pi-setup-actions">
-            <button className="primary" onClick={onSaveModel}>写入模型配置</button>
-          </div>
-        </div>
       </div>
     </div>
   );
@@ -962,7 +900,6 @@ export default function App() {
   const [piInstalling, setPiInstalling] = useState(false);
   const [cacheCleaning, setCacheCleaning] = useState(false);
   const [cacheCleanResult, setCacheCleanResult] = useState(null);
-  const [modelTemplateDraft, setModelTemplateDraft] = useState(() => ({ ...MODEL_TEMPLATE_DEFAULTS["openai-compatible"] }));
   const [projects, setProjects] = useState(() => loadProjects());
   const [activeProjectId, setActiveProjectId] = useState(null);
   const [activeProjectSessionId, setActiveProjectSessionId] = useState(null);
@@ -1145,6 +1082,15 @@ export default function App() {
     }
   }
 
+  async function openPiModelConfigDir() {
+    try {
+      const path = await invoke("open_pi_model_config_dir");
+      setStatus(`已打开 Pi 模型配置目录：${path}`);
+    } catch (error) {
+      setStatus(`打开 Pi 模型配置目录失败：${String(error)}`);
+    }
+  }
+
   async function cleanPiIdeCache() {
     if (!window.confirm("将清空 IDE 事件缓存、终端日志和调试日志，不会删除 Pi 原生会话。是否继续？")) return;
     setCacheCleaning(true);
@@ -1231,42 +1177,17 @@ export default function App() {
   }
 
   async function installPiCli() {
-    if (!window.confirm("将通过 npm 全局安装 @earendil-works/pi-coding-agent。是否继续？")) return;
+    if (!window.confirm("将通过 npm 全局安装/更新 @earendil-works/pi-coding-agent，并覆盖旧 Pi 命令入口。是否继续？")) return;
     setPiInstalling(true);
     try {
-      setStatus("正在安装 Pi...");
+      setStatus("正在安装/更新 Pi...");
       await invoke("install_pi_cli");
-      setStatus("Pi 安装完成，正在重新检测环境");
+      setStatus("Pi 安装/更新完成，正在重新检测环境");
       await checkPiEnvironment(activeProject?.path || workdir, { showStatus: true, force: true });
     } catch (error) {
-      setStatus(`Pi 安装失败：${String(error)}`);
+      setStatus(`Pi 安装/更新失败：${String(error)}`);
     } finally {
       setPiInstalling(false);
-    }
-  }
-
-  async function savePiModelTemplate() {
-    try {
-      if (!String(modelTemplateDraft.modelId || "").trim()) throw new Error("模型 ID 不能为空");
-      if (!String(modelTemplateDraft.provider || "").trim()) throw new Error("Provider 不能为空");
-      setStatus("正在写入模型配置...");
-      await invoke("save_pi_model_template", {
-        workdir: activeProject?.path || workdir || null,
-        template: modelTemplateDraft.template,
-        provider: modelTemplateDraft.provider,
-        modelId: modelTemplateDraft.modelId,
-        modelName: modelTemplateDraft.modelName || null,
-        baseUrl: modelTemplateDraft.baseUrl || null,
-        apiKey: modelTemplateDraft.apiKey || null,
-        api: modelTemplateDraft.api || null
-      });
-      setStatus("模型配置已写入，正在重新检测环境");
-      await checkPiEnvironment(activeProject?.path || workdir, { showStatus: true, force: true });
-      if (activeProjectSessionIdRef.current) {
-        await loadConfiguredModelCandidates(activeProjectSessionIdRef.current).catch(() => {});
-      }
-    } catch (error) {
-      setStatus(`写入模型配置失败：${String(error)}`);
     }
   }
 
@@ -2477,11 +2398,9 @@ export default function App() {
               environment={piEnvironment}
               checking={piEnvironmentChecking}
               installing={piInstalling}
-              modelDraft={modelTemplateDraft}
-              onModelDraftChange={setModelTemplateDraft}
               onCheck={() => checkPiEnvironment(activeProject?.path || workdir, { showStatus: true, force: true })}
               onInstall={installPiCli}
-              onSaveModel={savePiModelTemplate}
+              onOpenModelConfig={openPiModelConfigDir}
               onOpenDebugLog={openDebugLog}
               onCleanCache={cleanPiIdeCache}
               cacheCleaning={cacheCleaning}
