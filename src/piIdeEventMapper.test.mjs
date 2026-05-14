@@ -46,13 +46,99 @@ turns = applyPiIdeTimelineEvent(turns, {
   kind: "timeline",
   eventType: "message_update",
   deltaType: "text_delta",
+  contentIndex: 1,
+  delta: "，我在",
+  blockText: "会话窗口正常，我在。"
+}, { now: "2026-05-12T00:00:01.250Z", makeId });
+
+assert.equal(turns[0].items.find((item) => item.type === "assistant_message").text, "会话窗口正常，我在。");
+
+turns = applyPiIdeTimelineEvent(turns, {
+  kind: "timeline",
+  eventType: "message_update",
+  deltaType: "text_delta",
   delta: "\nThe user is simply testing table output rendering, and I should keep this concise."
 }, { now: "2026-05-12T00:00:01.500Z", makeId });
 
-assert.equal(turns[0].items.find((item) => item.type === "assistant_message").text, "会话窗口正常");
+assert.equal(turns[0].items.find((item) => item.type === "assistant_message").text, "会话窗口正常，我在。");
 assert.equal(
   turns[0].items.find((item) => item.type === "thinking").text.includes("The user is simply testing"),
   true
+);
+
+turns = applyPiIdeTimelineEvent(turns, {
+  kind: "timeline",
+  eventType: "message_end",
+  messageRole: "assistant",
+  text: `The user is asking me to test table output again. I should keep this concise.
+
+已在上面的回复中展示了多种表格样式。你目前看到的效果如何？如果需要调整，请告诉我具体需求，例如：
+
+- 是否表格渲染不正确，需要调整格式？
+- 需要特定的列对齐方式？
+- 需要嵌套或更复杂的表格？`
+}, { now: "2026-05-12T00:00:01.750Z", makeId });
+
+assert.equal(
+  turns[0].items.find((item) => item.type === "assistant_message").text,
+  `已在上面的回复中展示了多种表格样式。你目前看到的效果如何？如果需要调整，请告诉我具体需求，例如：
+
+- 是否表格渲染不正确，需要调整格式？
+- 需要特定的列对齐方式？
+- 需要嵌套或更复杂的表格？`
+);
+assert.equal(
+  turns[0].items.find((item) => item.type === "thinking").text.includes("The user is asking me to test table output again"),
+  true
+);
+
+turns = applyPiIdeTimelineEvent(turns, {
+  kind: "timeline",
+  eventType: "message_update",
+  deltaType: "text_delta",
+  delta: "\n表格行列合法状态\n- **格式** 数值数据"
+}, { now: "2026-05-12T00:00:01.800Z", makeId });
+
+assert.equal(
+  turns[0].items.find((item) => item.type === "assistant_message").text.includes("表格行列合法状态"),
+  true
+);
+
+let blockTurns = applyPiIdeTimelineEvent(baseTurns, {
+  kind: "timeline",
+  eventType: "message_update",
+  deltaType: "text_delta",
+  contentIndex: 1,
+  delta: "| 项目",
+  blockText: "| 项目 | 数值 |\n| --- | --- |\n| 收入 | 120,000 |"
+}, { now: "2026-05-12T00:00:01.850Z", makeId });
+
+blockTurns = applyPiIdeTimelineEvent(blockTurns, {
+  kind: "timeline",
+  eventType: "message_update",
+  deltaType: "text_delta",
+  contentIndex: 1,
+  delta: "重新",
+  blockText: "| 项目 | 数值 |\n| --- | --- |\n| 收入 | 120,000 |\n| 成本 | 80,000 |"
+}, { now: "2026-05-12T00:00:01.860Z", makeId });
+
+assert.equal(
+  blockTurns[0].items.find((item) => item.type === "assistant_message").text,
+  "| 项目 | 数值 |\n| --- | --- |\n| 收入 | 120,000 |\n| 成本 | 80,000 |"
+);
+
+turns = applyPiIdeTimelineEvent(turns, {
+  kind: "timeline",
+  eventType: "message_update",
+  deltaType: "text_end",
+  content: `The user wants a final correction.
+
+这是 text_end 提供的完整最终回答。`
+}, { now: "2026-05-12T00:00:01.900Z", makeId });
+
+assert.equal(
+  turns[0].items.find((item) => item.type === "assistant_message").text,
+  "这是 text_end 提供的完整最终回答。"
 );
 
 turns = applyPiIdeTimelineEvent(turns, {

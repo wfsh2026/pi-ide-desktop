@@ -77,6 +77,19 @@ const DEFAULT_DIRECTORY_TREE_MAX_ENTRIES_PER_DIRECTORY: usize = 160;
 const DEFAULT_DIRECTORY_TREE_PREVIEW_MAX_DEPTH: usize = 0;
 const DEFAULT_DIRECTORY_TREE_PREVIEW_MAX_LINES: usize = 0;
 const DEFAULT_BACKGROUND_PI_IDLE_STOP_MINUTES: u64 = 5;
+const DEFAULT_EVENT_TEXT_LIMIT: u64 = 50 * 1024;
+const DEFAULT_TOOL_RESULT_TEXT_LIMIT: u64 = 50 * 1024;
+const DEFAULT_PROJECT_EVENT_MAX_BYTES: u64 = 5 * 1024 * 1024;
+const DEFAULT_TERMINAL_LOG_MAX_BYTES: u64 = 2 * 1024 * 1024;
+
+#[derive(Clone)]
+struct StorageConfig {
+  event_text_limit: u64,
+  tool_result_text_limit: u64,
+  project_event_max_bytes: u64,
+  terminal_log_max_bytes: u64,
+  event_mode: String,
+}
 
 fn storage_dir() -> Result<PathBuf, String> {
   let home = dirs::home_dir().ok_or("无法定位用户 Home 目录")?;
@@ -114,13 +127,13 @@ fn append_debug_line_when(enabled: bool, line: &str) {
 }
 
 #[tauri::command]
-fn append_debug_log(source: String, message: String, workdir: Option<String>) -> Result<(), String> {
+fn append_debug_log(source: String, message: String, workdir: Option<String>, force: Option<bool>) -> Result<(), String> {
   let workdir_path = workdir
     .as_deref()
     .map(str::trim)
     .filter(|s| !s.is_empty())
     .map(PathBuf::from);
-  if resolve_debug_logging_enabled(workdir_path.as_deref(), None)? {
+  if force.unwrap_or(false) || resolve_debug_logging_enabled(workdir_path.as_deref(), None)? {
     append_debug_line_raw(&format!("[{source}] {message}"));
   }
   Ok(())
@@ -144,6 +157,13 @@ fn default_global_config(command: &str) -> serde_json::Value {
     "piSession": {
       "backgroundIdleStopMinutes": DEFAULT_BACKGROUND_PI_IDLE_STOP_MINUTES
     },
+    "storage": {
+      "eventMode": "compact",
+      "eventTextLimit": DEFAULT_EVENT_TEXT_LIMIT,
+      "toolResultTextLimit": DEFAULT_TOOL_RESULT_TEXT_LIMIT,
+      "projectEventMaxBytes": DEFAULT_PROJECT_EVENT_MAX_BYTES,
+      "terminalLogMaxBytes": DEFAULT_TERMINAL_LOG_MAX_BYTES
+    },
     "directoryTree": {
       "initialDepth": DEFAULT_DIRECTORY_TREE_INITIAL_DEPTH,
       "maxEntriesPerDirectory": DEFAULT_DIRECTORY_TREE_MAX_ENTRIES_PER_DIRECTORY,
@@ -166,6 +186,13 @@ fn default_project_config() -> serde_json::Value {
     "piSession": {
       "backgroundIdleStopMinutes": DEFAULT_BACKGROUND_PI_IDLE_STOP_MINUTES
     },
+    "storage": {
+      "eventMode": "compact",
+      "eventTextLimit": DEFAULT_EVENT_TEXT_LIMIT,
+      "toolResultTextLimit": DEFAULT_TOOL_RESULT_TEXT_LIMIT,
+      "projectEventMaxBytes": DEFAULT_PROJECT_EVENT_MAX_BYTES,
+      "terminalLogMaxBytes": DEFAULT_TERMINAL_LOG_MAX_BYTES
+    },
     "directoryTree": {
       "initialDepth": DEFAULT_DIRECTORY_TREE_INITIAL_DEPTH,
       "maxEntriesPerDirectory": DEFAULT_DIRECTORY_TREE_MAX_ENTRIES_PER_DIRECTORY,
@@ -178,8 +205,9 @@ fn default_project_config() -> serde_json::Value {
 fn read_json_value(path: &Path) -> Result<Option<serde_json::Value>, String> {
   if !path.exists() { return Ok(None); }
   let raw = fs::read_to_string(path).map_err(|e| format!("读取配置失败 {:?}: {e}", path))?;
+  let raw = raw.trim_start_matches('\u{feff}');
   if raw.trim().is_empty() { return Ok(None); }
-  let value = serde_json::from_str::<serde_json::Value>(&raw)
+  let value = serde_json::from_str::<serde_json::Value>(raw)
     .map_err(|e| format!("解析配置失败 {:?}: {e}", path))?;
   Ok(Some(value))
 }
@@ -271,6 +299,49 @@ fn ensure_pi_session_config(value: &mut serde_json::Value) -> bool {
   false
 }
 
+fn ensure_storage_config(value: &mut serde_json::Value) -> bool {
+  let Some(map) = value.as_object_mut() else {
+    return false;
+  };
+  let default_value = serde_json::json!({
+    "eventMode": "compact",
+    "eventTextLimit": DEFAULT_EVENT_TEXT_LIMIT,
+    "toolResultTextLimit": DEFAULT_TOOL_RESULT_TEXT_LIMIT,
+    "projectEventMaxBytes": DEFAULT_PROJECT_EVENT_MAX_BYTES,
+    "terminalLogMaxBytes": DEFAULT_TERMINAL_LOG_MAX_BYTES
+  });
+  let Some(storage) = map.get_mut("storage") else {
+    map.insert("storage".to_string(), default_value);
+    return true;
+  };
+  let Some(storage_map) = storage.as_object_mut() else {
+    *storage = default_value;
+    return true;
+  };
+
+  let mut changed = false;
+  if !matches!(storage_map.get("eventMode").and_then(|value| value.as_str()), Some("compact" | "full" | "off")) {
+    storage_map.insert("eventMode".to_string(), serde_json::json!("compact"));
+    changed = true;
+  }
+  for (key, fallback, allow_zero) in [
+    ("eventTextLimit", DEFAULT_EVENT_TEXT_LIMIT, false),
+    ("toolResultTextLimit", DEFAULT_TOOL_RESULT_TEXT_LIMIT, false),
+    ("projectEventMaxBytes", DEFAULT_PROJECT_EVENT_MAX_BYTES, true),
+    ("terminalLogMaxBytes", DEFAULT_TERMINAL_LOG_MAX_BYTES, true),
+  ] {
+    let valid = storage_map
+      .get(key)
+      .and_then(|value| value.as_u64())
+      .is_some_and(|value| if allow_zero { true } else { value > 0 });
+    if !valid {
+      storage_map.insert(key.to_string(), serde_json::json!(fallback));
+      changed = true;
+    }
+  }
+  changed
+}
+
 fn ensure_config_file_defaults(path: &Path, default_value: serde_json::Value) -> Result<(), String> {
   if !path.exists() {
     write_json_value(path, &default_value)?;
@@ -283,11 +354,26 @@ fn ensure_config_file_defaults(path: &Path, default_value: serde_json::Value) ->
   let debug_changed = ensure_debug_config(&mut value);
   let directory_tree_changed = ensure_directory_tree_config(&mut value);
   let pi_session_changed = ensure_pi_session_config(&mut value);
-  let changed = debug_changed || directory_tree_changed || pi_session_changed;
+  let storage_changed = ensure_storage_config(&mut value);
+  let changed = debug_changed || directory_tree_changed || pi_session_changed || storage_changed;
   if changed {
     write_json_value(path, &value)?;
   }
   Ok(())
+}
+
+#[cfg(test)]
+mod config_tests {
+  use super::*;
+
+  #[test]
+  fn read_json_value_accepts_utf8_bom() {
+    let path = env::temp_dir().join(format!("pi-ide-config-bom-{}.json", std::process::id()));
+    fs::write(&path, b"\xEF\xBB\xBF{\"debug\":{\"enabled\":true}}").unwrap();
+    let value = read_json_value(&path).unwrap().unwrap();
+    let _ = fs::remove_file(&path);
+    assert_eq!(value["debug"]["enabled"], true);
+  }
 }
 
 fn ensure_pi_ide_config_files(workdir: Option<&Path>, legacy_command: Option<&str>) -> Result<(PathBuf, Option<PathBuf>), String> {
@@ -351,6 +437,24 @@ fn config_background_idle_stop_minutes(value: Option<&serde_json::Value>) -> Opt
     .and_then(|minutes| minutes.as_u64())
 }
 
+fn config_u64(value: Option<&serde_json::Value>, section: &str, key: &str, allow_zero: bool) -> Option<u64> {
+  value
+    .and_then(|v| v.get(section))
+    .and_then(|section| section.get(key))
+    .and_then(|raw| raw.as_u64())
+    .filter(|raw| if allow_zero { true } else { *raw > 0 })
+}
+
+fn config_storage_event_mode(value: Option<&serde_json::Value>) -> Option<String> {
+  value
+    .and_then(|v| v.get("storage"))
+    .and_then(|storage| storage.get("eventMode"))
+    .and_then(|mode| mode.as_str())
+    .map(str::trim)
+    .filter(|mode| matches!(*mode, "compact" | "full" | "off"))
+    .map(ToString::to_string)
+}
+
 fn config_usize(value: Option<&serde_json::Value>, section: &str, key: &str) -> Option<usize> {
   value
     .and_then(|v| v.get(section))
@@ -358,6 +462,43 @@ fn config_usize(value: Option<&serde_json::Value>, section: &str, key: &str) -> 
     .and_then(|raw| raw.as_u64())
     .filter(|raw| *raw > 0)
     .and_then(|raw| usize::try_from(raw).ok())
+}
+
+fn apply_storage_config(value: Option<&serde_json::Value>, config: &mut StorageConfig) {
+  if let Some(limit) = config_u64(value, "storage", "eventTextLimit", false) {
+    config.event_text_limit = limit;
+  }
+  if let Some(limit) = config_u64(value, "storage", "toolResultTextLimit", false) {
+    config.tool_result_text_limit = limit;
+  }
+  if let Some(limit) = config_u64(value, "storage", "projectEventMaxBytes", true) {
+    config.project_event_max_bytes = limit;
+  }
+  if let Some(limit) = config_u64(value, "storage", "terminalLogMaxBytes", true) {
+    config.terminal_log_max_bytes = limit;
+  }
+  if let Some(mode) = config_storage_event_mode(value) {
+    config.event_mode = mode;
+  }
+}
+
+fn resolve_storage_config(workdir: Option<&Path>) -> Result<StorageConfig, String> {
+  let (global_path, project_path) = ensure_pi_ide_config_files(workdir, None)?;
+  let global_config = read_json_value(&global_path)?;
+  let project_config = match &project_path {
+    Some(path) => read_json_value(path)?,
+    None => None,
+  };
+  let mut config = StorageConfig {
+    event_text_limit: DEFAULT_EVENT_TEXT_LIMIT,
+    tool_result_text_limit: DEFAULT_TOOL_RESULT_TEXT_LIMIT,
+    project_event_max_bytes: DEFAULT_PROJECT_EVENT_MAX_BYTES,
+    terminal_log_max_bytes: DEFAULT_TERMINAL_LOG_MAX_BYTES,
+    event_mode: "compact".to_string(),
+  };
+  apply_storage_config(global_config.as_ref(), &mut config);
+  apply_storage_config(project_config.as_ref(), &mut config);
+  Ok(config)
 }
 
 fn apply_directory_tree_config(value: Option<&serde_json::Value>, config: &mut DirectoryTreeConfig) {
@@ -470,9 +611,25 @@ fn ensure_pi_ide_config(workdir: Option<String>, legacy_command: Option<String>)
   let background_idle_stop_minutes = config_background_idle_stop_minutes(project_config.as_ref())
     .or_else(|| config_background_idle_stop_minutes(global_config.as_ref()))
     .unwrap_or(DEFAULT_BACKGROUND_PI_IDLE_STOP_MINUTES);
+  let mut storage_config = StorageConfig {
+    event_text_limit: DEFAULT_EVENT_TEXT_LIMIT,
+    tool_result_text_limit: DEFAULT_TOOL_RESULT_TEXT_LIMIT,
+    project_event_max_bytes: DEFAULT_PROJECT_EVENT_MAX_BYTES,
+    terminal_log_max_bytes: DEFAULT_TERMINAL_LOG_MAX_BYTES,
+    event_mode: "compact".to_string(),
+  };
+  apply_storage_config(global_config.as_ref(), &mut storage_config);
+  apply_storage_config(project_config.as_ref(), &mut storage_config);
   Ok(serde_json::json!({
     "debugEnabled": debug_enabled,
     "backgroundIdleStopMinutes": background_idle_stop_minutes,
+    "storage": {
+      "eventMode": storage_config.event_mode,
+      "eventTextLimit": storage_config.event_text_limit,
+      "toolResultTextLimit": storage_config.tool_result_text_limit,
+      "projectEventMaxBytes": storage_config.project_event_max_bytes,
+      "terminalLogMaxBytes": storage_config.terminal_log_max_bytes
+    },
     "globalConfig": global_path.to_string_lossy(),
     "projectConfig": project_path.map(|path| path.to_string_lossy().to_string())
   }))
@@ -906,8 +1063,20 @@ const bashBefore = new Map();
 let sequence = 0;
 
 function eventTextLimit() {
-  const value = Number(process.env.PI_IDE_EVENT_TEXT_LIMIT || "10000000");
-  return Number.isFinite(value) && value > 0 ? Math.floor(value) : 10000000;
+  const value = Number(process.env.PI_IDE_EVENT_TEXT_LIMIT || "51200");
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : 51200;
+}
+
+function eventMode() {
+  const value = String(process.env.PI_IDE_EVENT_MODE || "compact").trim();
+  return ["compact", "full", "off"].includes(value) ? value : "compact";
+}
+
+function shouldPersistTimelineEvent(eventType) {
+  const mode = eventMode();
+  if (mode === "full") return true;
+  if (mode === "off") return false;
+  return eventType !== "message_update" && eventType !== "tool_execution_update";
 }
 
 function positiveEnvNumber(name, fallback) {
@@ -931,7 +1100,7 @@ function limitText(value) {
 }
 
 function toolResultTextLimit() {
-  return positiveEnvNumber("PI_IDE_TOOL_RESULT_TEXT_LIMIT", 10000000);
+  return positiveEnvNumber("PI_IDE_TOOL_RESULT_TEXT_LIMIT", 51200);
 }
 
 function readLineLimit() {
@@ -1092,6 +1261,64 @@ function textContent(message) {
   }).filter(Boolean).join("");
 }
 
+function contentItems(value) {
+  if (Array.isArray(value?.content)) return value.content;
+  if (Array.isArray(value)) return value;
+  if (value && typeof value === "object") return [value];
+  return [];
+}
+
+function contentItemText(item) {
+  if (typeof item === "string") return item;
+  if (!item || typeof item !== "object") return "";
+  return String(item.text || item.content || "");
+}
+
+function contentBlockText(value, index) {
+  const content = contentItems(value);
+  const item = Number.isInteger(index) ? content[index] : undefined;
+  if (item !== undefined) return contentItemText(item);
+  return content.map(contentItemText).filter(Boolean).join("");
+}
+
+function contentBlockType(value, index) {
+  const content = contentItems(value);
+  const item = Number.isInteger(index) ? content[index] : undefined;
+  if (typeof item === "string") return "string";
+  if (item && typeof item === "object") return item.type || "";
+  return "";
+}
+
+function previewText(value, limit = 180) {
+  const text = String(value || "");
+  return text.length > limit ? `${text.slice(0, limit)}…` : text;
+}
+
+function contentItemSummary(item, index) {
+  if (typeof item === "string") {
+    return { index, type: "string", textLength: item.length, preview: previewText(item) };
+  }
+  if (!item || typeof item !== "object") {
+    return { index, type: typeof item };
+  }
+  const text = String(item.text || item.content || "");
+  const summary = {
+    index,
+    type: item.type || "",
+    textLength: text.length,
+    preview: previewText(text),
+  };
+  if (item.name) summary.name = item.name;
+  if (item.id) summary.id = item.id;
+  if (item.toolName) summary.toolName = item.toolName;
+  return summary;
+}
+
+function messageContentSummary(message) {
+  const content = Array.isArray(message?.content) ? message.content : [];
+  return content.map(contentItemSummary);
+}
+
 function compactResult(result) {
   return {
     content: compactJson(result?.content || []),
@@ -1132,6 +1359,7 @@ function emitModels(ctx, source = "unknown") {
 }
 
 function appendTimeline(ctx, eventType, payload = {}) {
+  if (!shouldPersistTimelineEvent(eventType)) return;
   appendEvent(ctx, {
     kind: "timeline",
     eventType,
@@ -1245,18 +1473,32 @@ export default function(pi) {
     appendTimeline(ctx, event.type, {
       turnIndex: event.turnIndex,
       text: limitText(textContent(event.message)),
+      messageContentSummary: messageContentSummary(event.message),
       toolResults: event.toolResults?.map(compactResult) || [],
     });
   });
 
   pi.on("message_update", async (event, ctx) => {
     const delta = event.assistantMessageEvent || {};
+    const rawContentIndex = Number(delta.contentIndex);
+    const contentIndex = Number.isInteger(rawContentIndex) ? rawContentIndex : undefined;
     appendTimeline(ctx, event.type, {
       messageId: event.message?.id,
+      messageRole: event.message?.role,
       deltaType: delta.type,
-      contentIndex: delta.contentIndex,
+      contentIndex,
       delta: limitText(delta.delta || ""),
+      content: limitText(delta.content || ""),
       reason: limitText(delta.reason || ""),
+      blockType: contentBlockType(event.message, contentIndex),
+      blockText: limitText(contentBlockText(event.message, contentIndex)),
+      partialBlockType: contentBlockType(delta.partial, contentIndex),
+      partialBlockText: limitText(contentBlockText(delta.partial, contentIndex)),
+      deltaPreview: previewText(delta.delta || ""),
+      contentPreview: previewText(delta.content || ""),
+      reasonPreview: previewText(delta.reason || ""),
+      messageContentSummary: messageContentSummary(event.message),
+      partialContentSummary: messageContentSummary(delta.partial),
     });
   });
 
@@ -1265,6 +1507,7 @@ export default function(pi) {
       messageId: event.message?.id,
       text: limitText(textContent(event.message)),
       messageRole: event.message?.role,
+      messageContentSummary: messageContentSummary(event.message),
       model: modelInfo(event.message),
     });
   });

@@ -40,12 +40,38 @@ function looksLikeReasoningText(text) {
     /^用户(?:只是|正在|想要|需要|要求|提供)/,
     /^我(?:应该|需要|会|将)/,
     /^这里(?:应该|需要|可以)/,
-    /^看起来(?:像|是)/,
-    /^表格行列合法状态/,
-    /^[-*]\s*\*\*格式\*\*/
+    /^看起来(?:像|是)/
   ];
   return englishReasoningMarkers.some((pattern) => pattern.test(value))
     || chineseReasoningMarkers.some((pattern) => pattern.test(value));
+}
+
+function hasCjkText(text) {
+  return /[\u3400-\u9fff]/.test(String(text || ""));
+}
+
+function splitReasoningAndAnswer(text) {
+  const value = String(text || "").replace(/\r\n/g, "\n");
+  if (!value.trim()) return { reasoning: "", answer: "" };
+  if (!looksLikeReasoningText(value)) return { reasoning: "", answer: value };
+
+  const lines = value.split("\n");
+  let answerStart = -1;
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index].trim();
+    if (!line) continue;
+    if (looksLikeReasoningText(line)) continue;
+    if (hasCjkText(line)) {
+      answerStart = index;
+      break;
+    }
+  }
+
+  if (answerStart < 0) return { reasoning: value, answer: "" };
+  return {
+    reasoning: lines.slice(0, answerStart).join("\n").trim(),
+    answer: lines.slice(answerStart).join("\n").trimStart()
+  };
 }
 
 function commandText(event) {
@@ -118,13 +144,57 @@ function setAssistantText(items, text, now, makeId) {
   const next = items.map((item) => {
     if (item.type !== "assistant_message") return item;
     updated = true;
-    return { ...item, text, updated_at: now };
+    return { ...item, text, text_blocks: undefined, updated_at: now };
   });
   if (updated) return next;
   return [...next, {
     id: makeId("item"),
     type: "assistant_message",
     text,
+    status: "running",
+    created_at: now,
+    updated_at: now
+  }];
+}
+
+function contentBlockKey(index) {
+  const value = Number(index);
+  return Number.isInteger(value) && value >= 0 ? String(value) : "main";
+}
+
+function orderedBlockText(blocks) {
+  const entries = Object.entries(blocks || {}).filter(([, text]) => text);
+  return entries.sort(([left], [right]) => {
+    if (left === right) return 0;
+    if (left === "main") return 1;
+    if (right === "main") return -1;
+    return Number(left) - Number(right);
+  }).map(([, text]) => text).join("");
+}
+
+function setAssistantBlockText(items, contentIndex, text, now, makeId) {
+  if (!text) return items;
+  const blockKey = contentBlockKey(contentIndex);
+  let updated = false;
+  const next = items.map((item) => {
+    if (item.type !== "assistant_message") return item;
+    updated = true;
+    const text_blocks = { ...(item.text_blocks || {}), [blockKey]: text };
+    return {
+      ...item,
+      text_blocks,
+      text: orderedBlockText(text_blocks),
+      status: "running",
+      updated_at: now
+    };
+  });
+  if (updated) return next;
+  const text_blocks = { [blockKey]: text };
+  return [...next, {
+    id: makeId("item"),
+    type: "assistant_message",
+    text_blocks,
+    text: orderedBlockText(text_blocks),
     status: "running",
     created_at: now,
     updated_at: now
@@ -151,25 +221,94 @@ function appendThinkingText(items, delta, now, makeId) {
   }];
 }
 
+function setThinkingText(items, text, now, makeId) {
+  if (!text) return items;
+  let updated = false;
+  const next = items.map((item) => {
+    if (item.type !== "thinking") return item;
+    updated = true;
+    return { ...item, text, thinking_blocks: undefined, updated_at: now };
+  });
+  if (updated) return next;
+  return [...next, {
+    id: makeId("item"),
+    type: "thinking",
+    title: "思考过程",
+    text,
+    status: "running",
+    created_at: now,
+    updated_at: now
+  }];
+}
+
+function setThinkingBlockText(items, contentIndex, text, now, makeId) {
+  if (!text) return items;
+  const blockKey = contentBlockKey(contentIndex);
+  let updated = false;
+  const next = items.map((item) => {
+    if (item.type !== "thinking") return item;
+    updated = true;
+    const thinking_blocks = { ...(item.thinking_blocks || {}), [blockKey]: text };
+    return {
+      ...item,
+      thinking_blocks,
+      text: orderedBlockText(thinking_blocks),
+      status: "running",
+      updated_at: now
+    };
+  });
+  if (updated) return next;
+  const thinking_blocks = { [blockKey]: text };
+  return [...next, {
+    id: makeId("item"),
+    type: "thinking",
+    title: "思考过程",
+    thinking_blocks,
+    text: orderedBlockText(thinking_blocks),
+    status: "running",
+    created_at: now,
+    updated_at: now
+  }];
+}
+
+function firstTextValue(...values) {
+  for (const value of values) {
+    if (typeof value === "string" && value.length > 0) return value;
+  }
+  return "";
+}
+
+function eventBlockText(event) {
+  return firstTextValue(event?.blockText, event?.partialBlockText);
+}
+
 function routeMessageDelta(items, delta, now, makeId) {
-  if (looksLikeReasoningText(delta)) {
-    return upsertProgress(appendThinkingText(items, delta, now, makeId), "progress-thinking", {
+  const routed = splitReasoningAndAnswer(delta);
+  let next = items;
+  if (routed.reasoning) {
+    next = upsertProgress(appendThinkingText(next, routed.reasoning, now, makeId), "progress-thinking", {
       title: "正在思考",
       detail: "",
       status: "running"
     }, now, makeId);
   }
-  return upsertProgress(appendAssistantText(items, delta, now, makeId), "progress-output", {
-    title: "正在输出结果",
-    detail: "",
-    status: "running"
-  }, now, makeId);
+  if (routed.answer) {
+    next = upsertProgress(appendAssistantText(next, routed.answer, now, makeId), "progress-output", {
+      title: "正在输出结果",
+      detail: "",
+      status: "running"
+    }, now, makeId);
+  }
+  return next;
 }
 
 function setRoutedMessageText(items, text, now, makeId) {
   if (!text) return items;
-  if (looksLikeReasoningText(text)) return appendThinkingText(items, text, now, makeId);
-  return setAssistantText(items, text, now, makeId);
+  const routed = splitReasoningAndAnswer(text);
+  let next = items;
+  if (routed.reasoning) next = setThinkingText(next, routed.reasoning, now, makeId);
+  if (routed.answer) next = setAssistantText(next, routed.answer, now, makeId);
+  return next;
 }
 
 function upsertCommand(items, event, patch, now, makeId) {
@@ -235,16 +374,55 @@ function applyEventToItems(items, event, now, makeId) {
   }
 
   if (eventType === "message_update") {
-    if (event.deltaType === "text_delta") {
-      return routeMessageDelta(items, event.delta || "", now, makeId);
-    }
-    if (event.deltaType === "thinking_delta") {
-      return upsertProgress(appendThinkingText(items, event.delta || "", now, makeId), "progress-thinking", {
+    let nextItems = items;
+    if (event.reason) {
+      nextItems = upsertProgress(appendThinkingText(nextItems, event.reason, now, makeId), "progress-thinking", {
         title: "正在思考",
         detail: "",
         status: "running"
       }, now, makeId);
     }
+    if (event.deltaType === "text_delta") {
+      const blockText = eventBlockText(event);
+      if (blockText) {
+        return upsertProgress(setAssistantBlockText(nextItems, event.contentIndex, blockText, now, makeId), "progress-output", {
+          title: "正在输出结果",
+          detail: "",
+          status: "running"
+        }, now, makeId);
+      }
+      return routeMessageDelta(nextItems, event.delta || "", now, makeId);
+    }
+    if (event.deltaType === "text_end") {
+      const text = firstTextValue(event.content, eventBlockText(event), event.delta);
+      if (event.contentIndex !== undefined && text) {
+        return setAssistantBlockText(nextItems, event.contentIndex, text, now, makeId);
+      }
+      return setRoutedMessageText(nextItems, text, now, makeId);
+    }
+    if (event.deltaType === "thinking_delta") {
+      const blockText = eventBlockText(event);
+      const updatedItems = blockText
+        ? setThinkingBlockText(nextItems, event.contentIndex, blockText, now, makeId)
+        : appendThinkingText(nextItems, event.delta || "", now, makeId);
+      return upsertProgress(updatedItems, "progress-thinking", {
+        title: "正在思考",
+        detail: "",
+        status: "running"
+      }, now, makeId);
+    }
+    if (event.deltaType === "thinking_end") {
+      const text = firstTextValue(event.content, eventBlockText(event), event.delta);
+      const updatedItems = event.contentIndex !== undefined
+        ? setThinkingBlockText(nextItems, event.contentIndex, text, now, makeId)
+        : setThinkingText(nextItems, text, now, makeId);
+      return upsertProgress(updatedItems, "progress-thinking", {
+        title: "正在思考",
+        detail: "",
+        status: "running"
+      }, now, makeId);
+    }
+    return nextItems;
   }
 
   if (eventType === "message_end") {
