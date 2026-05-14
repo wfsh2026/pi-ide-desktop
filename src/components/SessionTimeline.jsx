@@ -206,37 +206,8 @@ function renderTextSection(text, keyPrefix) {
   return rendered;
 }
 
-function markdownRenderSummary(text, sections) {
-  const value = String(text || "");
-  const lines = value.split("\n");
-  const pipeLines = lines
-    .map((line, index) => ({ line, index }))
-    .filter((item) => item.line.includes("|"));
-  return {
-    textLength: value.length,
-    preview: value.length > 180 ? `${value.slice(0, 180)}…` : value,
-    lineCount: lines.length,
-    sectionSummary: sections.map((section) => ({
-      type: section.type,
-      language: section.language || "",
-      length: String(section.text || "").length
-    })),
-    pipeLineCount: pipeLines.length,
-    tableStartIndexes: lines.map((_, index) => tableStartsAt(lines, index) ? index : -1).filter((index) => index >= 0),
-    loosePipeLineIndexes: pipeLines
-      .filter(({ line, index }) => isTableRow(line) && !tableStartsAt(lines, index))
-      .slice(0, 12)
-      .map(({ index, line }) => ({ index, preview: line.length > 120 ? `${line.slice(0, 120)}…` : line }))
-  };
-}
-
-function MarkdownText({ text, debugLabel = "", onDebugLog }) {
+function MarkdownText({ text }) {
   const sections = useMemo(() => splitMarkdownSections(text), [text]);
-  const debugSummary = useMemo(() => markdownRenderSummary(text, sections), [text, sections]);
-
-  useEffect(() => {
-    onDebugLog?.("markdown render summary", { label: debugLabel, ...debugSummary });
-  }, [debugLabel, debugSummary, onDebugLog]);
 
   if (sections.length === 0) return null;
 
@@ -445,7 +416,7 @@ function TurnDetails({ parts, expandedCommands, onToggleCommand }) {
   );
 }
 
-function TurnView({ turn, runtimeStatus, fallbackOutputFiles, expanded, expandedCommands, onToggleTurn, onToggleCommand, onOpenFile, onOpenDirectory, now, onDebugLog }) {
+function TurnView({ turn, runtimeStatus, fallbackOutputFiles, expanded, expandedCommands, onToggleTurn, onToggleCommand, onOpenFile, onOpenDirectory, now }) {
   const active = Boolean((runtimeStatus?.processing || runtimeStatus?.starting) && turn.status === "running");
   const parts = collectTurnParts(turn, fallbackOutputFiles);
   const hasDetails = Boolean(parts.commands.length || parts.references.length || parts.progress.length || parts.thinking.length || parts.errors.length);
@@ -457,7 +428,7 @@ function TurnView({ turn, runtimeStatus, fallbackOutputFiles, expanded, expanded
       <UserMessage item={parts.user}/>
       <StatusLine label={status} expanded={expanded} canExpand={hasDetails} onToggle={onToggleTurn}/>
       <OperationRecords items={parts.progress}/>
-      {parts.assistantText.trim() ? <MarkdownText text={parts.assistantText} debugLabel={`assistant:${turn.id}`} onDebugLog={onDebugLog}/> : active ? <div className="pi-session-thinking">正在思考</div> : null}
+      {parts.assistantText.trim() ? <MarkdownText text={parts.assistantText}/> : active ? <div className="pi-session-thinking">正在思考</div> : null}
       {parts.outputs.length > 0 && (
         <div className="pi-session-output-section">
           <strong>已输出文件：</strong>
@@ -473,7 +444,7 @@ function TurnView({ turn, runtimeStatus, fallbackOutputFiles, expanded, expanded
   );
 }
 
-export default function SessionTimeline({ project, session, runtimeStatus, onOpenFile, onOpenDirectory, onDebugLog }) {
+export default function SessionTimeline({ project, session, runtimeStatus, onOpenFile, onOpenDirectory }) {
   const viewportRef = useRef(null);
   const shouldAutoScrollRef = useRef(true);
   const [expandedTurns, setExpandedTurns] = useState(() => new Set());
@@ -486,20 +457,6 @@ export default function SessionTimeline({ project, session, runtimeStatus, onOpe
     .filter((file) => !turnOutputFileKeys.has(fileKey(file))), [session?.output_files, turnOutputFileKeys]);
   const fallbackOutputTurnId = useMemo(() => latestCompletedTurnId(turns), [turns]);
   const modelLabel = formatModel(runtimeStatus?.model || session?.current_model);
-
-  useEffect(() => {
-    onDebugLog?.("session timeline render summary", {
-      sessionId: session?.id || "",
-      turnCount: turns.length,
-      active,
-      modelLabel,
-      latestTurn: turns.length ? {
-        id: turns[turns.length - 1].id,
-        status: turns[turns.length - 1].status,
-        itemTypes: (turns[turns.length - 1].items || []).map((item) => item.type)
-      } : null
-    });
-  }, [active, modelLabel, onDebugLog, session?.id, session?.updated_at, turns]);
 
   useEffect(() => {
     if (!active) return;
@@ -587,7 +544,6 @@ export default function SessionTimeline({ project, session, runtimeStatus, onOpe
               onOpenFile={onOpenFile}
               onOpenDirectory={onOpenDirectory}
               now={now}
-              onDebugLog={onDebugLog}
             />
           ))
         )}

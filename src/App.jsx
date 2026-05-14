@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
-import { Square, Send, FolderOpen, Plus, Folder, X, File, FileText, FolderTree, ChevronDown, ChevronRight, RefreshCw, MessageSquare, TerminalSquare, Settings } from "lucide-react";
+import { Square, Send, FolderOpen, Plus, Folder, X, File, FileText, FolderTree, ChevronDown, ChevronRight, RefreshCw, MessageSquare, TerminalSquare, Settings, Trash2 } from "lucide-react";
 import PiTerminal from "./components/PiTerminal.jsx";
 import SessionTimeline from "./components/SessionTimeline.jsx";
 import { applyPiIdeTimelineEvent } from "./piIdeEventMapper.js";
@@ -71,6 +71,19 @@ function storageLimits() {
 function normalizeBackgroundPiIdleStopMinutes(value) {
   const minutes = Number(value);
   return Number.isFinite(minutes) && minutes >= 0 ? Math.floor(minutes) : DEFAULT_BACKGROUND_PI_IDLE_STOP_MINUTES;
+}
+
+function formatBytes(value) {
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  let size = bytes;
+  let index = 0;
+  while (size >= 1024 && index < units.length - 1) {
+    size /= 1024;
+    index += 1;
+  }
+  return `${size.toFixed(size >= 10 || index === 0 ? 0 : 1)} ${units[index]}`;
 }
 
 function limitTerminalPreview(text) {
@@ -331,63 +344,6 @@ function debugLog(message, data = undefined) {
 
 function forceDebugLog(message, data = undefined) {
   writeFrontendLog(message, data, true);
-}
-
-function previewForLog(value, limit = 180) {
-  const text = String(value || "");
-  return text.length > limit ? `${text.slice(0, limit)}…` : text;
-}
-
-function textFieldSummary(value) {
-  const text = String(value || "");
-  return { length: text.length, preview: previewForLog(text) };
-}
-
-function summarizeTimelineTextEvent(event) {
-  const eventType = event?.eventType || event?.type;
-  const deltaType = event?.deltaType || "";
-  const isTextEvent = event?.kind === "timeline" && (
-    eventType === "message_end"
-    || eventType === "turn_end"
-    || eventType === "message_update"
-  );
-  if (!isTextEvent) return null;
-  return {
-    id: event.id,
-    eventType,
-    messageRole: event.messageRole,
-    messageId: event.messageId,
-    deltaType,
-    contentIndex: event.contentIndex,
-    delta: textFieldSummary(event.delta),
-    content: textFieldSummary(event.content),
-    reason: textFieldSummary(event.reason),
-    blockType: event.blockType,
-    blockText: textFieldSummary(event.blockText),
-    partialBlockType: event.partialBlockType,
-    partialBlockText: textFieldSummary(event.partialBlockText),
-    text: textFieldSummary(event.text),
-    messageContentSummary: event.messageContentSummary || [],
-    partialContentSummary: event.partialContentSummary || []
-  };
-}
-
-function summarizeLatestTurnForLog(turns) {
-  const turn = Array.isArray(turns) && turns.length ? turns[turns.length - 1] : null;
-  if (!turn) return null;
-  const items = Array.isArray(turn.items) ? turn.items : [];
-  const assistantText = items.filter((item) => item.type === "assistant_message").map((item) => item.text || "").join("");
-  const thinkingText = items.filter((item) => item.type === "thinking").map((item) => item.text || "").join("");
-  return {
-    turnId: turn.id,
-    status: turn.status,
-    itemTypes: items.map((item) => item.type),
-    assistant: textFieldSummary(assistantText),
-    thinking: textFieldSummary(thinkingText),
-    commandCount: items.filter((item) => item.type === "command").length,
-    progressCount: items.filter((item) => item.type === "progress").length,
-    errorCount: items.filter((item) => item.type === "error").length
-  };
 }
 
 function loadProjects() {
@@ -729,6 +685,9 @@ function PiSetupPanel({
   onInstall,
   onSaveModel,
   onOpenDebugLog,
+  onCleanCache,
+  cacheCleaning,
+  cacheCleanResult,
   onClose
 }) {
   const ready = Boolean(environment?.ready);
@@ -782,6 +741,28 @@ function PiSetupPanel({
             <RefreshCw size={14}/> {checking ? "检测中..." : "重新检测"}
           </button>
           <button onClick={onOpenDebugLog}><FileText size={14}/> 调试日志</button>
+        </div>
+
+        <div className="pi-setup-form">
+          <div className="pi-setup-form-head">
+            <strong>清理缓存</strong>
+            <small>清空 IDE 事件缓存、终端日志和调试日志，不删除 Pi 原生会话</small>
+          </div>
+          <div className="pi-setup-actions">
+            <button className="danger" onClick={onCleanCache} disabled={cacheCleaning}>
+              <Trash2 size={14}/> {cacheCleaning ? "清理中..." : "清理异常缓存"}
+            </button>
+            {cacheCleanResult && (
+              <span className="pi-setup-cache-result">
+                已释放 {formatBytes(cacheCleanResult.freedBytes)}，清理 {cacheCleanResult.filesCleared || 0} 个文件
+              </span>
+            )}
+          </div>
+          {cacheCleanResult?.skipped?.length > 0 && (
+            <div className="pi-setup-cache-skipped">
+              {cacheCleanResult.skipped.length} 个历史项目目录不存在，已跳过。
+            </div>
+          )}
         </div>
 
         <div className="pi-setup-form">
@@ -975,6 +956,8 @@ export default function App() {
   const [piEnvironmentChecking, setPiEnvironmentChecking] = useState(false);
   const [piSetupOpen, setPiSetupOpen] = useState(false);
   const [piInstalling, setPiInstalling] = useState(false);
+  const [cacheCleaning, setCacheCleaning] = useState(false);
+  const [cacheCleanResult, setCacheCleanResult] = useState(null);
   const [modelTemplateDraft, setModelTemplateDraft] = useState(() => ({ ...MODEL_TEMPLATE_DEFAULTS["openai-compatible"] }));
   const [projects, setProjects] = useState(() => loadProjects());
   const [activeProjectId, setActiveProjectId] = useState(null);
@@ -1178,6 +1161,39 @@ export default function App() {
     } catch (error) {
       debugLog("open debug log failed", { error: String(error) });
       setStatus(`打开调试日志失败：${String(error)}`);
+    }
+  }
+
+  async function cleanPiIdeCache() {
+    if (!window.confirm("将清空 IDE 事件缓存、终端日志和调试日志，不会删除 Pi 原生会话。是否继续？")) return;
+    setCacheCleaning(true);
+    setCacheCleanResult(null);
+    try {
+      const workdirs = [...new Set([
+        ...projectsRef.current.map((project) => project.path).filter(Boolean),
+        activeProject?.path || workdir || ""
+      ].filter(Boolean))];
+      const result = await invoke("clean_pi_ide_cache", { workdirs });
+      let changed = false;
+      const nextProjects = projectsRef.current.map((project) => ({
+        ...project,
+        sessions: (project.sessions || []).map((session) => {
+          if (!session.output && !session.output_truncated && !session.output_bytes) return session;
+          changed = true;
+          return { ...session, output: "", output_truncated: false, output_bytes: 0 };
+        })
+      }));
+      if (changed) saveProjects(nextProjects);
+      outputBufferRef.current = "";
+      setTerminalReplayContent("");
+      setTerminalReplaySignal((value) => value + 1);
+      if (centerView === "terminal") setClearTerminalSignal((value) => value + 1);
+      setCacheCleanResult(result);
+      setStatus(`缓存清理完成，释放 ${formatBytes(result?.freedBytes)}。`);
+    } catch (error) {
+      setStatus(`清理缓存失败：${String(error)}`);
+    } finally {
+      setCacheCleaning(false);
     }
   }
 
@@ -1515,10 +1531,6 @@ export default function App() {
 
       if (event.kind === "timeline") {
         touchPiSessionActivity(targetSessionId);
-        const textEventSummary = summarizeTimelineTextEvent(event);
-        if (textEventSummary) {
-          forceDebugLog("timeline text raw", { targetSessionId, eventRunId, runtimeRunId: runtime.runId, ...textEventSummary });
-        }
         debugLog("timeline event", { targetSessionId, eventType: event.eventType, eventRunId, runtimeRunId: runtime.runId });
         if (event.model) updateSessionModel(targetSessionId, event.model);
         const failedEvent = event.eventType === "extension_error" || (event.eventType === "auto_retry_end" && event.success === false);
@@ -1526,26 +1538,11 @@ export default function App() {
           clearSessionIdleTimer(targetSessionId);
           setSessionRuntimeStatus(targetSessionId, { processing: true });
         }
-        let mappedSummary = null;
         updateSessionById(targetSessionId, (session) => ({
           ...session,
-          turns: (() => {
-            const nextTurns = applyPiIdeTimelineEvent(session.turns, event, { makeId });
-            if (textEventSummary) {
-              mappedSummary = {
-                targetSessionId,
-                eventId: event.id,
-                eventType: event.eventType,
-                deltaType: event.deltaType,
-                before: summarizeLatestTurnForLog(session.turns),
-                after: summarizeLatestTurnForLog(nextTurns)
-              };
-            }
-            return nextTurns;
-          })(),
+          turns: applyPiIdeTimelineEvent(session.turns, event, { makeId }),
           updated_at: event.timestamp || new Date().toISOString()
         }));
-        if (mappedSummary) forceDebugLog("timeline text mapped", mappedSummary);
         if (event.eventType === "agent_end") {
           debugLog("processing false by agent_end", { targetSessionId });
           clearSessionIdleTimer(targetSessionId);
@@ -2528,6 +2525,9 @@ export default function App() {
               onInstall={installPiCli}
               onSaveModel={savePiModelTemplate}
               onOpenDebugLog={openDebugLog}
+              onCleanCache={cleanPiIdeCache}
+              cacheCleaning={cacheCleaning}
+              cacheCleanResult={cacheCleanResult}
               onClose={() => setPiSetupOpen(false)}
             />
           ) : centerView === "session" ? (
@@ -2537,7 +2537,6 @@ export default function App() {
               runtimeStatus={activeProjectSessionId ? piSessionStatus[activeProjectSessionId] : null}
               onOpenFile={(file) => openSessionFile(file).catch((e) => setStatus(String(e)))}
               onOpenDirectory={(file) => openSessionFileDirectory(file).catch((e) => setStatus(String(e)))}
-              onDebugLog={forceDebugLog}
             />
           ) : (
             <PiTerminal

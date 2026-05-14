@@ -374,6 +374,58 @@ mod config_tests {
     let _ = fs::remove_file(&path);
     assert_eq!(value["debug"]["enabled"], true);
   }
+
+  #[test]
+  fn clear_project_cache_files_skips_invalid_directory() {
+    let mut items = Vec::new();
+    let mut skipped = Vec::new();
+    let path = env::temp_dir().join(format!("pi-ide-missing-project-{}", std::process::id()));
+    clear_project_cache_files(&path.to_string_lossy(), &mut items, &mut skipped).unwrap();
+    assert!(items.is_empty());
+    assert_eq!(skipped.len(), 1);
+  }
+
+  #[test]
+  fn clear_cache_file_truncates_existing_file() {
+    let mut items = Vec::new();
+    let path = env::temp_dir().join(format!("pi-ide-cache-file-{}.log", std::process::id()));
+    fs::write(&path, b"cache-data").unwrap();
+    clear_cache_file(&mut items, &path, "test-cache").unwrap();
+    let len = fs::metadata(&path).unwrap().len();
+    let _ = fs::remove_file(&path);
+    assert_eq!(len, 0);
+    assert_eq!(items.len(), 1);
+  }
+
+  #[test]
+  fn bridge_extension_handles_non_array_content() {
+    let path = env::temp_dir().join(format!("pi-ide-bridge-content-{}.mjs", std::process::id()));
+    let script = format!("{PI_IDE_BRIDGE_EXTENSION}\n{}", r#"
+if (textContent({ content: "plain text" }) !== "plain text") {
+  throw new Error("string message content failed");
+}
+if (textContent({ content: { type: "text", text: "object text" } }) !== "object text") {
+  throw new Error("object message content failed");
+}
+const compacted = compactToolContent("tool output");
+if (!Array.isArray(compacted.content) || compacted.content[0] !== "tool output") {
+  throw new Error("string tool content failed");
+}
+const summary = messageContentSummary({ content: "summary text" });
+if (!Array.isArray(summary) || summary[0]?.type !== "string") {
+  throw new Error("string message summary failed");
+}
+"#);
+    fs::write(&path, script).unwrap();
+    let output = Command::new("node").arg(&path).output().unwrap();
+    let _ = fs::remove_file(&path);
+    assert!(
+      output.status.success(),
+      "stdout: {}\nstderr: {}",
+      String::from_utf8_lossy(&output.stdout),
+      String::from_utf8_lossy(&output.stderr)
+    );
+  }
 }
 
 fn ensure_pi_ide_config_files(workdir: Option<&Path>, legacy_command: Option<&str>) -> Result<(PathBuf, Option<PathBuf>), String> {
@@ -1146,7 +1198,7 @@ function limitToolText(value) {
 
 function compactToolContent(content) {
   let truncated = false;
-  const next = (Array.isArray(content) ? content : []).map((item) => {
+  const next = contentItems(content).map((item) => {
     if (typeof item === "string") {
       const limited = limitToolText(item);
       truncated ||= limited.truncated;
@@ -1254,7 +1306,7 @@ function appendEvent(ctx, payload) {
 }
 
 function textContent(message) {
-  return (message?.content || []).map((item) => {
+  return contentItems(message).map((item) => {
     if (typeof item === "string") return item;
     if (item?.type === "text") return item.text || "";
     return "";
@@ -1262,9 +1314,10 @@ function textContent(message) {
 }
 
 function contentItems(value) {
-  if (Array.isArray(value?.content)) return value.content;
-  if (Array.isArray(value)) return value;
-  if (value && typeof value === "object") return [value];
+  const raw = value && typeof value === "object" && "content" in value ? value.content : value;
+  if (Array.isArray(raw)) return raw;
+  if (typeof raw === "string") return [raw];
+  if (raw && typeof raw === "object") return [raw];
   return [];
 }
 
@@ -1315,8 +1368,7 @@ function contentItemSummary(item, index) {
 }
 
 function messageContentSummary(message) {
-  const content = Array.isArray(message?.content) ? message.content : [];
-  return content.map(contentItemSummary);
+  return contentItems(message).map(contentItemSummary);
 }
 
 function compactResult(result) {
@@ -1610,7 +1662,71 @@ fn pi_ide_events_path(workdir: &Path) -> PathBuf {
   workdir.join(".pi").join("pi-ide-events.jsonl")
 }
 
-fn ensure_pi_ide_file_tracker(workdir: &Path) -> Result<(), String> {
+fn clear_file_if_oversized(path: &Path, max_bytes: u64) -> Result<(), String> {
+  if !path.exists() {
+    return Ok(());
+  }
+  let len = fs::metadata(path).map_err(|e| format!("读取事件文件大小失败 {:?}: {e}", path))?.len();
+  if len > max_bytes {
+    fs::write(path, "").map_err(|e| format!("清理过大事件文件失败 {:?}: {e}", path))?;
+  }
+  Ok(())
+}
+
+fn clear_cache_file(items: &mut Vec<serde_json::Value>, path: &Path, kind: &str) -> Result<(), String> {
+  if !path.exists() || !path.is_file() {
+    return Ok(());
+  }
+  let before = fs::metadata(path).map_err(|e| format!("读取缓存文件大小失败 {:?}: {e}", path))?.len();
+  if before == 0 {
+    return Ok(());
+  }
+  fs::write(path, b"").map_err(|e| format!("清理缓存文件失败 {:?}: {e}", path))?;
+  let after = fs::metadata(path).map_err(|e| format!("读取清理后缓存文件大小失败 {:?}: {e}", path))?.len();
+  items.push(serde_json::json!({
+    "kind": kind,
+    "path": path.to_string_lossy(),
+    "beforeBytes": before,
+    "afterBytes": after,
+    "freedBytes": before.saturating_sub(after)
+  }));
+  Ok(())
+}
+
+fn clear_project_cache_files(workdir: &str, items: &mut Vec<serde_json::Value>, skipped: &mut Vec<serde_json::Value>) -> Result<(), String> {
+  let text = workdir.trim();
+  if text.is_empty() {
+    return Ok(());
+  }
+  let dir = PathBuf::from(text);
+  if !dir.exists() || !dir.is_dir() {
+    skipped.push(serde_json::json!({
+      "path": text,
+      "reason": "项目目录不存在"
+    }));
+    return Ok(());
+  }
+  clear_cache_file(items, &pi_ide_events_path(&dir), "project-events")?;
+  clear_cache_file(items, &pi_ide_file_events_path(&dir), "project-file-events")?;
+  Ok(())
+}
+
+fn clear_terminal_cache_logs(dir: &Path, items: &mut Vec<serde_json::Value>) -> Result<(), String> {
+  if !dir.exists() {
+    return Ok(());
+  }
+  for entry in fs::read_dir(dir).map_err(|e| format!("读取会话缓存目录失败 {:?}: {e}", dir))? {
+    let path = entry.map_err(|e| format!("读取会话缓存项失败 {:?}: {e}", dir))?.path();
+    if path.is_dir() {
+      clear_terminal_cache_logs(&path, items)?;
+    } else if path.file_name().and_then(|name| name.to_str()) == Some("terminal.log") {
+      clear_cache_file(items, &path, "terminal-log")?;
+    }
+  }
+  Ok(())
+}
+
+fn ensure_pi_ide_file_tracker(workdir: &Path, project_event_max_bytes: u64) -> Result<(), String> {
   let pi_dir = workdir.join(".pi");
   let extensions_dir = pi_dir.join("extensions");
   fs::create_dir_all(&extensions_dir).map_err(|e| format!("创建 Pi IDE 扩展目录失败: {e}"))?;
@@ -1620,6 +1736,7 @@ fn ensure_pi_ide_file_tracker(workdir: &Path) -> Result<(), String> {
   if !events_path.exists() {
     fs::write(&events_path, "").map_err(|e| format!("初始化 Pi IDE 事件流失败: {e}"))?;
   }
+  clear_file_if_oversized(&events_path, project_event_max_bytes)?;
   let legacy_events_path = pi_ide_file_events_path(workdir);
   if !legacy_events_path.exists() {
     fs::write(&legacy_events_path, "").map_err(|e| format!("初始化 Pi IDE 文件事件失败: {e}"))?;
@@ -2157,8 +2274,31 @@ fn terminal_log_tail_bytes() -> u64 {
   env_u64("PI_IDE_TERMINAL_LOG_TAIL_BYTES", 1024 * 1024)
 }
 
+fn terminal_log_max_bytes() -> u64 {
+  std::env::var("PI_IDE_TERMINAL_LOG_MAX_BYTES")
+    .ok()
+    .and_then(|value| value.trim().parse::<u64>().ok())
+    .unwrap_or(DEFAULT_TERMINAL_LOG_MAX_BYTES)
+}
+
 fn terminal_log_path(session_id: &str) -> Result<PathBuf, String> {
   Ok(session_dir(session_id)?.join("terminal.log"))
+}
+
+fn trim_file_to_tail(path: &Path, max_bytes: u64) -> Result<(), String> {
+  if max_bytes == 0 || !path.exists() {
+    return Ok(());
+  }
+  let len = fs::metadata(path).map_err(|e| format!("读取文件大小失败 {:?}: {e}", path))?.len();
+  if len <= max_bytes {
+    return Ok(());
+  }
+  let mut file = fs::File::open(path).map_err(|e| format!("打开文件失败 {:?}: {e}", path))?;
+  file.seek(SeekFrom::Start(len - max_bytes))
+    .map_err(|e| format!("定位文件尾部失败 {:?}: {e}", path))?;
+  let mut bytes = Vec::new();
+  file.read_to_end(&mut bytes).map_err(|e| format!("读取文件尾部失败 {:?}: {e}", path))?;
+  fs::write(path, bytes).map_err(|e| format!("裁剪文件失败 {:?}: {e}", path))
 }
 
 fn append_terminal_log_bytes(path: &Path, data: &[u8]) -> Result<(), String> {
@@ -2174,13 +2314,21 @@ fn append_terminal_log_bytes(path: &Path, data: &[u8]) -> Result<(), String> {
     .map_err(|e| format!("鍐欏叆缁堢鏃ュ織澶辫触 {:?}: {e}", path))
 }
 
+fn append_limited_terminal_log_bytes(path: &Path, data: &[u8], max_bytes: u64) -> Result<(), String> {
+  if max_bytes == 0 {
+    return Ok(());
+  }
+  append_terminal_log_bytes(path, data)?;
+  trim_file_to_tail(path, max_bytes)
+}
+
 #[tauri::command]
 fn append_terminal_log(session_id: String, data: String) -> Result<(), String> {
   if session_id.trim().is_empty() || data.is_empty() {
     return Ok(());
   }
   let path = terminal_log_path(&session_id)?;
-  append_terminal_log_bytes(&path, data.as_bytes())
+  append_limited_terminal_log_bytes(&path, data.as_bytes(), terminal_log_max_bytes())
 }
 
 #[tauri::command]
@@ -2228,6 +2376,7 @@ async fn start_pi_session(app: tauri::AppHandle, session_id: String, pi_command:
     .filter(|s| !s.is_empty())
     .map(PathBuf::from);
   let debug_enabled = resolve_debug_logging_enabled(workdir_path.as_deref(), pi_command.as_deref())?;
+  let storage_config = resolve_storage_config(workdir_path.as_deref())?;
   append_debug_line_when(debug_enabled, &format!("[backend] start_pi_session request session_id={session_id} workdir={:?} continue={:?}", workdir, continue_session));
 
   {
@@ -2264,14 +2413,16 @@ async fn start_pi_session(app: tauri::AppHandle, session_id: String, pi_command:
   cmd.env("PI_CODING_AGENT_SESSION_DIR", session_dir.to_string_lossy().to_string());
   cmd.env("PI_IDE_SESSION_ID", session_id.clone());
   cmd.env("PI_IDE_RUN_ID", run_id.clone());
-  cmd.env("PI_IDE_EVENT_TEXT_LIMIT", "10000000");
-  cmd.env("PI_IDE_TOOL_RESULT_TEXT_LIMIT", "10000000");
+  cmd.env("PI_IDE_EVENT_MODE", storage_config.event_mode.clone());
+  cmd.env("PI_IDE_EVENT_TEXT_LIMIT", storage_config.event_text_limit.to_string());
+  cmd.env("PI_IDE_TOOL_RESULT_TEXT_LIMIT", storage_config.tool_result_text_limit.to_string());
+  cmd.env("PI_IDE_TERMINAL_LOG_MAX_BYTES", storage_config.terminal_log_max_bytes.to_string());
   for (key, value) in config_envs {
     cmd.env(key, value);
   }
 
   if let Some(dir_path) = workdir_path.as_ref() {
-    ensure_pi_ide_file_tracker(dir_path)?;
+    ensure_pi_ide_file_tracker(dir_path, storage_config.project_event_max_bytes)?;
     cmd.cwd(dir_path);
   }
 
@@ -2295,6 +2446,7 @@ async fn start_pi_session(app: tauri::AppHandle, session_id: String, pi_command:
   let out_app = app.clone();
   let out_session_id = session_id.clone();
   let out_terminal_log_path = session_dir.join("terminal.log");
+  let out_terminal_log_max_bytes = storage_config.terminal_log_max_bytes;
   let out_debug_enabled = debug_enabled;
   std::thread::spawn(move || {
     let mut buf = vec![0u8; 8192];
@@ -2309,7 +2461,7 @@ async fn start_pi_session(app: tauri::AppHandle, session_id: String, pi_command:
           break;
         }
         Ok(n) => {
-          let _ = append_terminal_log_bytes(&out_terminal_log_path, &buf[..n]);
+          let _ = append_limited_terminal_log_bytes(&out_terminal_log_path, &buf[..n], out_terminal_log_max_bytes);
           append_debug_line_when(out_debug_enabled, &format!("[backend] pi-output session_id={} bytes={}", out_session_id, n));
           let _ = out_app.emit("pi-output", serde_json::json!({
             "sessionId": out_session_id,
@@ -2453,6 +2605,38 @@ fn get_storage_paths() -> Result<serde_json::Value, String> {
   }))
 }
 
+#[tauri::command]
+fn clean_pi_ide_cache(workdirs: Option<Vec<String>>) -> Result<serde_json::Value, String> {
+  let mut items = Vec::new();
+  let mut skipped = Vec::new();
+  clear_cache_file(&mut items, &debug_log_path()?, "debug-log")?;
+  clear_terminal_cache_logs(&storage_dir()?.join("pi-sessions"), &mut items)?;
+
+  let mut seen = std::collections::HashSet::new();
+  for workdir in workdirs.unwrap_or_default() {
+    let text = workdir.trim();
+    if !text.is_empty() && seen.insert(text.to_string()) {
+      clear_project_cache_files(text, &mut items, &mut skipped)?;
+    }
+  }
+
+  if let Ok(mut offsets) = PI_EVENT_OFFSETS.lock() {
+    offsets.clear();
+  }
+
+  let before_bytes = items.iter().filter_map(|item| item.get("beforeBytes").and_then(|value| value.as_u64())).sum::<u64>();
+  let after_bytes = items.iter().filter_map(|item| item.get("afterBytes").and_then(|value| value.as_u64())).sum::<u64>();
+  Ok(serde_json::json!({
+    "filesCleared": items.len(),
+    "beforeBytes": before_bytes,
+    "afterBytes": after_bytes,
+    "freedBytes": before_bytes.saturating_sub(after_bytes),
+    "items": items,
+    "skipped": skipped,
+    "piAgentSessionsTouched": false
+  }))
+}
+
 fn read_jsonl_values(path: PathBuf) -> Result<Vec<serde_json::Value>, String> {
   if !path.exists() {
     return Ok(vec![]);
@@ -2576,6 +2760,7 @@ fn main() {
       delete_session_node,
       clear_sessions,
       get_storage_paths,
+      clean_pi_ide_cache,
       load_pi_ide_file_events,
       load_pi_ide_events
     ])
