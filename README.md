@@ -1,204 +1,176 @@
-# Pi IDE Desktop
+# pi-ide-desktop
 
-<img width="1280" height="820" alt="image" src="https://github.com/user-attachments/assets/2895085c-6c81-4d9c-8c0c-a22f1dd6d573" />
+面向 [Pi Coding Agent](https://pi.dev/) 的 Windows 桌面 IDE 容器，基于 Tauri + React + xterm.js。
 
+将 Pi CLI 包装为桌面应用，提供项目管理、会话管理、终端交互、会话视图、目录树、文件追踪等能力。
 
-这是一个给 https://pi.dev/ 的 Pi AI 开发工具准备的轻量桌面 IDE 容器。
+## 环境要求
 
-它不是替代 Pi CLI，而是把 Pi CLI 包进一个更方便的桌面界面里：
+| 依赖 | 版本要求 |
+|---|---|
+| Windows | x64 |
+| Node.js | 18+ |
+| Rust | stable |
+| Pi CLI | >= 0.74.0（`@earendil-works/pi-coding-agent`） |
 
-- 嵌入式终端输出，支持 ANSI 彩色输出。
-- 独立增强输入框，支持多行编辑、鼠标快速定位、复制粘贴、`Ctrl/⌘ + Enter` 执行。
-- 支持拖拽文件到窗口，自动把文件路径插入输入框。
-- 支持“插入文件”按钮选择文件路径。
-- 命令历史保存到本地文件。
-- 本地会话树保存到本地文件，每发送一条指令就生成一个节点。
-- 支持 Windows 和 macOS，通过 Tauri 打包。
-
-## 1. 前置环境
-
-### 必需
-
-1. Node.js 18+
-2. Rust stable
-3. pnpm 或 npm
-4. 已安装 Pi CLI，并且终端里能执行：
+安装或更新 Pi CLI：
 
 ```bash
-pi --version
+npm install -g @earendil-works/pi-coding-agent
 ```
 
-Pi IDE 要求 Pi CLI >= `0.74.0`，推荐使用官方新包名安装或更新：
+旧包 `@mariozechner/pi-coding-agent` 已不推荐使用。
 
-```bash
-npm install -g --force @earendil-works/pi-coding-agent
-```
+## 核心功能
 
-如果仍在使用旧包 `@mariozechner/pi-coding-agent`，请迁移到上面的新包。旧包路径只用于检测和提示，不作为正式启动路径。
+### Pi 终端
 
-模型配置不再由 Pi IDE 写入。点击环境设置里的“模型配置”栏会打开 `~/.pi/agent`，用户可以手动编辑 Pi 的 `models.json` / `settings.json`。
+- Tauri PTY 承载 Pi CLI，原始终端渲染（ANSI 彩色、TUI 支持）
+- 支持多行启动命令（设置环境变量后再启动 Pi）
+- xterm viewport 原生滚动条
 
-如果你的 Pi 命令不是 `pi`，可以在软件左侧的“Pi 命令”里填完整路径，例如：
+### 项目与会话
 
-```bash
-/opt/homebrew/bin/pi
-```
+- 左侧项目列表，支持添加项目目录
+- 每个项目下可创建多个 Pi 会话
+- 会话间独立的 Pi 进程，切换会话不影响其他会话
+- 会话右键菜单：重命名、归档
+- 项目右键菜单：在资源管理器打开
 
-Windows 示例：
+### 增强输入
 
-```powershell
-C:\Users\你的用户名\AppData\Roaming\npm\pi.cmd
-```
+- 底部多行输入框，`Ctrl/Cmd + Enter` 发送
+- 支持“插入文件”选择文件路径
+- 支持从系统文件管理器拖入文件
+- 支持从右侧目录树拖入文件
 
-也可以通过环境变量指定：
+### 会话视图
 
-```bash
-export PI_IDE_PI_BIN="/your/path/pi"
-```
+- 结构化展示用户消息、AI 回复、工具调用和结果
+- Markdown 渲染：表格、代码高亮、列表
+- 折叠展开工具执行详情
+- AI 参考文件 / AI 输出文件追踪
 
-## 2. 安装依赖
+### 目录树
 
-解压后进入目录：
+- 右侧懒加载项目目录树
+- 支持搜索文件或目录（文件名 / 路径匹配 + 高亮）
+- 文件双击以系统默认程序打开
+- 文件可拖动到会话框
+
+### Pi 环境设置
+
+- 点击顶部“环境设置”检测 Pi 安装状态和模型配置
+- 支持一键安装 Pi CLI
+- 显示 Pi 版本、模型数量、配置路径
+
+### Pi 文件事件追踪
+
+- IDE 启动 Pi 时自动注入项目级 extension
+- 精确追踪 Pi `read` → AI 参考文件
+- 精确追踪 Pi `write/edit` → AI 输出文件
+- bash 变更通过 git diff 检测
+
+## 快速开始
+
+### 开发运行
 
 ```bash
 cd pi-ide-desktop
-pnpm install
-```
-
-没有 pnpm 时可用：
-
-```bash
 npm install
-```
-
-## 3. 开发运行
-
-```bash
-pnpm tauri:dev
-```
-
-或：
-
-```bash
 npm run tauri:dev
 ```
 
-启动后：
-
-1. 左侧确认 `Pi 命令` 是 `pi` 或你的 Pi CLI 路径。
-2. 可选择工作目录。
-3. 点击“启动”。
-4. 在底部增强输入框输入任务。
-5. 按 `Ctrl + Enter` / `⌘ + Enter` 或点击“发送”。
-
-## 4. 打包
+### 打包
 
 ```bash
-pnpm tauri:build
+npm run package:release
 ```
 
-构建产物位置通常在：
+产物：
 
-```bash
-src-tauri/target/release/bundle/
+```text
+release/pi-ide-desktop_1.x.0_x64-setup.exe
+release/pi-ide-desktop_1.x.0_x64_en-US.msi
+release/pi-ide-desktop.exe
+release/SHA256SUMS-1.x.0.txt
 ```
 
-Windows 通常会生成 `.msi` 或 `.exe` 安装包。
-macOS 通常会生成 `.app` 或 `.dmg`。
+## 本地数据位置
 
-## 5. 本地数据位置
-
-应用会自动创建：
-
-```bash
+```text
 ~/.pi-ide/
+├─ config.json          # 全局配置
+├─ projects.json        # 项目索引
+├─ pi-sessions/         # 会话日志和终端输出
+└─ launch-scripts/      # 启动脚本
 ```
 
-包含：
+项目级配置：
 
-```bash
-~/.pi-ide/history.json
-~/.pi-ide/sessions.json
+```text
+项目目录/.pi.ide/config.json
 ```
 
-软件左侧会显示本地存储目录，并提供复制按钮。
+## 界面概览
 
-## 6. 测试清单
-
-### A. Pi 启动测试
-
-1. 打开应用。
-2. 点击“启动”。
-3. 终端区域应该显示 Pi 的启动输出或欢迎信息。
-
-如果启动失败，先在系统终端中确认：
-
-```bash
-pi --version
-pi
+```text
+┌────────────┬──────────────────────┬────────────┐
+│  项目列表   │    终端 / 会话视图    │  工具面板   │
+│            │                      │  目录树     │
+│  项目 A    │   Pi 终端输出         │  会话文件   │
+│  ├ 会话 1  │                      │            │
+│  ├ 会话 2  │                      │            │
+│  项目 B    │                      │            │
+│            ├──────────────────────┤            │
+│            │  增强输入框           │            │
+│            │  [插入文件] [发送]    │            │
+└────────────┴──────────────────────┴────────────┘
 ```
 
-### B. 输入框测试
+## 配置
 
-1. 在底部输入框输入多行文本。
-2. 用鼠标点击中间任意位置，确认光标可快速定位。
-3. 按 `Ctrl/⌘ + Enter` 执行。
-4. 终端中应该出现你发送的命令。
+全局配置 `~/.pi-ide/config.json` 和项目配置 `<project>/.pi.ide/config.json` 支持：
 
-### C. 文件拖拽测试
+| 配置项 | 说明 | 默认值 |
+|---|---|---|
+| `pi.command` | Pi 启动命令 | `pi` |
+| `pi.minVersion` | 最低 Pi 版本 | `0.74.0` |
+| `piSession.backgroundIdleStopMinutes` | 后台空闲自动关闭 | `5` |
+| `debug.enabled` | 调试日志开关 | `false` |
+| `directoryTree.initialDepth` | 初始加载深度 | `0` |
+| `directoryTree.maxEntriesPerDirectory` | 单层最大条目 | `160` |
+| `storage.terminalPreviewChars` | 终端预览长度 | `256KB` |
 
-1. 从 Finder / Windows Explorer 拖一个文件到应用窗口。
-2. 输入框中应该插入文件路径。
-3. 也可以点击“插入文件”按钮选择文件。
-
-### D. 命令历史测试
-
-1. 连续发送几条命令。
-2. 右侧“命令历史”应出现记录。
-3. 点击历史项，命令会回填到底部输入框。
-4. 关闭并重新打开应用，历史仍应存在。
-
-### E. 会话树测试
-
-1. 发送第一条命令，会生成根节点。
-2. 点击某个会话节点，再发送新命令，会在该节点下生成子节点。
-3. 点击顶部“发送 /tree”，会把 `/tree` 发送给 Pi CLI，同时本地会话树也会保存这个动作。
-4. 关闭并重新打开应用，会话树仍应存在。
-
-### F. 清空测试
-
-点击顶部“清空历史/会话”，确认：
-
-- 右侧历史为空。
-- 右侧会话树为空。
-- `~/.pi-ide/history.json` 与 `~/.pi-ide/sessions.json` 被清空为 `[]`。
-
-## 7. 已知限制
-
-- 这个版本是轻量 MVP，核心目标是把 Pi CLI 包进桌面 IDE 容器。
-- 文件拖拽路径在部分浏览器/WebView 安全策略下可能只返回文件名；此时请使用“插入文件”按钮，它通过 Tauri 原生文件对话框获取完整路径。
-- 会话树是本地辅助树，不等同于 Pi 内部的完整对话树；`/tree` 按钮会把 Pi 自己的 `/tree` 指令发送给 CLI。
-- 目前没有内置自动安装 Pi CLI，需要你先按 pi.dev 的方式安装 Pi。
-
-## 8. 目录结构
+## 目录结构
 
 ```text
 pi-ide-desktop/
 ├─ src/
-│  ├─ App.jsx
-│  ├─ main.jsx
-│  ├─ styles.css
+│  ├─ App.jsx                         # 主应用
+│  ├─ main.jsx                        # 入口
+│  ├─ styles.css                      # 样式
+│  ├─ projectStorageModel.js          # 项目存储模型
+│  ├─ sessionTimelineModel.js         # 会话视图模型
+│  ├─ sessionMarkdownTableModel.js    # 表格解析
+│  ├─ piIdeEventMapper.js             # Pi 事件映射
 │  └─ components/
-│     ├─ PiTerminal.jsx
-│     ├─ HistoryPanel.jsx
-│     └─ SessionTree.jsx
+│     ├─ PiTerminal.jsx               # 嵌入式终端
+│     ├─ SessionTimeline.jsx          # 会话视图
+│     └─ AppErrorBoundary.jsx         # 错误边界
 ├─ src-tauri/
 │  ├─ Cargo.toml
 │  ├─ tauri.conf.json
-│  ├─ build.rs
-│  ├─ capabilities/default.json
-│  └─ src/main.rs
+│  └─ src/main.rs                     # Tauri 后端
 ├─ package.json
 ├─ vite.config.js
-└─ README.md
+└─ scripts/
+   └─ package-release.ps1             # Windows 打包脚本
 ```
+
+## 已知限制
+
+- 仅支持 Windows x64
+- 若启动参数含 `--no-extensions`，文件精确追踪不生效
+- `bash` 内部文件读写无法像 `read/write/edit` 一样 100% 结构化确认
+- 当前中央区域以终端和会话视图切换为主，尚未实现完整结构化消息流
