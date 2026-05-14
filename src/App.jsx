@@ -951,7 +951,6 @@ export default function App() {
   const [directoryTreeLoading, setDirectoryTreeLoading] = useState(false);
   const [directoryTreeError, setDirectoryTreeError] = useState("");
   const [workdir, setWorkdir] = useState(localStorage.getItem("workdir") || "");
-  const [debugLogEnabled, setDebugLogEnabled] = useState(false);
   const [piEnvironment, setPiEnvironment] = useState(null);
   const [piEnvironmentChecking, setPiEnvironmentChecking] = useState(false);
   const [piSetupOpen, setPiSetupOpen] = useState(false);
@@ -1002,30 +1001,6 @@ export default function App() {
   const piEnvironmentReady = Boolean(piEnvironment?.ready);
   const showPiSetupPanel = piSetupOpen || (piEnvironment && !piEnvironment.ready);
 
-  useEffect(() => {
-    const projectPath = activeProject?.path || workdir || "";
-    let cancelled = false;
-    const timer = window.setTimeout(() => {
-      invoke("ensure_pi_ide_config", { workdir: projectPath || null, legacyCommand: legacyPiCommandRef.current }).then((config) => {
-        if (cancelled) return;
-        const enabled = Boolean(config?.debugEnabled ?? config?.enabled);
-        backgroundPiIdleStopMinutesRef.current = normalizeBackgroundPiIdleStopMinutes(config?.backgroundIdleStopMinutes);
-        setDebugLogEnabled(enabled);
-        setDebugLogContext({ enabled, workdir: projectPath });
-      }).catch(() => {
-        if (cancelled) return;
-        backgroundPiIdleStopMinutesRef.current = DEFAULT_BACKGROUND_PI_IDLE_STOP_MINUTES;
-        setDebugLogEnabled(false);
-        setDebugLogContext({ enabled: false, workdir: projectPath });
-        forceDebugLog("ensure pi ide config failed", { projectPath });
-      });
-    }, 800);
-    return () => {
-      cancelled = true;
-      window.clearTimeout(timer);
-    };
-  }, [activeProject?.path, workdir]);
-
   function replayTerminalTail(sessionId, fallbackOutput = "") {
     const fallback = String(fallbackOutput || "");
     setTerminalReplayContent(fallback);
@@ -1037,7 +1012,6 @@ export default function App() {
       if (nextContent === fallback) return;
       setTerminalReplayContent(nextContent);
       setTerminalReplaySignal((value) => value + 1);
-      debugLog("terminal replay tail loaded", { sessionId, bytes: nextContent.length });
     }).catch(() => {});
   }
 
@@ -1155,7 +1129,6 @@ export default function App() {
   async function openDebugLog() {
     try {
       const path = await invoke("get_debug_log_path");
-      debugLog("open debug log", { path });
       await invoke("open_path_in_file_manager", { path });
       setStatus(`已打开调试日志目录：${path}`);
     } catch (error) {
@@ -1311,7 +1284,6 @@ export default function App() {
 
   function setSessionRuntimeStatus(sessionId, patch) {
     if (!sessionId) return;
-    debugLog("setSessionRuntimeStatus", { sessionId, patch });
     const next = {
       ...piSessionStatusRef.current,
       [sessionId]: { ...(piSessionStatusRef.current[sessionId] || {}), ...patch }
@@ -1518,20 +1490,17 @@ export default function App() {
           setStatus(`已切换模型：${formatModelInfo(event.model)}`);
         } else {
           setStatus(`模型切换失败：${event.error || "未知错误"}`);
-          debugLog("model switch failed", { targetSessionId, error: event.error, requested: event.requested });
         }
         continue;
       }
 
       if (event.kind === "model_error") {
         setStatus(`模型列表获取失败：${event.error || "未知错误"}`);
-        debugLog("model list failed", { targetSessionId, error: event.error });
         continue;
       }
 
       if (event.kind === "timeline") {
         touchPiSessionActivity(targetSessionId);
-        debugLog("timeline event", { targetSessionId, eventType: event.eventType, eventRunId, runtimeRunId: runtime.runId });
         if (event.model) updateSessionModel(targetSessionId, event.model);
         const failedEvent = event.eventType === "extension_error" || (event.eventType === "auto_retry_end" && event.success === false);
         if (event.eventType === "agent_start") {
@@ -1544,13 +1513,11 @@ export default function App() {
           updated_at: event.timestamp || new Date().toISOString()
         }));
         if (event.eventType === "agent_end") {
-          debugLog("processing false by agent_end", { targetSessionId });
           clearSessionIdleTimer(targetSessionId);
           setSessionRuntimeStatus(targetSessionId, { processing: false });
           markLatestTurnStatus(targetSessionId, "completed");
         }
         if (failedEvent) {
-          debugLog("processing false by failed timeline event", { targetSessionId, eventType: event.eventType });
           clearSessionIdleTimer(targetSessionId);
           setSessionRuntimeStatus(targetSessionId, { processing: false });
           markLatestTurnStatus(targetSessionId, "failed", event.error || event.finalError || event.errorMessage || "Pi 执行失败");
@@ -1600,7 +1567,6 @@ export default function App() {
 
   function appendOutputToSession(sessionId, data) {
     if (!sessionId || !data) return;
-    debugLog("appendOutputToSession", { sessionId, bytes: data.length, active: activeProjectSessionIdRef.current });
     const now = new Date().toISOString();
     let changed = false;
     const nextProjects = projectsRef.current.map((project) => ({
@@ -1696,9 +1662,7 @@ export default function App() {
       activeProjectId: activeProjectIdRef.current,
       activeProjectSessionId: activeProjectSessionIdRef.current
     });
-    debugLog("app mounted");
     listen("pi-status", (event) => {
-      debugLog("pi-status event", event.payload);
       const payload = event.payload;
       const sessionId = payload && typeof payload === "object" ? (payload.sessionId || payload.session_id) : null;
       const text = payload && typeof payload === "object" ? String(payload.status || "") : String(payload || "");
@@ -1739,13 +1703,11 @@ export default function App() {
       if (!sessionId || !piSessionStatusRef.current[sessionId]?.processing) return;
       clearSessionIdleTimer(sessionId);
       if (data.includes("[PTY 读取错误]") || data.includes("Pi 已停止") || data.includes("Pi 已退出")) {
-        debugLog("processing false by terminal error", { sessionId });
         setSessionRuntimeStatus(sessionId, { processing: false });
         markLatestTurnStatus(sessionId, "failed", data);
         return;
       }
       outputIdleTimersRef.current[sessionId] = setTimeout(() => {
-        debugLog("processing false by idle fallback", { sessionId });
         setSessionRuntimeStatus(sessionId, { processing: false });
         markLatestTurnStatus(sessionId, "completed");
         delete outputIdleTimersRef.current[sessionId];
@@ -1973,12 +1935,10 @@ export default function App() {
   }
 
   function selectProjectSession(projectId, sessionId, options = {}) {
-    debugLog("selectProjectSession enter", { projectId, sessionId, current: activeProjectSessionIdRef.current, options });
     persistCurrentSessionOutput();
     const project = projectsRef.current.find((p) => p.id === projectId);
     const session = project?.sessions?.find((s) => s.id === sessionId);
     if (!project || !session) {
-      debugLog("selectProjectSession missing", { projectId, sessionId });
       return null;
     }
     const sameSession = sessionId === activeProjectSessionIdRef.current;
@@ -2005,13 +1965,11 @@ export default function App() {
       setTerminalReplaySignal((value) => value + 1);
       debugLog("selectProjectSession skip replay", { sessionId, outputBytes: (session.output || "").length });
     } else {
-      debugLog("selectProjectSession same session no replay", { sessionId });
     }
     return { project, session };
   }
 
   async function activateProjectSession(projectId, sessionId) {
-    debugLog("activateProjectSession enter", { projectId, sessionId, status: piSessionStatusRef.current[sessionId] });
     const selected = selectProjectSession(projectId, sessionId);
     if (!selected?.project || !selected?.session) return;
     scheduleSessionWarmup(sessionId, selected.project.path, selected.session);
@@ -2059,7 +2017,6 @@ export default function App() {
   }
 
   async function startPi(options = {}) {
-    debugLog("startPi enter", { options, active: activeProjectSessionIdRef.current, status: piSessionStatusRef.current[options.sessionId || activeProjectSessionIdRef.current] });
     let runWorkdir = options.workdir || activeProject?.path || workdir;
     let sessionId = options.sessionId || activeProjectSessionIdRef.current;
 
@@ -2077,11 +2034,9 @@ export default function App() {
     if (!sessionId) throw new Error("请先选择或创建一个会话");
     await ensurePiEnvironmentReady(runWorkdir);
     if (piSessionStatusRef.current[sessionId]?.running) {
-      debugLog("startPi skip running", { sessionId });
       return;
     }
     if (startingSessionsRef.current.has(sessionId)) {
-      debugLog("startPi skip starting", { sessionId });
       return;
     }
     const { session } = getSessionById(sessionId);
@@ -2092,9 +2047,7 @@ export default function App() {
     startingSessionsRef.current.add(sessionId);
     setSessionRuntimeStatus(sessionId, { starting: true, runId: null, status: "Pi 启动中" });
     try {
-      debugLog("startPi invoke", { sessionId, workdir: runWorkdir, continueSession });
       await invoke("start_pi_session", { sessionId, piCommand: legacyPiCommandRef.current, workdir: runWorkdir, continueSession });
-      debugLog("startPi done", { sessionId });
       touchPiSessionActivity(sessionId, { running: true, starting: false, processing: false, status: "Pi 已启动" });
       flushPendingPiInputs(sessionId).catch((error) => {
         debugLog("flush pending inputs after start failed", { sessionId, error: String(error) });
@@ -2147,7 +2100,6 @@ export default function App() {
 
   async function ensureActivePiRunning() {
     const sessionId = activeProjectSessionIdRef.current;
-    debugLog("ensureActivePiRunning", { sessionId, status: piSessionStatusRef.current[sessionId] });
     if (!sessionId) throw new Error("请先选择或创建一个会话");
     if (!piSessionStatusRef.current[sessionId]?.running) {
       const { project, session } = getSessionById(sessionId);
@@ -2510,9 +2462,7 @@ export default function App() {
           </div>
           <button className={piEnvironmentReady ? "" : "danger"} onClick={() => setPiSetupOpen((value) => !value)} title="检查和配置 Pi 环境">
             <Settings size={15}/> 环境设置
-          </button>
-          {debugLogEnabled && <button onClick={openDebugLog} title="打开调试日志所在目录"><FileText size={15}/> 调试日志</button>}
-        </header>
+          </button>        </header>
         <div className="center-view-wrap">
           {showPiSetupPanel ? (
             <PiSetupPanel
@@ -2543,10 +2493,7 @@ export default function App() {
               activeSessionId={activeProjectSessionId}
               clearSignal={clearTerminalSignal}
               replaySignal={terminalReplaySignal}
-              replayContent={terminalReplayContent}
-              debugEnabled={debugLogEnabled}
-              debugWorkdir={activeProject?.path || workdir}
-              onTerminalInput={handleTerminalInput}
+              replayContent={terminalReplayContent}              onTerminalInput={handleTerminalInput}
             />
           )}
         </div>

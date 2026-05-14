@@ -16,13 +16,7 @@ function terminalScrollbackLimit() {
   return configuredPositiveNumber(TERMINAL_SCROLLBACK_STORAGE_KEY, DEFAULT_TERMINAL_SCROLLBACK);
 }
 
-function debugLog(enabled, workdir, message, data = undefined) {
-  if (!enabled) return;
-  const suffix = data === undefined ? "" : ` ${JSON.stringify(data)}`;
-  invoke("append_debug_log", { source: "terminal", message: `${message}${suffix}`, workdir: workdir || null }).catch(() => {});
-}
-
-export default function PiTerminal({ activeSessionId, clearSignal, replaySignal = 0, replayContent = "", debugEnabled = false, debugWorkdir = "", onTerminalInput }) {
+export default function PiTerminal({ activeSessionId, clearSignal, replaySignal = 0, replayContent = "", onTerminalInput }) {
   const hostRef = useRef(null);
   const terminalRef = useRef(null);
   const fitRef = useRef(null);
@@ -32,14 +26,6 @@ export default function PiTerminal({ activeSessionId, clearSignal, replaySignal 
   const isReplayingRef = useRef(false);
   const activeSessionIdRef = useRef(activeSessionId);
   const onTerminalInputRef = useRef(onTerminalInput);
-  const debugEnabledRef = useRef(debugEnabled);
-  const debugWorkdirRef = useRef(debugWorkdir);
-  const logDebug = (message, data) => debugLog(debugEnabledRef.current, debugWorkdirRef.current, message, data);
-
-  useEffect(() => {
-    debugEnabledRef.current = debugEnabled;
-    debugWorkdirRef.current = debugWorkdir;
-  }, [debugEnabled, debugWorkdir]);
 
   useEffect(() => {
     activeSessionIdRef.current = activeSessionId;
@@ -53,7 +39,6 @@ export default function PiTerminal({ activeSessionId, clearSignal, replaySignal 
     const host = hostRef.current;
     if (!host) return;
 
-    logDebug("PiTerminal mount", { activeSessionId: activeSessionIdRef.current });
     const term = new Terminal({
       cursorBlink: true,
       convertEol: false,
