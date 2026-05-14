@@ -694,6 +694,11 @@ function PiSetupPanel({
   const issues = Array.isArray(environment?.issues) ? environment.issues : [];
   const modelConfigPath = environment?.modelsConfig || "";
   const command = environment?.command || DEFAULT_COMMAND;
+  const installed = Boolean(environment?.installed);
+  const versionOk = Boolean(environment?.versionOk);
+  const packageOk = environment?.packageOk !== false;
+  const minVersion = environment?.minVersion || "0.74.0";
+  const activePackage = environment?.package?.activePackage || environment?.packageName || "";
 
   function updateDraft(patch) {
     onModelDraftChange({ ...modelDraft, ...patch });
@@ -715,10 +720,10 @@ function PiSetupPanel({
         </div>
 
         <div className="pi-setup-status-grid">
-          <div className={`pi-setup-status ${environment?.installed ? "ok" : "danger"}`}>
+          <div className={`pi-setup-status ${installed && versionOk && packageOk ? "ok" : "danger"}`}>
             <strong>Pi CLI</strong>
             <span>{environment?.installed ? environment?.version || "已安装" : "未检测到"}</span>
-            <small>{command}</small>
+            <small>{activePackage ? `${command} · ${activePackage}` : command} · 最低 {minVersion}</small>
           </div>
           <div className={`pi-setup-status ${environment?.hasModels || environment?.hasAuth ? "ok" : "danger"}`}>
             <strong>模型配置</strong>
@@ -998,6 +1003,9 @@ export default function App() {
     [activeRuntimeModel, activePendingModel, activeProjectSession?.current_model]
   );
   const activeModelPending = Boolean(activePendingModel && !activeRuntimeModel);
+  const piVersionLabel = piEnvironment?.version
+    ? `Pi ${piEnvironment.version}`
+    : `Pi >= ${piEnvironment?.minVersion || "0.74.0"}`;
   const piEnvironmentReady = Boolean(piEnvironment?.ready);
   const showPiSetupPanel = piSetupOpen || (piEnvironment && !piEnvironment.ready);
 
@@ -2520,7 +2528,7 @@ export default function App() {
             placeholder={'输入 Pi 指令或自然语言任务。例如：帮我分析这个文件 "/path/to/file"'}
           />
           <div className="composer-actions">
-            <span>当前项目：{activeProject?.name || "未选择"} / 会话：{activeProjectSession?.title || "未选择"}</span>
+            <span>当前项目：{activeProject?.name || "未选择"} / 会话：{activeProjectSession?.title || "未选择"} / {piVersionLabel}</span>
             <div className="composer-action-buttons">
               <div className="model-picker">
                 <button className="model-picker-button" onClick={() => toggleModelMenu().catch((e) => setStatus(String(e)))} title="切换当前 Pi 会话模型">

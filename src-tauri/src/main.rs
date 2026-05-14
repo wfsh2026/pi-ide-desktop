@@ -81,6 +81,9 @@ const DEFAULT_EVENT_TEXT_LIMIT: u64 = 50 * 1024;
 const DEFAULT_TOOL_RESULT_TEXT_LIMIT: u64 = 50 * 1024;
 const DEFAULT_PROJECT_EVENT_MAX_BYTES: u64 = 5 * 1024 * 1024;
 const DEFAULT_TERMINAL_LOG_MAX_BYTES: u64 = 2 * 1024 * 1024;
+const PI_PACKAGE_NAME: &str = "@earendil-works/pi-coding-agent";
+const PI_LEGACY_PACKAGE_NAME: &str = "@mariozechner/pi-coding-agent";
+const DEFAULT_MIN_PI_VERSION: &str = "0.74.0";
 
 #[derive(Clone)]
 struct StorageConfig {
@@ -89,6 +92,19 @@ struct StorageConfig {
   project_event_max_bytes: u64,
   terminal_log_max_bytes: u64,
   event_mode: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct PiSemver {
+  major: u64,
+  minor: u64,
+  patch: u64,
+}
+
+impl std::fmt::Display for PiSemver {
+  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(formatter, "{}.{}.{}", self.major, self.minor, self.patch)
+  }
 }
 
 fn storage_dir() -> Result<PathBuf, String> {
@@ -149,7 +165,10 @@ fn default_global_config(command: &str) -> serde_json::Value {
     "version": 1,
     "pi": {
       "command": command,
-      "env": {}
+      "env": {},
+      "minVersion": DEFAULT_MIN_PI_VERSION,
+      "packageName": PI_PACKAGE_NAME,
+      "legacyPackageNames": [PI_LEGACY_PACKAGE_NAME]
     },
     "debug": {
       "enabled": false
@@ -178,7 +197,10 @@ fn default_project_config() -> serde_json::Value {
     "version": 1,
     "pi": {
       "command": "",
-      "env": {}
+      "env": {},
+      "minVersion": DEFAULT_MIN_PI_VERSION,
+      "packageName": PI_PACKAGE_NAME,
+      "legacyPackageNames": [PI_LEGACY_PACKAGE_NAME]
     },
     "debug": {
       "enabled": false
@@ -237,6 +259,60 @@ fn ensure_debug_config(value: &mut serde_json::Value) -> bool {
     return true;
   }
   false
+}
+
+fn ensure_pi_config(value: &mut serde_json::Value, default_command: &str) -> bool {
+  let Some(map) = value.as_object_mut() else {
+    return false;
+  };
+  let default_value = serde_json::json!({
+    "command": default_command,
+    "env": {},
+    "minVersion": DEFAULT_MIN_PI_VERSION,
+    "packageName": PI_PACKAGE_NAME,
+    "legacyPackageNames": [PI_LEGACY_PACKAGE_NAME]
+  });
+  let Some(pi) = map.get_mut("pi") else {
+    map.insert("pi".to_string(), default_value);
+    return true;
+  };
+  let Some(pi_map) = pi.as_object_mut() else {
+    *pi = default_value;
+    return true;
+  };
+
+  let mut changed = false;
+  if !matches!(pi_map.get("command"), Some(value) if value.as_str().is_some()) {
+    pi_map.insert("command".to_string(), serde_json::json!(default_command));
+    changed = true;
+  }
+  if !matches!(pi_map.get("env"), Some(value) if value.is_object()) {
+    pi_map.insert("env".to_string(), serde_json::json!({}));
+    changed = true;
+  }
+  let default_min_version = extract_semver(DEFAULT_MIN_PI_VERSION).unwrap();
+  let valid_min_version = pi_map
+    .get("minVersion")
+    .and_then(|value| value.as_str())
+    .and_then(extract_semver)
+    .is_some_and(|value| value >= default_min_version);
+  if !valid_min_version {
+    pi_map.insert("minVersion".to_string(), serde_json::json!(DEFAULT_MIN_PI_VERSION));
+    changed = true;
+  }
+  if !matches!(pi_map.get("packageName").and_then(|value| value.as_str()), Some(value) if value == PI_PACKAGE_NAME) {
+    pi_map.insert("packageName".to_string(), serde_json::json!(PI_PACKAGE_NAME));
+    changed = true;
+  }
+  let valid_legacy_names = pi_map
+    .get("legacyPackageNames")
+    .and_then(|value| value.as_array())
+    .is_some_and(|items| items.iter().any(|item| item.as_str() == Some(PI_LEGACY_PACKAGE_NAME)));
+  if !valid_legacy_names {
+    pi_map.insert("legacyPackageNames".to_string(), serde_json::json!([PI_LEGACY_PACKAGE_NAME]));
+    changed = true;
+  }
+  changed
 }
 
 fn ensure_directory_tree_config(value: &mut serde_json::Value) -> bool {
@@ -347,15 +423,22 @@ fn ensure_config_file_defaults(path: &Path, default_value: serde_json::Value) ->
     write_json_value(path, &default_value)?;
     return Ok(());
   }
+  let default_command = default_value
+    .get("pi")
+    .and_then(|pi| pi.get("command"))
+    .and_then(|command| command.as_str())
+    .unwrap_or("pi")
+    .to_string();
   let Some(mut value) = read_json_value(path)? else {
     write_json_value(path, &default_value)?;
     return Ok(());
   };
+  let pi_changed = ensure_pi_config(&mut value, &default_command);
   let debug_changed = ensure_debug_config(&mut value);
   let directory_tree_changed = ensure_directory_tree_config(&mut value);
   let pi_session_changed = ensure_pi_session_config(&mut value);
   let storage_changed = ensure_storage_config(&mut value);
-  let changed = debug_changed || directory_tree_changed || pi_session_changed || storage_changed;
+  let changed = pi_changed || debug_changed || directory_tree_changed || pi_session_changed || storage_changed;
   if changed {
     write_json_value(path, &value)?;
   }
@@ -373,6 +456,43 @@ mod config_tests {
     let value = read_json_value(&path).unwrap().unwrap();
     let _ = fs::remove_file(&path);
     assert_eq!(value["debug"]["enabled"], true);
+  }
+
+  #[test]
+  fn extract_semver_accepts_pi_version_output() {
+    assert_eq!(extract_semver("pi 0.74.0").unwrap().to_string(), "0.74.0");
+    assert_eq!(extract_semver("0.75.1\n").unwrap().to_string(), "0.75.1");
+    assert!(extract_semver("version unknown").is_none());
+  }
+
+  #[test]
+  fn version_meets_configured_minimum() {
+    assert_eq!(version_meets_min(Some("pi 0.74.0"), "0.74.0"), Some(true));
+    assert_eq!(version_meets_min(Some("pi 0.73.1"), "0.74.0"), Some(false));
+    assert_eq!(version_meets_min(Some("pi 0.75.0"), "0.74.0"), Some(true));
+    assert_eq!(version_meets_min(Some("unknown"), "0.74.0"), None);
+  }
+
+  #[test]
+  fn ensure_config_file_defaults_adds_pi_policy() {
+    let path = env::temp_dir().join(format!("pi-ide-config-policy-{}.json", std::process::id()));
+    fs::write(&path, r#"{"version":1,"pi":{"command":"pi","env":{}}}"#).unwrap();
+    ensure_config_file_defaults(&path, default_global_config("pi")).unwrap();
+    let value = read_json_value(&path).unwrap().unwrap();
+    let _ = fs::remove_file(&path);
+    assert_eq!(value["pi"]["minVersion"], DEFAULT_MIN_PI_VERSION);
+    assert_eq!(value["pi"]["packageName"], PI_PACKAGE_NAME);
+    assert_eq!(value["pi"]["legacyPackageNames"][0], PI_LEGACY_PACKAGE_NAME);
+  }
+
+  #[test]
+  fn ensure_config_file_defaults_does_not_allow_lower_min_pi_version() {
+    let path = env::temp_dir().join(format!("pi-ide-config-min-version-{}.json", std::process::id()));
+    fs::write(&path, r#"{"version":1,"pi":{"command":"pi","env":{},"minVersion":"0.73.1"}}"#).unwrap();
+    ensure_config_file_defaults(&path, default_global_config("pi")).unwrap();
+    let value = read_json_value(&path).unwrap().unwrap();
+    let _ = fs::remove_file(&path);
+    assert_eq!(value["pi"]["minVersion"], DEFAULT_MIN_PI_VERSION);
   }
 
   #[test]
@@ -473,6 +593,16 @@ fn config_env(value: Option<&serde_json::Value>) -> HashMap<String, String> {
     }
   }
   envs
+}
+
+fn config_pi_min_version(value: Option<&serde_json::Value>) -> Option<String> {
+  value
+    .and_then(|v| v.get("pi"))
+    .and_then(|pi| pi.get("minVersion"))
+    .and_then(|min_version| min_version.as_str())
+    .map(str::trim)
+    .filter(|value| extract_semver(value).is_some())
+    .map(ToString::to_string)
 }
 
 fn config_debug_enabled(value: Option<&serde_json::Value>) -> Option<bool> {
@@ -644,6 +774,21 @@ fn resolve_pi_launch_config(workdir: Option<&Path>, legacy_command: Option<&str>
   })))
 }
 
+fn resolve_min_pi_version(workdir: Option<&Path>, legacy_command: Option<&str>) -> Result<String, String> {
+  let (global_path, project_path) = ensure_pi_ide_config_files(workdir, legacy_command)?;
+  let global_config = read_json_value(&global_path)?;
+  let project_config = match &project_path {
+    Some(path) => read_json_value(path)?,
+    None => None,
+  };
+  let configured = config_pi_min_version(project_config.as_ref())
+    .or_else(|| config_pi_min_version(global_config.as_ref()))
+    .unwrap_or_else(|| DEFAULT_MIN_PI_VERSION.to_string());
+  let default_min = extract_semver(DEFAULT_MIN_PI_VERSION).unwrap();
+  let configured_min = extract_semver(&configured).unwrap_or(default_min);
+  Ok(if configured_min < default_min { DEFAULT_MIN_PI_VERSION.to_string() } else { configured })
+}
+
 #[tauri::command]
 fn ensure_pi_ide_config(workdir: Option<String>, legacy_command: Option<String>) -> Result<serde_json::Value, String> {
   let workdir_path = workdir
@@ -663,6 +808,9 @@ fn ensure_pi_ide_config(workdir: Option<String>, legacy_command: Option<String>)
   let background_idle_stop_minutes = config_background_idle_stop_minutes(project_config.as_ref())
     .or_else(|| config_background_idle_stop_minutes(global_config.as_ref()))
     .unwrap_or(DEFAULT_BACKGROUND_PI_IDLE_STOP_MINUTES);
+  let min_pi_version = config_pi_min_version(project_config.as_ref())
+    .or_else(|| config_pi_min_version(global_config.as_ref()))
+    .unwrap_or_else(|| DEFAULT_MIN_PI_VERSION.to_string());
   let mut storage_config = StorageConfig {
     event_text_limit: DEFAULT_EVENT_TEXT_LIMIT,
     tool_result_text_limit: DEFAULT_TOOL_RESULT_TEXT_LIMIT,
@@ -674,6 +822,9 @@ fn ensure_pi_ide_config(workdir: Option<String>, legacy_command: Option<String>)
   apply_storage_config(project_config.as_ref(), &mut storage_config);
   Ok(serde_json::json!({
     "debugEnabled": debug_enabled,
+    "minPiVersion": min_pi_version,
+    "piPackageName": PI_PACKAGE_NAME,
+    "piLegacyPackageName": PI_LEGACY_PACKAGE_NAME,
     "backgroundIdleStopMinutes": background_idle_stop_minutes,
     "storage": {
       "eventMode": storage_config.event_mode,
@@ -805,6 +956,39 @@ fn json_file_has_content(path: &Path) -> bool {
   }
 }
 
+fn parse_semver_candidate(candidate: &str) -> Option<PiSemver> {
+  let mut parts = candidate.split('.');
+  let major = parts.next()?.parse::<u64>().ok()?;
+  let minor = parts.next()?.parse::<u64>().ok()?;
+  let patch = parts.next()?.parse::<u64>().ok()?;
+  Some(PiSemver { major, minor, patch })
+}
+
+fn extract_semver(text: &str) -> Option<PiSemver> {
+  let bytes = text.as_bytes();
+  let mut index = 0;
+  while index < bytes.len() {
+    if !bytes[index].is_ascii_digit() {
+      index += 1;
+      continue;
+    }
+    let start = index;
+    while index < bytes.len() && (bytes[index].is_ascii_digit() || bytes[index] == b'.') {
+      index += 1;
+    }
+    if let Some(version) = parse_semver_candidate(&text[start..index]) {
+      return Some(version);
+    }
+  }
+  None
+}
+
+fn version_meets_min(version_text: Option<&str>, min_version: &str) -> Option<bool> {
+  let version = version_text.and_then(extract_semver)?;
+  let min = extract_semver(min_version).unwrap_or_else(|| extract_semver(DEFAULT_MIN_PI_VERSION).unwrap());
+  Some(version >= min)
+}
+
 #[cfg(windows)]
 fn is_windows_batch_command(path: &Path) -> bool {
   path.extension()
@@ -896,7 +1080,13 @@ fn check_pi_version(command_text: &str, envs: &HashMap<String, String>) -> (bool
     Ok(output) if output.status.success() => {
       let stdout = String::from_utf8_lossy(&output.stdout);
       let stderr = String::from_utf8_lossy(&output.stderr);
-      let text = stdout.lines().chain(stderr.lines()).find(|line| !line.trim().is_empty()).unwrap_or("").trim().to_string();
+      let text = stdout.lines()
+        .chain(stderr.lines())
+        .find(|line| extract_semver(line).is_some())
+        .or_else(|| stdout.lines().chain(stderr.lines()).find(|line| !line.trim().is_empty()))
+        .unwrap_or("")
+        .trim()
+        .to_string();
       (true, (!text.is_empty()).then_some(text), None)
     }
     Ok(output) => {
@@ -909,6 +1099,40 @@ fn check_pi_version(command_text: &str, envs: &HashMap<String, String>) -> (bool
   }
 }
 
+fn package_detection_json(detection: &PiPackageDetection) -> serde_json::Value {
+  serde_json::json!({
+    "activePackage": detection.active_package.as_deref(),
+    "activePackagePath": detection.active_package_path.as_ref().map(|path| path.to_string_lossy().to_string()),
+    "legacyPackageDetected": detection.legacy_package_path.is_some(),
+    "legacyPackagePath": detection.legacy_package_path.as_ref().map(|path| path.to_string_lossy().to_string())
+  })
+}
+
+fn pi_version_error(version: Option<&str>, min_version: &str) -> String {
+  match version {
+    Some(raw) if extract_semver(raw).is_some() => format!("Pi CLI 版本过低：当前 {raw}，最低需要 {min_version}。请运行 npm install -g {PI_PACKAGE_NAME}"),
+    Some(raw) => format!("无法识别 Pi CLI 版本：{raw}。最低需要 {min_version}，请运行 npm install -g {PI_PACKAGE_NAME}"),
+    None => format!("无法读取 Pi CLI 版本。最低需要 {min_version}，请运行 npm install -g {PI_PACKAGE_NAME}"),
+  }
+}
+
+fn assert_pi_runtime_supported(command_text: &str, envs: &HashMap<String, String>, min_version: &str) -> Result<(String, PiPackageDetection), String> {
+  let (installed, version, command_error) = check_pi_version(command_text, envs);
+  if !installed {
+    return Err(command_error.unwrap_or_else(|| "未找到可用 Pi CLI".to_string()));
+  }
+  let detection = detect_pi_package(command_text);
+  if detection.uses_legacy_package() {
+    return Err(format!(
+      "当前 Pi CLI 指向旧包 {PI_LEGACY_PACKAGE_NAME}，请迁移到 {PI_PACKAGE_NAME}：npm install -g {PI_PACKAGE_NAME}"
+    ));
+  }
+  if version_meets_min(version.as_deref(), min_version) != Some(true) {
+    return Err(pi_version_error(version.as_deref(), min_version));
+  }
+  Ok((version.unwrap_or_else(|| min_version.to_string()), detection))
+}
+
 #[tauri::command]
 fn check_pi_environment(workdir: Option<String>, legacy_command: Option<String>) -> Result<serde_json::Value, String> {
   let workdir_path = workdir
@@ -917,7 +1141,12 @@ fn check_pi_environment(workdir: Option<String>, legacy_command: Option<String>)
     .filter(|s| !s.is_empty())
     .map(PathBuf::from);
   let (command_text, envs, config_info) = resolve_pi_launch_config(workdir_path.as_deref(), legacy_command.as_deref())?;
+  let min_version = resolve_min_pi_version(workdir_path.as_deref(), legacy_command.as_deref())?;
   let (installed, version, command_error) = check_pi_version(&command_text, &envs);
+  let package_detection = detect_pi_package(&command_text);
+  let parsed_version = version.as_deref().and_then(extract_semver).map(|value| value.to_string());
+  let version_ok = installed && version_meets_min(version.as_deref(), &min_version) == Some(true);
+  let package_ok = !package_detection.uses_legacy_package();
 
   let auth_path = global_pi_auth_path()?;
   let has_auth = json_file_has_content(&auth_path);
@@ -943,6 +1172,18 @@ fn check_pi_environment(workdir: Option<String>, legacy_command: Option<String>)
       "message": command_error.clone().unwrap_or_else(|| "未找到可用 Pi 命令".to_string())
     }));
   }
+  if installed && !version_ok {
+    issues.push(serde_json::json!({
+      "code": if parsed_version.is_some() { "PI_VERSION_TOO_OLD" } else { "PI_VERSION_UNKNOWN" },
+      "message": pi_version_error(version.as_deref(), &min_version)
+    }));
+  }
+  if installed && !package_ok {
+    issues.push(serde_json::json!({
+      "code": "PI_LEGACY_PACKAGE",
+      "message": format!("当前 Pi CLI 指向旧包 {PI_LEGACY_PACKAGE_NAME}，请迁移到 {PI_PACKAGE_NAME}")
+    }));
+  }
   if !has_models && !has_auth {
     issues.push(serde_json::json!({
       "code": "PI_MODEL_NOT_CONFIGURED",
@@ -951,10 +1192,17 @@ fn check_pi_environment(workdir: Option<String>, legacy_command: Option<String>)
   }
 
   Ok(serde_json::json!({
-    "ready": installed && (has_models || has_auth),
+    "ready": installed && version_ok && package_ok && (has_models || has_auth),
     "installed": installed,
     "command": command_text,
     "version": version,
+    "parsedVersion": parsed_version,
+    "minVersion": min_version,
+    "versionOk": version_ok,
+    "packageOk": package_ok,
+    "packageName": PI_PACKAGE_NAME,
+    "legacyPackageName": PI_LEGACY_PACKAGE_NAME,
+    "package": package_detection_json(&package_detection),
     "hasModels": has_models,
     "modelCount": model_count,
     "hasDefaultModel": has_default_model,
@@ -1296,7 +1544,8 @@ function appendEvent(ctx, payload) {
   sequence += 1;
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.appendFileSync(file, JSON.stringify({
-    schema: 1,
+    schema: 2,
+    bridgeVersion: "pi-ide-pi-0.74",
     id: payload.id || `${process.env.PI_IDE_RUN_ID || process.env.PI_IDE_SESSION_ID || "pi"}:${sequence}`,
     timestamp: new Date().toISOString(),
     cwd,
@@ -2154,17 +2403,119 @@ fn is_pi_wrapper(path: &PathBuf) -> bool {
     .unwrap_or(false)
 }
 
+#[derive(Debug, Clone)]
+struct PiPackageDetection {
+  active_package: Option<String>,
+  active_package_path: Option<PathBuf>,
+  legacy_package_path: Option<PathBuf>,
+}
+
+impl PiPackageDetection {
+  fn empty() -> Self {
+    Self {
+      active_package: None,
+      active_package_path: None,
+      legacy_package_path: None,
+    }
+  }
+
+  fn uses_legacy_package(&self) -> bool {
+    self.active_package.as_deref() == Some(PI_LEGACY_PACKAGE_NAME)
+  }
+}
+
+#[cfg(windows)]
+fn package_cli_path(npm_root: &Path, package_name: &str) -> PathBuf {
+  let mut path = npm_root.to_path_buf();
+  for part in package_name.split('/') {
+    path = path.join(part);
+  }
+  path.join("dist").join("cli.js")
+}
+
+#[cfg(windows)]
+fn pi_package_detection_from_wrapper(wrapper: &PathBuf) -> PiPackageDetection {
+  let Some(parent) = wrapper.parent() else {
+    return PiPackageDetection::empty();
+  };
+  let npm_root = parent.join("node_modules");
+  let current_cli = package_cli_path(&npm_root, PI_PACKAGE_NAME);
+  let legacy_cli = package_cli_path(&npm_root, PI_LEGACY_PACKAGE_NAME);
+  let legacy_package_path = legacy_cli.exists().then_some(legacy_cli.clone());
+  if current_cli.exists() {
+    return PiPackageDetection {
+      active_package: Some(PI_PACKAGE_NAME.to_string()),
+      active_package_path: Some(current_cli),
+      legacy_package_path,
+    };
+  }
+  if legacy_cli.exists() {
+    return PiPackageDetection {
+      active_package: Some(PI_LEGACY_PACKAGE_NAME.to_string()),
+      active_package_path: Some(legacy_cli.clone()),
+      legacy_package_path: Some(legacy_cli),
+    };
+  }
+  PiPackageDetection::empty()
+}
+
+#[cfg(windows)]
+fn detect_pi_package(command_text: &str) -> PiPackageDetection {
+  let parts = split_windows_command_line(command_text.trim());
+  let Some(program) = parts.first() else {
+    return PiPackageDetection::empty();
+  };
+  let resolved_program = if program.eq_ignore_ascii_case("pi") {
+    find_windows_pi_command().unwrap_or_else(|| PathBuf::from(program))
+  } else {
+    PathBuf::from(program)
+  };
+  if is_pi_wrapper(&resolved_program) {
+    return pi_package_detection_from_wrapper(&resolved_program);
+  }
+  let raw = command_text.replace('\\', "/");
+  if raw.contains(PI_LEGACY_PACKAGE_NAME) {
+    return PiPackageDetection {
+      active_package: Some(PI_LEGACY_PACKAGE_NAME.to_string()),
+      active_package_path: Some(PathBuf::from(program)),
+      legacy_package_path: Some(PathBuf::from(program)),
+    };
+  }
+  if raw.contains(PI_PACKAGE_NAME) {
+    return PiPackageDetection {
+      active_package: Some(PI_PACKAGE_NAME.to_string()),
+      active_package_path: Some(PathBuf::from(program)),
+      legacy_package_path: None,
+    };
+  }
+  PiPackageDetection::empty()
+}
+
+#[cfg(not(windows))]
+fn detect_pi_package(command_text: &str) -> PiPackageDetection {
+  let raw = command_text.replace('\\', "/");
+  if raw.contains(PI_LEGACY_PACKAGE_NAME) {
+    return PiPackageDetection {
+      active_package: Some(PI_LEGACY_PACKAGE_NAME.to_string()),
+      active_package_path: None,
+      legacy_package_path: None,
+    };
+  }
+  if raw.contains(PI_PACKAGE_NAME) {
+    return PiPackageDetection {
+      active_package: Some(PI_PACKAGE_NAME.to_string()),
+      active_package_path: None,
+      legacy_package_path: None,
+    };
+  }
+  PiPackageDetection::empty()
+}
+
 #[cfg(windows)]
 fn pi_cli_js_from_wrapper(wrapper: &PathBuf) -> Option<PathBuf> {
-  let npm_root = wrapper.parent()?.join("node_modules");
-  for package_path in [
-    npm_root.join("@earendil-works").join("pi-coding-agent"),
-    npm_root.join("@mariozechner").join("pi-coding-agent"),
-  ] {
-    let cli = package_path.join("dist").join("cli.js");
-    if cli.exists() {
-      return Some(cli);
-    }
+  let detection = pi_package_detection_from_wrapper(wrapper);
+  if detection.active_package.as_deref() == Some(PI_PACKAGE_NAME) {
+    return detection.active_package_path;
   }
   None
 }
@@ -2401,12 +2752,21 @@ async fn start_pi_session(app: tauri::AppHandle, session_id: String, pi_command:
   }
 
   let (raw, config_envs, config_info) = resolve_pi_launch_config(workdir_path.as_deref(), pi_command.as_deref())?;
+  let min_version = resolve_min_pi_version(workdir_path.as_deref(), pi_command.as_deref())?;
+  let (pi_version, package_detection) = assert_pi_runtime_supported(&raw, &config_envs, &min_version)?;
   let extra_args = if continue_session.unwrap_or(false) && !command_has_resume_flag(&raw) {
     vec!["--continue".to_string()]
   } else {
     vec![]
   };
-  append_debug_line_when(debug_enabled, &format!("[backend] start_pi_session build command session_id={session_id} command_len={} extra_args={:?} config={}", raw.len(), extra_args, config_info));
+  append_debug_line_when(debug_enabled, &format!(
+    "[backend] start_pi_session build command session_id={session_id} command_len={} pi_version={} package={:?} extra_args={:?} config={}",
+    raw.len(),
+    pi_version,
+    package_detection.active_package,
+    extra_args,
+    config_info
+  ));
   let mut cmd = build_pi_command(&raw, &extra_args)?;
   let session_dir = session_dir(&session_id)?;
   let run_id = format!("pi-run-{}-{}", chrono::Utc::now().timestamp_millis(), session_id);

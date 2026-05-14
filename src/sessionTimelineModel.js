@@ -19,7 +19,10 @@ export function isPiStartupOutput(text) {
     /Update Available/i,
     /Package Updates Available/i,
     /npm root/i,
-    /npm view pi-intercom version/i
+    /npm view pi-intercom version/i,
+    /@earendil-works\/pi-coding-agent/i,
+    /earendil-works\/pi/i,
+    /pi\.dev/i
   ];
   return markers.filter((pattern) => pattern.test(value)).length >= 2;
 }
