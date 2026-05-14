@@ -303,10 +303,91 @@ function setDebugLogContext(context) {
   };
 }
 
+function errorLogData(error) {
+  if (!error) return "";
+  return {
+    name: error?.name || "",
+    message: error?.message || String(error),
+    stack: error?.stack || ""
+  };
+}
+
+function writeFrontendLog(message, data = undefined, force = false) {
+  let suffix = "";
+  if (data !== undefined) {
+    try {
+      suffix = ` ${JSON.stringify(data, (_key, value) => typeof value === "string" && value.length > 300 ? `${value.slice(0, 300)}…` : value)}`;
+    } catch (error) {
+      suffix = ` ${JSON.stringify({ serializationError: String(error) })}`;
+    }
+  }
+  invoke("append_debug_log", { source: "frontend", message: `${message}${suffix}`, workdir: debugLogContext.workdir || null, force }).catch(() => {});
+}
+
 function debugLog(message, data = undefined) {
   if (!debugLogContext.enabled) return;
-  const suffix = data === undefined ? "" : ` ${JSON.stringify(data, (_key, value) => typeof value === "string" && value.length > 300 ? `${value.slice(0, 300)}…` : value)}`;
-  invoke("append_debug_log", { source: "frontend", message: `${message}${suffix}`, workdir: debugLogContext.workdir || null }).catch(() => {});
+  writeFrontendLog(message, data, false);
+}
+
+function forceDebugLog(message, data = undefined) {
+  writeFrontendLog(message, data, true);
+}
+
+function previewForLog(value, limit = 180) {
+  const text = String(value || "");
+  return text.length > limit ? `${text.slice(0, limit)}…` : text;
+}
+
+function textFieldSummary(value) {
+  const text = String(value || "");
+  return { length: text.length, preview: previewForLog(text) };
+}
+
+function summarizeTimelineTextEvent(event) {
+  const eventType = event?.eventType || event?.type;
+  const deltaType = event?.deltaType || "";
+  const isTextEvent = event?.kind === "timeline" && (
+    eventType === "message_end"
+    || eventType === "turn_end"
+    || eventType === "message_update"
+  );
+  if (!isTextEvent) return null;
+  return {
+    id: event.id,
+    eventType,
+    messageRole: event.messageRole,
+    messageId: event.messageId,
+    deltaType,
+    contentIndex: event.contentIndex,
+    delta: textFieldSummary(event.delta),
+    content: textFieldSummary(event.content),
+    reason: textFieldSummary(event.reason),
+    blockType: event.blockType,
+    blockText: textFieldSummary(event.blockText),
+    partialBlockType: event.partialBlockType,
+    partialBlockText: textFieldSummary(event.partialBlockText),
+    text: textFieldSummary(event.text),
+    messageContentSummary: event.messageContentSummary || [],
+    partialContentSummary: event.partialContentSummary || []
+  };
+}
+
+function summarizeLatestTurnForLog(turns) {
+  const turn = Array.isArray(turns) && turns.length ? turns[turns.length - 1] : null;
+  if (!turn) return null;
+  const items = Array.isArray(turn.items) ? turn.items : [];
+  const assistantText = items.filter((item) => item.type === "assistant_message").map((item) => item.text || "").join("");
+  const thinkingText = items.filter((item) => item.type === "thinking").map((item) => item.text || "").join("");
+  return {
+    turnId: turn.id,
+    status: turn.status,
+    itemTypes: items.map((item) => item.type),
+    assistant: textFieldSummary(assistantText),
+    thinking: textFieldSummary(thinkingText),
+    commandCount: items.filter((item) => item.type === "command").length,
+    progressCount: items.filter((item) => item.type === "progress").length,
+    errorCount: items.filter((item) => item.type === "error").length
+  };
 }
 
 function loadProjects() {
@@ -314,7 +395,8 @@ function loadProjects() {
     const raw = localStorage.getItem(PROJECTS_STORAGE_KEY);
     const parsed = raw ? JSON.parse(raw) : [];
     return normalizeStoredProjects(Array.isArray(parsed) ? parsed : [], storageLimits());
-  } catch {
+  } catch (error) {
+    forceDebugLog("load projects failed", { error: errorLogData(error) });
     return [];
   }
 }
@@ -952,6 +1034,7 @@ export default function App() {
         backgroundPiIdleStopMinutesRef.current = DEFAULT_BACKGROUND_PI_IDLE_STOP_MINUTES;
         setDebugLogEnabled(false);
         setDebugLogContext({ enabled: false, workdir: projectPath });
+        forceDebugLog("ensure pi ide config failed", { projectPath });
       });
     }, 800);
     return () => {
@@ -1389,6 +1472,7 @@ export default function App() {
     const bySession = new Map();
 
     for (const event of events) {
+      try {
       const targetSessionId = event.ideSessionId || event.ide_session_id || activeProjectSessionIdRef.current;
       if (!targetSessionId) continue;
       const runtime = piSessionStatusRef.current[targetSessionId] || {};
@@ -1431,6 +1515,10 @@ export default function App() {
 
       if (event.kind === "timeline") {
         touchPiSessionActivity(targetSessionId);
+        const textEventSummary = summarizeTimelineTextEvent(event);
+        if (textEventSummary) {
+          forceDebugLog("timeline text raw", { targetSessionId, eventRunId, runtimeRunId: runtime.runId, ...textEventSummary });
+        }
         debugLog("timeline event", { targetSessionId, eventType: event.eventType, eventRunId, runtimeRunId: runtime.runId });
         if (event.model) updateSessionModel(targetSessionId, event.model);
         const failedEvent = event.eventType === "extension_error" || (event.eventType === "auto_retry_end" && event.success === false);
@@ -1438,11 +1526,26 @@ export default function App() {
           clearSessionIdleTimer(targetSessionId);
           setSessionRuntimeStatus(targetSessionId, { processing: true });
         }
+        let mappedSummary = null;
         updateSessionById(targetSessionId, (session) => ({
           ...session,
-          turns: applyPiIdeTimelineEvent(session.turns, event, { makeId }),
+          turns: (() => {
+            const nextTurns = applyPiIdeTimelineEvent(session.turns, event, { makeId });
+            if (textEventSummary) {
+              mappedSummary = {
+                targetSessionId,
+                eventId: event.id,
+                eventType: event.eventType,
+                deltaType: event.deltaType,
+                before: summarizeLatestTurnForLog(session.turns),
+                after: summarizeLatestTurnForLog(nextTurns)
+              };
+            }
+            return nextTurns;
+          })(),
           updated_at: event.timestamp || new Date().toISOString()
         }));
+        if (mappedSummary) forceDebugLog("timeline text mapped", mappedSummary);
         if (event.eventType === "agent_end") {
           debugLog("processing false by agent_end", { targetSessionId });
           clearSessionIdleTimer(targetSessionId);
@@ -1475,6 +1578,21 @@ export default function App() {
       const bucket = bySession.get(targetSessionId);
       if (event.kind === "reference") bucket.referenced.push(record);
       else if (event.kind === "output") bucket.output.push(record);
+      } catch (error) {
+        forceDebugLog("applyPiIdeEvents event failed", {
+          error: errorLogData(error),
+          event: {
+            id: event?.id,
+            kind: event?.kind,
+            eventType: event?.eventType || event?.type,
+            source: event?.source,
+            messageRole: event?.messageRole,
+            deltaType: event?.deltaType,
+            contentIndex: event?.contentIndex,
+            timestamp: event?.timestamp
+          }
+        });
+      }
     }
 
     for (const [sessionId, bucket] of bySession.entries()) {
@@ -1523,7 +1641,8 @@ export default function App() {
         try {
           const events = await invoke("load_pi_ide_events", { workdir: projectPath });
           if (!cancelled) applyPiIdeEvents(events);
-        } catch (_) {
+        } catch (error) {
+          forceDebugLog("load pi ide events failed", { projectPath, error: errorLogData(error) });
           // 事件桥扩展尚未生成或 Pi 未写入事件时忽略。
         }
       }
@@ -1570,9 +1689,16 @@ export default function App() {
         setTimeout(() => invoke("ensure_pi_ide_config", { workdir: projectPath, legacyCommand: legacyPiCommandRef.current }).catch(() => {}), 800);
         setStatus(`已载入项目：${basename(projectPath)}`);
       }
-    }).catch(() => {});
+    }).catch((error) => {
+      forceDebugLog("get launch context failed", { error: errorLogData(error) });
+    });
 
     const unsubs = [];
+    forceDebugLog("app mounted", {
+      projectCount: projectsRef.current.length,
+      activeProjectId: activeProjectIdRef.current,
+      activeProjectSessionId: activeProjectSessionIdRef.current
+    });
     debugLog("app mounted");
     listen("pi-status", (event) => {
       debugLog("pi-status event", event.payload);
@@ -2411,6 +2537,7 @@ export default function App() {
               runtimeStatus={activeProjectSessionId ? piSessionStatus[activeProjectSessionId] : null}
               onOpenFile={(file) => openSessionFile(file).catch((e) => setStatus(String(e)))}
               onOpenDirectory={(file) => openSessionFileDirectory(file).catch((e) => setStatus(String(e)))}
+              onDebugLog={forceDebugLog}
             />
           ) : (
             <PiTerminal
