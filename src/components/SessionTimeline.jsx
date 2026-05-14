@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { Bot, Check, ChevronDown, ChevronRight, Clock3, Copy, ExternalLink, File, FileText, Loader2, MoreHorizontal, RotateCcw, Terminal } from "lucide-react";
+import { Bot, Check, ChevronDown, ChevronRight, Clock3, Copy, File, FileText, Loader2, Terminal } from "lucide-react";
 import { buildSessionTimeline, splitMarkdownSections } from "../sessionTimelineModel.js";
 import { isTableRow, isTableSeparator, parseTableCells, tableStartsAt } from "../sessionMarkdownTableModel.js";
 
@@ -327,11 +327,6 @@ function ChangeSummary({ files, onOpenFile }) {
     <div className="pi-session-change-card">
       <div className="pi-session-change-head">
         <strong>{files.length} 个文件已更改</strong>
-        <div>
-          <button title="撤销"><RotateCcw size={13}/>撤销</button>
-          <button title="审核"><ExternalLink size={13}/>审核</button>
-          <button title="更多"><MoreHorizontal size={14}/></button>
-        </div>
       </div>
       {files.map((file) => (
         <button className="pi-session-change-row" key={file.path || file.name} onClick={() => onOpenFile?.(file)}>
