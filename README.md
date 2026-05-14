@@ -1,5 +1,8 @@
 # pi-ide-desktop
 
+<img width="1282" height="852" alt="image" src="https://github.com/user-attachments/assets/8c388592-e46e-4709-a43f-a6bc4e567623" />
+
+
 面向 [Pi Coding Agent](https://pi.dev/) 的 Windows 桌面 IDE 容器，基于 Tauri + React + xterm.js。
 
 将 Pi CLI 包装为桌面应用，提供项目管理、会话管理、终端交互、会话视图、目录树、文件追踪等能力。
