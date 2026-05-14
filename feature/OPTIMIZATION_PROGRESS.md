@@ -13,7 +13,8 @@
 3. `.pi/pi-ide-events.jsonl` 不再被前端周期性全量读取和解析。
 4. Pi extension 不再把高频流式文本重复写入事件文件。
 5. debug 日志默认关闭，未开启时前后端不写入 debug 日志，入口按钮不可见。
-6. 构建、现有 JS 测试、Rust 后端检查通过。
+6. 旧版本产生的异常缓存可以在设置中一键清理，且不删除 Pi 原生会话。
+7. 构建、现有 JS 测试、Rust 后端检查通过。
 
 ## 优先级列表
 
@@ -23,6 +24,7 @@
 | P0 | P0-2 | 限制终端内存和历史回放 | xterm `scrollback` 过大，切换会话 replay 全量输出 | 降低并配置 scrollback，只读取后端日志尾部回放 | 已完成，已通过验证 | 切换长会话只回放尾部内容 |
 | P0 | P0-3 | 事件读取改增量 | 每 1.2 秒全量读取 JSONL，事件文件越大越慢 | 后端记录文件 offset，只返回新增事件 | 已完成，已通过验证 | 连续轮询同一文件时第二次返回空新增 |
 | P0 | P0-4 | 精简 Pi extension 高频事件 | `message_update` 和工具结果可能重复写入大文本 | 只记录 delta，最终文本和工具结果按配置截断 | 已完成，已通过验证 | 事件文件体积增长明显下降 |
+| P0 | P0-5 | 旧版本异常缓存清理 | 旧版本用户已经积累大体积事件流、终端日志和 debug 日志 | 设置中增加“清理异常缓存”，清空 IDE 事件缓存、终端日志、debug 日志和本地终端预览；不删除 Pi 原生会话 | 已完成，已通过验证 | 设置触发后返回释放空间和清理文件数 |
 | P1 | P1-1 | 评估 Pi RPC 主通道 | PTY 输出不适合作为结构化 UI 的主数据源 | 逐步改用 `pi --mode rpc` 获取 JSONL 事件 | 阶段 1 已完成，已通过验证 | 会话视图不依赖终端文本解析 |
 | P1 | P1-2 | Pi 原生 session 对齐 | 桌面端重复维护大量会话内容 | 保存 UI 元数据，完整会话交给 Pi session JSONL | 阶段 1 已完成，已通过验证 | 重启后可以从 Pi session 恢复 |
 | P1 | P1-3 | Pi extension 权限与工具治理 | bash/read/write/edit 缺少统一限制 | extension 拦截危险命令、大文件读取和大输出 | 阶段 1 已完成，已通过验证 | 危险命令可被拦截或确认 |
@@ -38,6 +40,7 @@
 - P1 已减少本地项目/会话元数据体积，但完整的 Pi session 恢复仍依赖后续 RPC 或更完整的 JSONL 对齐。
 - Pi extension 已增加危险命令和大输出治理，但后续还需要把策略暴露为项目级配置，避免只靠环境变量控制。
 - P3-1 已关闭默认 debug 写入，但如果用户手动开启 debug，仍需要 P3-2 的大小轮转来限制磁盘增长。
+- P0-5 清理入口只处理 IDE 额外缓存，不处理 `~/.pi/agent/sessions`，避免误删 Pi 原生会话事实源。
 
 ## P1-1 RPC 迁移评估
 
@@ -64,6 +67,10 @@ Pi 官方支持 RPC 模式，适合 IDE 或自定义 UI 作为结构化主通道
 - `piIdeSessionFileRecordLimit`：本地保存的文件记录数量，默认 `500`。
 - `PI_IDE_READ_LIMIT`：Pi extension 自动给 `read` 工具补上的读取行数上限，默认 `1200`。
 - `PI_IDE_TOOL_RESULT_TEXT_LIMIT`：Pi extension 返回给模型的单个工具结果文本上限，默认 `50000`。
+- `<项目>/.pi.ide/config.json` 或 `~/.pi-ide/config.json` 的 `storage.eventMode`：事件持久化模式，默认 `compact`，可设为 `full` 或 `off`。
+- `storage.eventTextLimit`：Pi IDE 事件写入的单段文本上限，默认 `51200`。
+- `storage.projectEventMaxBytes`：项目级 `.pi/pi-ide-events.jsonl` 最大保留体积，默认 `5MB`，超过后自动清空。
+- `storage.terminalLogMaxBytes`：单个 IDE 会话 `terminal.log` 最大保留体积，默认 `2MB`，设置为 `0` 表示不保留终端日志。
 - `PI_IDE_DANGEROUS_COMMAND_PATTERN`：危险 shell 命令正则，默认拦截 `rm -rf`、`git reset --hard`、`git clean -f`、`del /s`、`format`、`mkfs`、递归 `Remove-Item`。
 - `PI_IDE_PROTECTED_PATH_PATTERN`：受保护写入路径正则，默认保护 `.env*`、`.git`、`node_modules`。
 - `~/.pi-ide/config.json` 的 `debug.enabled`：全局 debug 日志开关，默认 `false`。
@@ -103,3 +110,13 @@ Pi 官方支持 RPC 模式，适合 IDE 或自定义 UI 作为结构化主通道
 - 2026-05-13：针对打开项目卡顿风险进一步收紧目录树加载规则：移除切换项目时自动加载目录树的 effect，`get_directory_tree` 首次只返回根节点且不预扫描 preview lines；用户展开目录时再调用 `get_directory_children`。验证通过：`npm run build`、`node src/projectStorageModel.test.mjs`、`node src/sessionTimelineModel.test.mjs`、`node src/piIdeEventMapper.test.mjs`、`cargo check`。
 - 2026-05-13：继续优化默认启动内容：项目打开/切换时不再自动执行 Pi 环境检测，只重置环境状态并等待用户点击“环境设置”或发送任务时检测；配置 ensure 延迟执行；非终端视图切换会话时延迟读取终端日志尾部。
 - 2026-05-13：完成会话切换体验修复和终端滚动方案重构。会话视图移除最近记录窗口限制，恢复完整 turn 渲染，并新增 Markdown 表格渲染支持；终端视图移除自定义滚动条和 wheel 事件拦截，改为完全信任 xterm 原生 viewport 滚动，同时停止过滤 ANSI 控制序列；Pi IDE bridge 事件文本上限提升到 10000000。
+
+## 2026-05-14 增量进度：存储降噪与异常缓存清理
+
+- 默认存储策略改为 `compact`：Pi IDE bridge 不再持久化高频 `message_update` 和 `tool_execution_update` 事件，减少 `.pi/pi-ide-events.jsonl` 增长速度；如需完整事件，可通过 `storage.eventMode` 调整。
+- 新增存储配置默认值：事件文本上限 `51200`、工具结果文本上限 `51200`、项目事件文件上限 `5MB`、单会话终端日志上限 `2MB`。
+- 新增后端清理命令 `clean_pi_ide_cache`：清空 IDE debug 日志、`~/.pi-ide/pi-sessions/**/terminal.log`、已知项目的 `.pi/pi-ide-events.jsonl` 和 `.pi/pi-ide-file-events.jsonl`；明确不删除 `~/.pi/agent/sessions`。
+- 新增“环境设置 -> 清理缓存”入口：用户可一键清理旧版本异常缓存，并看到释放空间和清理文件数；同时清空本地 `session.output` 终端预览缓存。
+- 已同步清理异常文件内容：`F:\SausageProject\B-SplitProject\.pi\pi-ide-events.jsonl` 已从 103MB 清理到受控范围，`~/.pi-ide/pi-sessions` 下历史 `terminal.log` 已裁剪到默认上限范围。
+- 验证通过：`node src/projectStorageModel.test.mjs`、`node src/sessionTimelineModel.test.mjs`、`node src/piIdeEventMapper.test.mjs`、`node src/sessionMarkdownTableModel.test.mjs`、`npm run build`、`cargo test config_tests -- --nocapture`、`cargo check`。
+- 修复 Pi IDE bridge 对 `message.content` 类型的错误假设：`textContent`、`messageContentSummary` 和 `compactToolContent` 现在统一兼容字符串、数组和对象，避免 `content.map is not a function` 扩展运行时报错；已同步更新当前项目的 `.pi/extensions/pi-ide-file-tracker.ts`。
