@@ -535,6 +535,15 @@ const summary = messageContentSummary({ content: "summary text" });
 if (!Array.isArray(summary) || summary[0]?.type !== "string") {
   throw new Error("string message summary failed");
 }
+if (!agentDefinitionPath("C:/repo", ".pi/agents/reviewer.md").endsWith("reviewer.md")) {
+  throw new Error("project agent definition path failed");
+}
+if (agentNameFromPath("C:/repo/.pi/agents/reviewer.md") !== "reviewer") {
+  throw new Error("agent definition name failed");
+}
+if (!isSubagentToolName("intercom")) {
+  throw new Error("intercom subagent bridge detection failed");
+}
 "#);
     fs::write(&path, script).unwrap();
     let output = Command::new("node").arg(&path).output().unwrap();
@@ -1298,6 +1307,10 @@ function toolResultTextLimit() {
   return positiveEnvNumber("PI_IDE_TOOL_RESULT_TEXT_LIMIT", 51200);
 }
 
+function subagentDebugEnabled() {
+  return ["1", "true", "yes", "on"].includes(String(process.env.PI_IDE_SUBAGENT_DEBUG || process.env.PI_IDE_DEBUG_ENABLED || "").toLowerCase());
+}
+
 function readLineLimit() {
   return positiveEnvNumber("PI_IDE_READ_LIMIT", 1200);
 }
@@ -1422,6 +1435,20 @@ function normalizeFilePath(cwd, raw) {
   return path.normalize(path.isAbsolute(value) ? value : path.join(cwd, value));
 }
 
+function agentDefinitionPath(cwd, raw) {
+  const normalized = normalizeFilePath(cwd, raw);
+  if (!normalized) return "";
+  return /(^|[\\/])\.pi[\\/]agents[\\/][^\\/]+\.md$/i.test(normalized) ? normalized : "";
+}
+
+function fileNameFromPath(value) {
+  return String(value || "").split(/[\\/]/).filter(Boolean).pop() || String(value || "");
+}
+
+function agentNameFromPath(value) {
+  return fileNameFromPath(value).replace(/\.md$/i, "") || "subagent";
+}
+
 function sessionInfo(ctx) {
   const manager = ctx?.sessionManager;
   return {
@@ -1450,7 +1477,9 @@ function appendEvent(ctx, payload) {
 }
 
 function textContent(message) {
-  return contentItems(message).map((item) => {
+  const items = contentItems(message);
+  if (!Array.isArray(items)) return "";
+  return items.map((item) => {
     if (typeof item === "string") return item;
     if (item?.type === "text") return item.text || "";
     return "";
@@ -1520,6 +1549,74 @@ function compactResult(result) {
     content: compactJson(result?.content || []),
     details: compactJson(result?.details || {}),
   };
+}
+
+function resultText(result) {
+  return contentItems(result?.content || result).map(contentItemText).filter(Boolean).join("\n");
+}
+
+function isSubagentToolName(name) {
+  return /^(subagent|run_subagent|agent|intercom)$/i.test(String(name || ""));
+}
+
+function isSubagentLaunchInput(input) {
+  const action = String(input?.action || input?.command || "").trim().toLowerCase();
+  if (["list", "status", "doctor", "interrupt", "cancel", "stop"].includes(action)) return false;
+  return true;
+}
+
+function subagentRunId(event) {
+  return String(event?.runId || event?.run_id || event?.toolCallId || `subagent-${Date.now()}-${sequence}`);
+}
+
+function subagentName(input, event) {
+  return String(
+    input?.agent
+    || input?.name
+    || input?.subagent
+    || input?.role
+    || input?.target
+    || input?.to
+    || input?.session
+    || input?.sessionId
+    || event?.agentName
+    || event?.toolName
+    || "subagent"
+  ).trim();
+}
+
+function subagentTask(input) {
+  return String(input?.task || input?.prompt || input?.message || input?.input || input?.content || "").trim();
+}
+
+function subagentArtifactPaths(result) {
+  const details = result?.details || {};
+  const keys = ["sessionFile", "sessionPath", "artifactPath", "resultFile", "outputPath", "outputFile"];
+  const paths = [];
+  for (const key of keys) {
+    const value = details[key];
+    if (typeof value === "string" && value.trim()) paths.push(value.trim());
+  }
+  return [...new Set(paths)];
+}
+
+function appendSubagentEvent(ctx, eventType, payload = {}) {
+  appendEvent(ctx, {
+    kind: "subagent",
+    eventType,
+    source: payload.source || "pi-ide-subagent-adapter",
+    ...payload,
+  });
+}
+
+function appendSubagentTrace(ctx, stage, payload = {}) {
+  if (!subagentDebugEnabled()) return;
+  appendEvent(ctx, {
+    kind: "subagent_trace",
+    source: "pi-ide-subagent-adapter",
+    stage,
+    ...payload,
+  });
 }
 
 function modelInfo(model) {
@@ -1592,6 +1689,36 @@ function gitChangedFiles(cwd) {
 }
 
 export default function(pi) {
+  // 定期检查 IDE 下发的命令（避免通过 PTY 文本发送，完全绕过 LLM）
+  let commandsPath = null;
+  let commandsOffset = 0;
+  try {
+    commandsPath = path.join(process.cwd(), ".pi", "pi-ide-command.jsonl");
+    try { commandsOffset = fs.statSync(commandsPath).size || 0; } catch (_) { commandsOffset = 0; }
+    setInterval(() => {
+      try {
+        const stat = fs.statSync(commandsPath);
+        if (stat.size <= commandsOffset) return;
+        const file = fs.openSync(commandsPath, "r");
+        if (commandsOffset < stat.size) {
+          fs.readSync(file, Buffer.alloc(1), 0, 0, commandsOffset);
+          const raw = fs.readFileSync(commandsPath, "utf8");
+          const lines = raw.slice(commandsOffset).split("\n").filter(Boolean);
+          for (const line of lines) {
+            try {
+              const cmd = JSON.parse(line);
+              if (cmd?.action === "switch_model" && cmd.provider && cmd.id) {
+                const model = pi.ctx?.modelRegistry?.find(cmd.provider, cmd.id);
+                if (model) pi.setModel(model).catch(() => {});
+              }
+            } catch (_) {}
+          }
+        }
+        commandsOffset = stat.size;
+        try { fs.closeSync(file); } catch (_) {}
+      } catch (_) {}
+    }, 800);
+  } catch (_) {}
   pi.registerCommand("pi-ide-list-models", {
     description: "Emit available models for Pi IDE Desktop",
     handler: async (_args, ctx) => {
@@ -1709,6 +1836,25 @@ export default function(pi) {
   });
 
   pi.on("tool_execution_start", async (event, ctx) => {
+    appendSubagentTrace(ctx, "tool_execution_start", {
+      toolCallId: event.toolCallId,
+      toolName: event.toolName,
+      recognized: isSubagentToolName(event.toolName),
+      inputKeys: Object.keys(event.args || {}),
+    });
+    if (isSubagentToolName(event.toolName) && isSubagentLaunchInput(event.args || {})) {
+      const input = event.args || {};
+      appendSubagentEvent(ctx, "subagent_start", {
+        runId: subagentRunId(event),
+        toolCallId: event.toolCallId,
+        toolName: event.toolName,
+        agentName: subagentName(input, event),
+        task: subagentTask(input),
+        action: input.action || "",
+        model: modelInfo(ctx?.model),
+        cwd: ctx?.cwd || process.cwd(),
+      });
+    }
     appendTimeline(ctx, event.type, {
       toolCallId: event.toolCallId,
       toolName: event.toolName,
@@ -1717,6 +1863,15 @@ export default function(pi) {
   });
 
   pi.on("tool_execution_update", async (event, ctx) => {
+    if (isSubagentToolName(event.toolName)) {
+      appendSubagentEvent(ctx, "subagent_message", {
+        runId: subagentRunId(event),
+        toolCallId: event.toolCallId,
+        toolName: event.toolName,
+        text: limitText(resultText(event.partialResult)),
+        status: "running",
+      });
+    }
     appendTimeline(ctx, event.type, {
       toolCallId: event.toolCallId,
       toolName: event.toolName,
@@ -1726,6 +1881,27 @@ export default function(pi) {
   });
 
   pi.on("tool_execution_end", async (event, ctx) => {
+    appendSubagentTrace(ctx, "tool_execution_end", {
+      toolCallId: event.toolCallId,
+      toolName: event.toolName,
+      recognized: isSubagentToolName(event.toolName),
+      isError: Boolean(event.isError),
+    });
+    if (isSubagentToolName(event.toolName)) {
+      const text = resultText(event.result);
+      const paths = subagentArtifactPaths(event.result);
+      appendSubagentEvent(ctx, "subagent_end", {
+        runId: subagentRunId(event),
+        toolCallId: event.toolCallId,
+        toolName: event.toolName,
+        summary: limitText(text),
+        status: event.isError ? "failed" : "completed",
+        isError: Boolean(event.isError),
+        artifactPaths: paths,
+        sessionFile: paths.find((value) => value.endsWith(".jsonl") || value.endsWith(".json")) || "",
+        result: compactResult(event.result),
+      });
+    }
     appendTimeline(ctx, event.type, {
       toolCallId: event.toolCallId,
       toolName: event.toolName,
@@ -1737,6 +1913,27 @@ export default function(pi) {
   pi.on("tool_call", async (event, ctx) => {
     const policyResult = applyToolPolicy(event, ctx);
     if (policyResult) return policyResult;
+
+    appendSubagentTrace(ctx, "tool_call", {
+      toolCallId: event.toolCallId,
+      toolName: event.toolName,
+      recognized: isSubagentToolName(event.toolName),
+      inputKeys: Object.keys(event.input || {}),
+    });
+
+    if (isSubagentToolName(event.toolName) && isSubagentLaunchInput(event.input || {})) {
+      const input = event.input || {};
+      appendSubagentEvent(ctx, "subagent_start", {
+        runId: subagentRunId(event),
+        toolCallId: event.toolCallId,
+        toolName: event.toolName,
+        agentName: subagentName(input, event),
+        task: subagentTask(input),
+        action: input.action || "",
+        model: modelInfo(ctx?.model),
+        cwd: ctx?.cwd || process.cwd(),
+      });
+    }
 
     if (event.toolName === "bash") {
       bashBefore.set(event.toolCallId, gitChangedFiles(ctx.cwd));
@@ -1774,11 +1971,37 @@ export default function(pi) {
 
     if (toolName === "write") {
       recordPath(ctx, "output", "pi-tool-write", toolCallId, toolName, input.path);
+      const definitionPath = agentDefinitionPath(ctx?.cwd || process.cwd(), input.path);
+      if (definitionPath) {
+        appendSubagentEvent(ctx, "subagent_definition", {
+          runId: `definition:${definitionPath}`,
+          toolCallId,
+          toolName,
+          agentName: agentNameFromPath(definitionPath),
+          task: `定义子 Agent ${agentNameFromPath(definitionPath)}`,
+          path: definitionPath,
+          status: "defined",
+          summary: `已创建或更新子 Agent 定义：${definitionPath}`,
+        });
+      }
       return resultPatch;
     }
 
     if (toolName === "edit") {
       recordPath(ctx, "output", "pi-tool-edit", toolCallId, toolName, input.path);
+      const definitionPath = agentDefinitionPath(ctx?.cwd || process.cwd(), input.path);
+      if (definitionPath) {
+        appendSubagentEvent(ctx, "subagent_definition", {
+          runId: `definition:${definitionPath}`,
+          toolCallId,
+          toolName,
+          agentName: agentNameFromPath(definitionPath),
+          task: `定义子 Agent ${agentNameFromPath(definitionPath)}`,
+          path: definitionPath,
+          status: "defined",
+          summary: `已创建或更新子 Agent 定义：${definitionPath}`,
+        });
+      }
       return resultPatch;
     }
 
@@ -2075,6 +2298,23 @@ fn open_pi_model_config_dir() -> Result<String, String> {
   fs::create_dir_all(&dir).map_err(|e| format!("创建 Pi 配置目录失败：{e}"))?;
   open_path_in_file_manager(dir.to_string_lossy().to_string())?;
   Ok(dir.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn queue_pi_command(workdir: String, command: String) -> Result<(), String> {
+  let dir = PathBuf::from(workdir.trim());
+  if !dir.exists() || !dir.is_dir() {
+    return Err(format!("工作目录不存在：{}", workdir));
+  }
+  let pi_dir = dir.join(".pi");
+  fs::create_dir_all(&pi_dir).map_err(|e| format!("创建 .pi 目录失败：{e}"))?;
+  let path = pi_dir.join("pi-ide-command.jsonl");
+  let mut file = fs::OpenOptions::new()
+    .create(true)
+    .append(true)
+    .open(&path)
+    .map_err(|e| format!("打开命令文件失败 {:?}: {e}", path))?;
+  writeln!(file, "{}", command.trim()).map_err(|e| format!("写入命令文件失败 {:?}: {e}", path))
 }
 
 #[tauri::command]
@@ -2680,6 +2920,7 @@ async fn start_pi_session(app: tauri::AppHandle, session_id: String, pi_command:
   cmd.env("PI_IDE_EVENT_TEXT_LIMIT", storage_config.event_text_limit.to_string());
   cmd.env("PI_IDE_TOOL_RESULT_TEXT_LIMIT", storage_config.tool_result_text_limit.to_string());
   cmd.env("PI_IDE_TERMINAL_LOG_MAX_BYTES", storage_config.terminal_log_max_bytes.to_string());
+  cmd.env("PI_IDE_DEBUG_ENABLED", if debug_enabled { "true" } else { "false" });
   for (key, value) in config_envs {
     cmd.env(key, value);
   }
@@ -3003,6 +3244,7 @@ fn main() {
       load_pi_model_config,
       install_pi_cli,
       open_pi_model_config_dir,
+      queue_pi_command,
       open_path_in_file_manager,
       open_file_with_default_app,
       get_directory_tree,

@@ -3,11 +3,12 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
-import { Square, Send, FolderOpen, Plus, Folder, X, File, FileText, FolderTree, ChevronDown, ChevronRight, RefreshCw, MessageSquare, TerminalSquare, Settings, Trash2 } from "lucide-react";
+import { Square, Send, FolderOpen, Plus, Folder, X, File, FileText, FolderTree, ChevronDown, ChevronRight, RefreshCw, MessageSquare, TerminalSquare, Settings, Trash2, Bot, CheckCircle2, AlertCircle, Loader2 } from "lucide-react";
 import PiTerminal from "./components/PiTerminal.jsx";
 import SessionTimeline from "./components/SessionTimeline.jsx";
 import { applyPiIdeTimelineEvent } from "./piIdeEventMapper.js";
-import { DEFAULT_STORAGE_LIMITS, limitTextValue, normalizeStoredProjects, positiveInteger } from "./projectStorageModel.js";
+import { DEFAULT_STORAGE_LIMITS, limitTextValue, normalizeStoredProjects, normalizeStoredProjectsForQuota, positiveInteger } from "./projectStorageModel.js";
+import { collectSessionSubagents, sessionSubagentSummary } from "./subagentSummary.js";
 
 const DEFAULT_COMMAND = "pi";
 const PROJECTS_STORAGE_KEY = "piIdeProjects";
@@ -37,6 +38,30 @@ function makeId(prefix) {
 
 function configuredPositiveNumber(key, fallback) {
   return positiveInteger(localStorage.getItem(key), fallback);
+}
+
+function isStorageQuotaError(error) {
+  return error?.name === "QuotaExceededError"
+    || error?.code === 22
+    || String(error?.message || error).includes("QuotaExceeded");
+}
+
+function safeSetStorageItem(key, value) {
+  try {
+    localStorage.setItem(key, value);
+    return true;
+  } catch (error) {
+    forceDebugLog("local storage set failed", { key, quota: isStorageQuotaError(error), error: errorLogData(error) });
+    return false;
+  }
+}
+
+function safeRemoveStorageItem(key) {
+  try {
+    localStorage.removeItem(key);
+  } catch (error) {
+    forceDebugLog("local storage remove failed", { key, error: errorLogData(error) });
+  }
 }
 
 function storageLimits() {
@@ -428,6 +453,7 @@ function ProjectPanel({ projects, activeProjectId, activeSessionId, piSessionSta
                   if (visibleSessions.length === 0) return <div className="project-empty-session">暂无 Pi 会话</div>;
                   return visibleSessions.map((session) => {
                   const isEditing = editing?.sessionId === session.id;
+                  const subagentSummary = sessionSubagentSummary(session);
                   return (
                     <div
                       key={session.id}
@@ -458,6 +484,7 @@ function ProjectPanel({ projects, activeProjectId, activeSessionId, piSessionSta
                           <i className={`session-state-dot ${piSessionStatus?.[session.id]?.processing ? "processing" : piSessionStatus?.[session.id]?.running ? "running" : "stopped"}`} />
                           <span>{session.title}</span>
                           <small>{relativeTime(session.updated_at || session.created_at)}</small>
+                          {subagentSummary && <em className="project-session-subagents">{subagentSummary}</em>}
                         </>
                       )}
                     </div>
@@ -655,6 +682,213 @@ function SessionFilesSection({ title, files, emptyText, onOpenFile, onOpenDirect
   );
 }
 
+function subagentStatusLabel(status) {
+  if (status === "running") return "运行中";
+  if (status === "failed") return "失败";
+  if (status === "defined") return "已定义";
+  if (status === "stopped") return "已停止";
+  return "已完成";
+}
+
+function SubagentStatusIcon({ status }) {
+  if (status === "running") return <Loader2 size={14} className="spin"/>;
+  if (status === "failed") return <AlertCircle size={14}/>;
+  return <CheckCircle2 size={14}/>;
+}
+
+function subagentSummaryText(subagent) {
+  const summary = String(subagent?.summary || "").trim();
+  if (summary) return summary;
+  const messages = (subagent?.items || [])
+    .filter((item) => item?.type === "assistant_message")
+    .map((item) => String(item.text || "").trim())
+    .filter(Boolean);
+  return messages[messages.length - 1] || "";
+}
+
+function formatSubagentModel(model) {
+  if (!model) return "";
+  if (typeof model === "string") return model;
+  return formatModelInfo(model) || String(model.name || model.id || model.model || "");
+}
+
+function SubagentFileGroup({ title, files, onOpenFile, onOpenDirectory }) {
+  if (!files?.length) return null;
+  return (
+    <div className="subagent-inspector-file-group">
+      <strong>{title}</strong>
+      <div className="subagent-inspector-files">
+        {files.map((file) => (
+          <button
+            key={`${file.path || file.name}-${file.source || ""}`}
+            title={`${file.path || file.name}\n左键打开文件，右键打开所在目录`}
+            onClick={() => onOpenFile?.(file)}
+            onContextMenu={(event) => {
+              event.preventDefault();
+              onOpenDirectory?.(file);
+            }}
+          >
+            <File size={13}/>
+            <span>{file.name || basename(file.path)}</span>
+            <small>{file.source || ""}</small>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function SubagentActivityItem({ item }) {
+  const type = item?.type || "assistant_message";
+  if (type === "command") {
+    return (
+      <div className="subagent-activity-item">
+        <strong>命令</strong>
+        <pre>{item.cwd ? `${item.cwd}> ${item.command}` : `$ ${item.command}`}{item.output ? `\n\n${item.output}` : ""}</pre>
+      </div>
+    );
+  }
+  if (type === "file_reference" || type === "file_output") {
+    const files = Array.isArray(item.files) ? item.files : [];
+    return (
+      <div className="subagent-activity-item">
+        <strong>{type === "file_output" ? "输出文件" : "参考文件"}</strong>
+        <span>{files.map((file) => file.name || basename(file.path)).join("、") || item.title || ""}</span>
+      </div>
+    );
+  }
+  if (type === "error") {
+    return (
+      <div className="subagent-activity-item danger">
+        <strong>{item.title || "错误"}</strong>
+        <pre>{item.detail || item.text || ""}</pre>
+      </div>
+    );
+  }
+  return (
+    <div className="subagent-activity-item">
+      <strong>{item.title || (type === "progress" ? "进度" : type === "thinking" ? "思考" : "消息")}</strong>
+      <span>{String(item.detail || item.text || item.output || "").trim()}</span>
+    </div>
+  );
+}
+
+function SessionSubagentsSection({ subagents, onOpenSubagent }) {
+  const [expanded, setExpanded] = useState(true);
+  const list = Array.isArray(subagents) ? subagents : [];
+  return (
+    <div className="session-files-section session-subagents-section">
+      <button
+        type="button"
+        className="session-files-section-toggle"
+        aria-expanded={expanded}
+        onClick={() => setExpanded((value) => !value)}
+      >
+        <span className="session-files-section-label">
+          {expanded ? <ChevronDown size={14}/> : <ChevronRight size={14}/>}
+          <strong>Subagent</strong>
+        </span>
+        <small>{list.length} 个</small>
+      </button>
+      {expanded && (
+        list.length === 0
+          ? <div className="session-files-empty">暂无 Subagent 记录。AI 使用子 Agent 后会显示在这里。</div>
+          : (
+            <div className="session-subagent-list">
+              {list.map((subagent) => {
+                const fileCount = (subagent.referencedFiles || []).length + (subagent.outputFiles || []).length + (subagent.relatedFiles || []).length;
+                return (
+                <button
+                  key={subagent.id}
+                  className={`session-subagent-item ${subagent.status}`}
+                  title={subagent.task || subagent.summary || subagent.name}
+                  onClick={() => onOpenSubagent(subagent.id)}
+                >
+                  <SubagentStatusIcon status={subagent.status}/>
+                  <span>{subagent.name}</span>
+                  <small>{subagentStatusLabel(subagent.status)}</small>
+                  {subagent.task && <em>{subagent.task}</em>}
+                  <b>{fileCount} 个文件</b>
+                </button>
+                );
+              })}
+            </div>
+          )
+      )}
+    </div>
+  );
+}
+
+function SubagentInspector({ subagent, onClose, onOpenFile, onOpenDirectory }) {
+  const [activeTab, setActiveTab] = useState("activity");
+  const summary = subagentSummaryText(subagent);
+  const sessionFile = subagent?.sessionFile ? { path: subagent.sessionFile, name: basename(subagent.sessionFile), source: "subagent-session" } : null;
+  const referencedFiles = subagent?.referencedFiles || [];
+  const outputFiles = subagent?.outputFiles || [];
+  const relatedFiles = sessionFile ? [sessionFile, ...(subagent?.relatedFiles || [])] : (subagent?.relatedFiles || []);
+  const activityItems = subagent?.items || [];
+
+  useEffect(() => {
+    setActiveTab("activity");
+  }, [subagent?.id]);
+
+  useEffect(() => {
+    if (!subagent) return undefined;
+    const onKeyDown = (event) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [subagent, onClose]);
+
+  if (!subagent) return null;
+
+  return (
+    <div className="subagent-inspector-backdrop" onClick={onClose}>
+      <div className="subagent-inspector" role="dialog" aria-modal="true" onClick={(event) => event.stopPropagation()}>
+        <div className="subagent-inspector-head">
+          <div>
+            <strong><Bot size={16}/> {subagent.name}</strong>
+            <small><SubagentStatusIcon status={subagent.status}/> {subagentStatusLabel(subagent.status)}</small>
+          </div>
+          <button className="icon" title="关闭" onClick={onClose}><X size={15}/></button>
+        </div>
+        <div className="subagent-inspector-meta">
+          {subagent.task && <div><strong>任务</strong><span>{subagent.task}</span></div>}
+          {subagent.model && <div><strong>模型</strong><span>{formatSubagentModel(subagent.model)}</span></div>}
+          {subagent.cwd && <div><strong>目录</strong><span>{subagent.cwd}</span></div>}
+          {subagent.sessionFile && <div><strong>会话文件</strong><span>{subagent.sessionFile}</span></div>}
+        </div>
+        <div className="subagent-inspector-tabs">
+          <button className={activeTab === "activity" ? "primary" : ""} onClick={() => setActiveTab("activity")}>实时动态</button>
+          <button className={activeTab === "files" ? "primary" : ""} onClick={() => setActiveTab("files")}>文件</button>
+          <button className={activeTab === "summary" ? "primary" : ""} onClick={() => setActiveTab("summary")}>摘要</button>
+        </div>
+        <div className="subagent-inspector-body">
+          {activeTab === "activity" && (
+            activityItems.length === 0
+              ? <div className="session-files-empty">暂无更细粒度的 Subagent 动态。</div>
+              : activityItems.map((item, index) => <SubagentActivityItem key={item.id || index} item={item}/>)
+          )}
+          {activeTab === "files" && (
+            <>
+              <SubagentFileGroup title="参考文件" files={referencedFiles} onOpenFile={onOpenFile} onOpenDirectory={onOpenDirectory}/>
+              <SubagentFileGroup title="输出文件" files={outputFiles} onOpenFile={onOpenFile} onOpenDirectory={onOpenDirectory}/>
+              <SubagentFileGroup title="相关文件" files={relatedFiles} onOpenFile={onOpenFile} onOpenDirectory={onOpenDirectory}/>
+              {!referencedFiles.length && !outputFiles.length && !relatedFiles.length && (
+                <div className="session-files-empty">暂无 Subagent 文件记录。</div>
+              )}
+            </>
+          )}
+          {activeTab === "summary" && (
+            summary ? <pre className="subagent-inspector-summary">{summary}</pre> : <div className="session-files-empty">Subagent 尚未输出摘要。</div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function PiSetupPanel({
   environment,
   checking,
@@ -777,11 +1011,18 @@ function RightToolPanel({
   onOpenSessionFile,
   onOpenSessionFileDirectory
 }) {
+  const [selectedSubagentId, setSelectedSubagentId] = useState(null);
   const searchText = String(directoryTreeSearch || "");
   const filteredTree = filterDirectoryTreeNode(directoryTree?.tree, searchText);
   const effectiveExpandedPaths = searchText.trim()
     ? collectDirectorySearchExpandedPaths(filteredTree.node)
     : expandedDirectoryPaths;
+  const subagents = useMemo(() => collectSessionSubagents(activeSession), [activeSession]);
+  const selectedSubagent = subagents.find((item) => item.id === selectedSubagentId) || null;
+
+  useEffect(() => {
+    if (selectedSubagentId && !subagents.some((item) => item.id === selectedSubagentId)) setSelectedSubagentId(null);
+  }, [selectedSubagentId, subagents]);
 
   return (
     <section className="panel tool-panel">
@@ -822,7 +1063,17 @@ function RightToolPanel({
           onOpenFile={onOpenSessionFile}
           onOpenDirectory={onOpenSessionFileDirectory}
         />
+        <SessionSubagentsSection
+          subagents={subagents}
+          onOpenSubagent={setSelectedSubagentId}
+        />
       </div>}
+      <SubagentInspector
+        subagent={selectedSubagent}
+        onClose={() => setSelectedSubagentId(null)}
+        onOpenFile={onOpenSessionFile}
+        onOpenDirectory={onOpenSessionFileDirectory}
+      />
       {directoryTreeOpen && (
         <div className="tool-content directory-tree-card">
           <div className="directory-tree-header">
@@ -921,6 +1172,7 @@ export default function App() {
   const backgroundPiIdleStopMinutesRef = useRef(DEFAULT_BACKGROUND_PI_IDLE_STOP_MINUTES);
   const launchHandledRef = useRef(false);
   const legacyPiCommandRef = useRef(localStorage.getItem("piCommand") || DEFAULT_COMMAND);
+  const storageQuotaWarningShownRef = useRef(false);
 
   useEffect(() => { projectsRef.current = projects; }, [projects]);
   useEffect(() => { activeProjectIdRef.current = activeProjectId; }, [activeProjectId]);
@@ -961,7 +1213,7 @@ export default function App() {
   }
 
   useEffect(() => {
-    localStorage.setItem(CENTER_VIEW_STORAGE_KEY, centerView);
+    safeSetStorageItem(CENTER_VIEW_STORAGE_KEY, centerView);
   }, [centerView]);
 
   useEffect(() => {
@@ -1196,11 +1448,32 @@ export default function App() {
     setPiSetupOpen(false);
   }, [activeProject?.path, workdir]);
 
+  function showStorageQuotaWarning() {
+    if (storageQuotaWarningShownRef.current) return;
+    storageQuotaWarningShownRef.current = true;
+    setStatus("本地缓存已满，已自动压缩历史会话缓存；当前消息发送不会被阻断。");
+  }
+
+  function persistProjectsStorage(compactProjects) {
+    if (safeSetStorageItem(PROJECTS_STORAGE_KEY, JSON.stringify(compactProjects))) {
+      return compactProjects;
+    }
+
+    const quotaProjects = normalizeStoredProjectsForQuota(compactProjects);
+    safeRemoveStorageItem(PROJECTS_STORAGE_KEY);
+    if (safeSetStorageItem(PROJECTS_STORAGE_KEY, JSON.stringify(quotaProjects))) {
+      showStorageQuotaWarning();
+      return quotaProjects;
+    }
+
+    showStorageQuotaWarning();
+    return compactProjects;
+  }
+
   function saveProjects(nextProjects) {
-    const compactProjects = normalizeStoredProjects(nextProjects, storageLimits());
+    const compactProjects = persistProjectsStorage(normalizeStoredProjects(nextProjects, storageLimits()));
     projectsRef.current = compactProjects;
     setProjects(compactProjects);
-    localStorage.setItem(PROJECTS_STORAGE_KEY, JSON.stringify(compactProjects));
   }
 
   function getSessionById(sessionId) {
@@ -1264,18 +1537,18 @@ export default function App() {
       })
     }));
     if (changed) {
-      const compactProjects = normalizeStoredProjects(nextProjects, storageLimits());
+      const compactProjects = persist
+        ? persistProjectsStorage(normalizeStoredProjects(nextProjects, storageLimits()))
+        : normalizeStoredProjects(nextProjects, storageLimits());
       projectsRef.current = compactProjects;
       setProjects(compactProjects);
-      if (persist) localStorage.setItem(PROJECTS_STORAGE_KEY, JSON.stringify(compactProjects));
     }
     return updatedSession;
   }
 
   function persistCurrentSessionOutput() {
-    const compactProjects = normalizeStoredProjects(projectsRef.current, storageLimits());
+    const compactProjects = persistProjectsStorage(normalizeStoredProjects(projectsRef.current, storageLimits()));
     projectsRef.current = compactProjects;
-    localStorage.setItem(PROJECTS_STORAGE_KEY, JSON.stringify(compactProjects));
   }
 
   function schedulePersistCurrentSessionOutput() {
@@ -1428,7 +1701,27 @@ export default function App() {
         continue;
       }
 
-      if (event.kind === "timeline") {
+      if (event.kind === "subagent_trace") {
+        debugLog("subagent trace", {
+          stage: event.stage,
+          toolName: event.toolName,
+          recognized: event.recognized,
+          toolCallId: event.toolCallId,
+          inputKeys: event.inputKeys
+        });
+        continue;
+      }
+
+      if (event.kind === "timeline" || event.kind === "subagent") {
+        if (event.kind === "subagent") {
+          debugLog("subagent event", {
+            eventType: event.eventType || event.type,
+            toolName: event.toolName,
+            toolCallId: event.toolCallId,
+            agentName: event.agentName || event.agent,
+            status: event.status
+          });
+        }
         touchPiSessionActivity(targetSessionId);
         if (event.model) updateSessionModel(targetSessionId, event.model);
         const failedEvent = event.eventType === "extension_error" || (event.eventType === "auto_retry_end" && event.success === false);
@@ -1665,12 +1958,12 @@ export default function App() {
     const session = project?.sessions?.find((s) => s.id === activeProjectSessionId);
     if (project && session) {
       setWorkdir(project.path);
-      localStorage.setItem("workdir", project.path);
-      localStorage.setItem(ACTIVE_PROJECT_STORAGE_KEY, project.id);
-      localStorage.setItem(ACTIVE_SESSION_STORAGE_KEY, session.id);
+      safeSetStorageItem("workdir", project.path);
+      safeSetStorageItem(ACTIVE_PROJECT_STORAGE_KEY, project.id);
+      safeSetStorageItem(ACTIVE_SESSION_STORAGE_KEY, session.id);
     } else {
-      localStorage.removeItem(ACTIVE_PROJECT_STORAGE_KEY);
-      localStorage.removeItem(ACTIVE_SESSION_STORAGE_KEY);
+      safeRemoveStorageItem(ACTIVE_PROJECT_STORAGE_KEY);
+      safeRemoveStorageItem(ACTIVE_SESSION_STORAGE_KEY);
     }
   }, [projects, activeProjectId, activeProjectSessionId]);
 
@@ -1971,7 +2264,7 @@ export default function App() {
     const { session } = getSessionById(sessionId);
     const continueSession = options.continueSession ?? shouldContinueSession(session);
 
-    if (runWorkdir) localStorage.setItem("workdir", runWorkdir);
+    if (runWorkdir) safeSetStorageItem("workdir", runWorkdir);
     recordSessionStart(runWorkdir);
     startingSessionsRef.current.add(sessionId);
     setSessionRuntimeStatus(sessionId, { starting: true, runId: null, status: "Pi 启动中" });
@@ -2125,13 +2418,8 @@ export default function App() {
   async function refreshModels() {
     const sessionId = activeProjectSessionIdRef.current;
     try {
-      if (sessionId && piSessionStatusRef.current[sessionId]?.running) {
-        await sendToRunningPi(sessionId, "/pi-ide-list-models\r");
-        setStatus("正在刷新模型列表...");
-      } else {
-        const result = await loadConfiguredModelCandidates(sessionId);
-        setStatus(result.models.length > 0 || result.defaultModel ? "已读取 Pi 配置模型候选" : "未找到 Pi 配置模型候选");
-      }
+      const result = await loadConfiguredModelCandidates(sessionId);
+      setStatus(result.models.length > 0 || result.defaultModel ? "已读取 Pi 配置模型候选" : "未找到 Pi 配置模型候选");
     } catch (error) {
       setStatus(`刷新模型列表失败：${String(error)}`);
     }
@@ -2145,7 +2433,10 @@ export default function App() {
       const payload = JSON.stringify({ provider: model.provider, id: model.id });
       if (piSessionStatusRef.current[sessionId]?.running) {
         setStatus(`正在切换模型：${label}`);
-        await sendToRunningPi(sessionId, `/pi-ide-switch-model ${payload}\r`);
+        await invoke("queue_pi_command", {
+          workdir: activeProject?.path || workdir || "",
+          command: JSON.stringify({ action: "switch_model", provider: model.provider, id: model.id })
+        });
         updateSessionById(sessionId, (session) => ({ ...session, pending_model: null, updated_at: new Date().toISOString() }));
       } else {
         const pending = normalizeModelInfo(model);
