@@ -7,7 +7,7 @@ import { Square, Send, FolderOpen, Plus, Folder, X, File, FileText, FolderTree, 
 import PiTerminal from "./components/PiTerminal.jsx";
 import SessionTimeline from "./components/SessionTimeline.jsx";
 import { applyPiIdeTimelineEvent } from "./piIdeEventMapper.js";
-import { DEFAULT_STORAGE_LIMITS, limitTextValue, normalizeStoredProjects, positiveInteger } from "./projectStorageModel.js";
+import { DEFAULT_STORAGE_LIMITS, MINIMAL_STORAGE_LIMITS, QUOTA_STORAGE_LIMITS, limitTextValue, normalizeStoredProjects, positiveInteger, resolveStoredActiveSession } from "./projectStorageModel.js";
 
 const DEFAULT_COMMAND = "pi";
 const PROJECTS_STORAGE_KEY = "piIdeProjects";
@@ -39,12 +39,21 @@ function configuredPositiveNumber(key, fallback) {
   return positiveInteger(localStorage.getItem(key), fallback);
 }
 
+function storedValue(key) {
+  try {
+    return localStorage.getItem(key) || null;
+  } catch {
+    return null;
+  }
+}
+
 function storageLimits() {
   return {
-    terminalPreviewChars: configuredPositiveNumber(TERMINAL_PREVIEW_CHARS_STORAGE_KEY, DEFAULT_STORAGE_LIMITS.terminalPreviewChars),
-    sessionTextPreviewChars: configuredPositiveNumber(SESSION_TEXT_PREVIEW_CHARS_STORAGE_KEY, DEFAULT_STORAGE_LIMITS.sessionTextPreviewChars),
-    sessionTurnLimit: configuredPositiveNumber(SESSION_TURN_LIMIT_STORAGE_KEY, DEFAULT_STORAGE_LIMITS.sessionTurnLimit),
-    sessionFileRecordLimit: configuredPositiveNumber(SESSION_FILE_RECORD_LIMIT_STORAGE_KEY, DEFAULT_STORAGE_LIMITS.sessionFileRecordLimit)
+    terminalPreviewChars: Math.min(configuredPositiveNumber(TERMINAL_PREVIEW_CHARS_STORAGE_KEY, DEFAULT_STORAGE_LIMITS.terminalPreviewChars), DEFAULT_STORAGE_LIMITS.terminalPreviewChars),
+    sessionTextPreviewChars: Math.min(configuredPositiveNumber(SESSION_TEXT_PREVIEW_CHARS_STORAGE_KEY, DEFAULT_STORAGE_LIMITS.sessionTextPreviewChars), DEFAULT_STORAGE_LIMITS.sessionTextPreviewChars),
+    sessionTurnLimit: Math.min(configuredPositiveNumber(SESSION_TURN_LIMIT_STORAGE_KEY, DEFAULT_STORAGE_LIMITS.sessionTurnLimit), DEFAULT_STORAGE_LIMITS.sessionTurnLimit),
+    sessionFileRecordLimit: Math.min(configuredPositiveNumber(SESSION_FILE_RECORD_LIMIT_STORAGE_KEY, DEFAULT_STORAGE_LIMITS.sessionFileRecordLimit), DEFAULT_STORAGE_LIMITS.sessionFileRecordLimit),
+    projectSessionLimit: DEFAULT_STORAGE_LIMITS.projectSessionLimit
   };
 }
 
@@ -330,7 +339,7 @@ function loadProjects() {
   try {
     const raw = localStorage.getItem(PROJECTS_STORAGE_KEY);
     const parsed = raw ? JSON.parse(raw) : [];
-    return normalizeStoredProjects(Array.isArray(parsed) ? parsed : [], storageLimits());
+    return normalizeStoredProjects(Array.isArray(parsed) ? parsed : [], { ...storageLimits(), closeRunningTurns: true });
   } catch (error) {
     forceDebugLog("load projects failed", { error: errorLogData(error) });
     return [];
@@ -901,8 +910,8 @@ export default function App() {
   const [cacheCleaning, setCacheCleaning] = useState(false);
   const [cacheCleanResult, setCacheCleanResult] = useState(null);
   const [projects, setProjects] = useState(() => loadProjects());
-  const [activeProjectId, setActiveProjectId] = useState(null);
-  const [activeProjectSessionId, setActiveProjectSessionId] = useState(null);
+  const [activeProjectId, setActiveProjectId] = useState(() => storedValue(ACTIVE_PROJECT_STORAGE_KEY));
+  const [activeProjectSessionId, setActiveProjectSessionId] = useState(() => storedValue(ACTIVE_SESSION_STORAGE_KEY));
 
   const inputRef = useRef(null);
   const outputBufferRef = useRef("");
@@ -1196,11 +1205,42 @@ export default function App() {
     setPiSetupOpen(false);
   }, [activeProject?.path, workdir]);
 
-  function saveProjects(nextProjects) {
-    const compactProjects = normalizeStoredProjects(nextProjects, storageLimits());
+  function persistProjectsStorage(projectList, preferredLimits = storageLimits()) {
+    const attempts = [
+      { label: "normal", projects: normalizeStoredProjects(projectList, preferredLimits), removeFirst: false },
+      { label: "quota", projects: normalizeStoredProjects(projectList, QUOTA_STORAGE_LIMITS), removeFirst: false },
+      { label: "minimal", projects: normalizeStoredProjects(projectList, MINIMAL_STORAGE_LIMITS), removeFirst: true }
+    ];
+    let lastError = null;
+    for (const attempt of attempts) {
+      try {
+        const payload = JSON.stringify(attempt.projects);
+        if (attempt.removeFirst) localStorage.removeItem(PROJECTS_STORAGE_KEY);
+        localStorage.setItem(PROJECTS_STORAGE_KEY, payload);
+        if (attempt.label !== "normal") {
+          setStatus("本地会话缓存过大，已自动压缩历史预览。");
+          forceDebugLog("projects storage quota fallback", { mode: attempt.label, bytes: payload.length });
+        }
+        return attempt.projects;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    forceDebugLog("persist projects failed", { error: errorLogData(lastError) });
+    setStatus("本地会话缓存保存失败，请清理缓存后重试。");
+    return attempts[attempts.length - 1].projects;
+  }
+
+  useEffect(() => {
+    const compactProjects = persistProjectsStorage(projectsRef.current, { ...storageLimits(), closeRunningTurns: true });
     projectsRef.current = compactProjects;
     setProjects(compactProjects);
-    localStorage.setItem(PROJECTS_STORAGE_KEY, JSON.stringify(compactProjects));
+  }, []);
+
+  function saveProjects(nextProjects) {
+    const compactProjects = persistProjectsStorage(nextProjects);
+    projectsRef.current = compactProjects;
+    setProjects(compactProjects);
   }
 
   function getSessionById(sessionId) {
@@ -1264,18 +1304,16 @@ export default function App() {
       })
     }));
     if (changed) {
-      const compactProjects = normalizeStoredProjects(nextProjects, storageLimits());
+      const compactProjects = persist ? persistProjectsStorage(nextProjects) : normalizeStoredProjects(nextProjects, storageLimits());
       projectsRef.current = compactProjects;
       setProjects(compactProjects);
-      if (persist) localStorage.setItem(PROJECTS_STORAGE_KEY, JSON.stringify(compactProjects));
     }
     return updatedSession;
   }
 
   function persistCurrentSessionOutput() {
-    const compactProjects = normalizeStoredProjects(projectsRef.current, storageLimits());
+    const compactProjects = persistProjectsStorage(projectsRef.current);
     projectsRef.current = compactProjects;
-    localStorage.setItem(PROJECTS_STORAGE_KEY, JSON.stringify(compactProjects));
   }
 
   function schedulePersistCurrentSessionOutput() {
@@ -1586,7 +1624,7 @@ export default function App() {
     });
 
     const unsubs = [];
-    forceDebugLog("app mounted", {
+    debugLog("app mounted", {
       projectCount: projectsRef.current.length,
       activeProjectId: activeProjectIdRef.current,
       activeProjectSessionId: activeProjectSessionIdRef.current
@@ -1661,17 +1699,27 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const project = projects.find((p) => p.id === activeProjectId);
-    const session = project?.sessions?.find((s) => s.id === activeProjectSessionId);
+    const resolved = resolveStoredActiveSession(projects, activeProjectId, activeProjectSessionId);
+    const project = projects.find((p) => p.id === resolved.projectId);
+    const session = project?.sessions?.find((s) => s.id === resolved.sessionId);
     if (project && session) {
+      if (resolved.projectId !== activeProjectId) {
+        setActiveProjectId(resolved.projectId);
+        return;
+      }
+      if (resolved.sessionId !== activeProjectSessionId) {
+        setActiveProjectSessionId(resolved.sessionId);
+        return;
+      }
       setWorkdir(project.path);
       localStorage.setItem("workdir", project.path);
       localStorage.setItem(ACTIVE_PROJECT_STORAGE_KEY, project.id);
       localStorage.setItem(ACTIVE_SESSION_STORAGE_KEY, session.id);
-    } else {
-      localStorage.removeItem(ACTIVE_PROJECT_STORAGE_KEY);
-      localStorage.removeItem(ACTIVE_SESSION_STORAGE_KEY);
+      return;
     }
+
+    localStorage.removeItem(ACTIVE_PROJECT_STORAGE_KEY);
+    localStorage.removeItem(ACTIVE_SESSION_STORAGE_KEY);
   }, [projects, activeProjectId, activeProjectSessionId]);
 
   function createOrSelectProjectForPath(path, { createNewSession = false, sessionTitle = "新 Pi 会话", startCommand = "" } = {}) {

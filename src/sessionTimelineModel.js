@@ -89,6 +89,14 @@ function normalizeTimelineItem(item, index) {
     };
   }
 
+  if (type === "note") {
+    return {
+      ...base,
+      title: String(item.title || "操作说明"),
+      text: stripAnsiText(item.text || item.detail || "")
+    };
+  }
+
   if (type === "file_reference" || type === "file_output") {
     return {
       ...base,
@@ -109,13 +117,18 @@ function normalizeTimelineItem(item, index) {
     return {
       ...base,
       title: String(item.title || "思考过程"),
-      text: stripAnsiText(item.text || "")
+      text: stripAnsiText(item.text || ""),
+      round: Number.isInteger(item.round) ? item.round : undefined,
+      roundClosed: Boolean(item.roundClosed)
     };
   }
 
   if (type === "command") {
     return {
       ...base,
+      toolCallId: String(item.tool_call_id || item.toolCallId || "").trim(),
+      toolName: String(item.tool_name || item.toolName || ""),
+      args: item.args && typeof item.args === "object" ? item.args : {},
       command: String(item.command || ""),
       cwd: String(item.cwd || ""),
       output: stripAnsiText(item.output || ""),

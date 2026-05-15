@@ -1267,11 +1267,12 @@ function eventMode() {
   return ["compact", "full", "off"].includes(value) ? value : "compact";
 }
 
-function shouldPersistTimelineEvent(eventType) {
+function shouldPersistTimelineEvent(eventType, payload = {}) {
   const mode = eventMode();
   if (mode === "full") return true;
   if (mode === "off") return false;
-  return eventType !== "message_update" && eventType !== "tool_execution_update";
+  if (eventType === "message_update") return payload.deltaType === "thinking_end";
+  return eventType !== "tool_execution_update";
 }
 
 function positiveEnvNumber(name, fallback) {
@@ -1555,7 +1556,7 @@ function emitModels(ctx, source = "unknown") {
 }
 
 function appendTimeline(ctx, eventType, payload = {}) {
-  if (!shouldPersistTimelineEvent(eventType)) return;
+  if (!shouldPersistTimelineEvent(eventType, payload)) return;
   appendEvent(ctx, {
     kind: "timeline",
     eventType,

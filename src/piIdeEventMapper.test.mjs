@@ -62,7 +62,7 @@ turns = applyPiIdeTimelineEvent(turns, {
 
 assert.equal(turns[0].items.find((item) => item.type === "assistant_message").text, "会话窗口正常，我在。");
 assert.equal(
-  turns[0].items.find((item) => item.type === "thinking").text.includes("The user is simply testing"),
+  turns[0].items.some((item) => item.type === "thinking" && item.text.includes("The user is simply testing")),
   true
 );
 
@@ -88,7 +88,7 @@ assert.equal(
 - 需要嵌套或更复杂的表格？`
 );
 assert.equal(
-  turns[0].items.find((item) => item.type === "thinking").text.includes("The user is asking me to test table output again"),
+  turns[0].items.some((item) => item.type === "thinking" && item.text.includes("The user is asking me to test table output again")),
   true
 );
 
@@ -177,5 +177,85 @@ turns = applyPiIdeTimelineEvent(turns, {
 
 assert.equal(turns[0].status, "completed");
 assert.equal(turns[0].items.find((item) => item.type === "assistant_message").status, "completed");
+
+let processTurns = applyPiIdeTimelineEvent(baseTurns, {
+  kind: "timeline",
+  eventType: "message_update",
+  deltaType: "thinking_delta",
+  delta: "先分析需求"
+}, { now: "2026-05-12T00:01:00.000Z", makeId });
+
+processTurns = applyPiIdeTimelineEvent(processTurns, {
+  kind: "timeline",
+  eventType: "message_update",
+  deltaType: "thinking_end",
+  content: "先分析需求"
+}, { now: "2026-05-12T00:01:01.000Z", makeId });
+
+processTurns = applyPiIdeTimelineEvent(processTurns, {
+  kind: "timeline",
+  eventType: "tool_execution_start",
+  toolCallId: "read-1",
+  toolName: "read",
+  args: { path: "src/App.jsx" }
+}, { now: "2026-05-12T00:01:02.000Z", makeId });
+
+processTurns = applyPiIdeTimelineEvent(processTurns, {
+  kind: "timeline",
+  eventType: "tool_execution_update",
+  toolCallId: "read-1",
+  toolName: "read",
+  args: { path: "src/App.jsx" },
+  partialResult: { content: [{ type: "text", text: "partial" }] }
+}, { now: "2026-05-12T00:01:02.500Z", makeId });
+
+processTurns = applyPiIdeTimelineEvent(processTurns, {
+  kind: "timeline",
+  eventType: "tool_execution_end",
+  toolCallId: "read-1",
+  toolName: "read",
+  result: { content: [{ type: "text", text: "file content" }] },
+  isError: false
+}, { now: "2026-05-12T00:01:03.000Z", makeId });
+
+processTurns = applyPiIdeTimelineEvent(processTurns, {
+  kind: "timeline",
+  eventType: "message_update",
+  deltaType: "thinking_delta",
+  delta: "根据文件继续"
+}, { now: "2026-05-12T00:01:04.000Z", makeId });
+
+const thinkingItems = processTurns[0].items.filter((item) => item.type === "thinking");
+assert.equal(thinkingItems.length, 2);
+assert.equal(thinkingItems[0].roundClosed, true);
+assert.equal(thinkingItems[0].status, "completed");
+assert.equal(thinkingItems[1].round, 2);
+assert.equal(thinkingItems[1].status, "running");
+
+const readCommand = processTurns[0].items.find((item) => item.id === "command-read-1");
+assert.equal(readCommand.toolName, "read");
+assert.equal(readCommand.command, "read src/App.jsx");
+assert.equal(readCommand.output, "file content");
+assert.equal(readCommand.status, "completed");
+
+let noteTurns = applyPiIdeTimelineEvent(baseTurns, {
+  kind: "timeline",
+  eventType: "message_update",
+  deltaType: "text_delta",
+  delta: "控制台 GBK 编码不支持 emoji，让我修复一下："
+}, { now: "2026-05-12T00:02:00.000Z", makeId });
+
+noteTurns = applyPiIdeTimelineEvent(noteTurns, {
+  kind: "timeline",
+  eventType: "tool_execution_start",
+  toolCallId: "edit-1",
+  toolName: "edit",
+  args: { path: "src/processor.py" }
+}, { now: "2026-05-12T00:02:01.000Z", makeId });
+
+const note = noteTurns[0].items.find((item) => item.type === "note");
+assert.equal(note.text, "控制台 GBK 编码不支持 emoji，让我修复一下：");
+assert.equal(noteTurns[0].items.find((item) => item.type === "assistant_message").text, "");
+assert.equal(noteTurns[0].items.find((item) => item.id === "command-edit-1").command, "edit src/processor.py");
 
 console.log("pi ide event mapper ok");
