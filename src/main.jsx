@@ -25,13 +25,13 @@ function errorData(error, extra = {}) {
   };
 }
 
-function bootLog(message, data = undefined) {
+function bootLog(message, data = undefined, force = false) {
   const suffix = data === undefined ? "" : ` ${safeLogData(data)}`;
   invoke("append_debug_log", {
     source: "frontend-boot",
     message: `${message}${suffix}`,
     workdir: null,
-    force: true
+    force
   }).catch(() => {});
 }
 
@@ -42,25 +42,25 @@ window.addEventListener("error", (event) => {
     lineno: event.lineno,
     colno: event.colno,
     error: errorData(event.error)
-  });
+  }, true);
 });
 
 window.addEventListener("unhandledrejection", (event) => {
-  bootLog("unhandled rejection", errorData(event.reason));
+  bootLog("unhandled rejection", errorData(event.reason), true);
 });
 
 async function bootstrap() {
   bootLog("bootstrap start");
   const rootElement = document.getElementById("root");
   if (!rootElement) {
-    bootLog("root element missing");
+    bootLog("root element missing", undefined, true);
     return;
   }
 
   const { default: App } = await import("./App.jsx");
   createRoot(rootElement).render(
     <React.StrictMode>
-      <AppErrorBoundary onError={(error, info) => bootLog("react render error", errorData(error, info))}>
+      <AppErrorBoundary onError={(error, info) => bootLog("react render error", errorData(error, info), true)}>
         <App />
       </AppErrorBoundary>
     </React.StrictMode>
@@ -69,7 +69,7 @@ async function bootstrap() {
 }
 
 bootstrap().catch((error) => {
-  bootLog("bootstrap failed", errorData(error));
+  bootLog("bootstrap failed", errorData(error), true);
   const rootElement = document.getElementById("root");
   if (rootElement) {
     rootElement.innerHTML = "<div class=\"app-error-screen\"><div><strong>界面启动失败，已写入调试日志。</strong></div></div>";

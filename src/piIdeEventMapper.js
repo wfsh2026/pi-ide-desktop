@@ -1,3 +1,35 @@
+// ─── Session Debug Logging ──────────────────────────────────────────
+let sessionDebugEnabled = false;
+
+function initSessionDebug() {
+  try {
+    if (typeof localStorage !== "undefined" && localStorage.getItem("piIdeSessionDebug") === "1") {
+      sessionDebugEnabled = true;
+    }
+  } catch (_) { /* ignore */ }
+}
+initSessionDebug();
+
+function sessionDebug(category, message, data) {
+  if (!sessionDebugEnabled) return;
+  try {
+    console.log(`[pi-ide:${category}]`, message, data !== undefined ? safeClone(data) : "");
+  } catch (_) { /* ignore */ }
+}
+
+function safeClone(value) {
+  try {
+    return JSON.parse(JSON.stringify(value, (_k, v) => {
+      if (typeof v === "string" && v.length > 500) return v.slice(0, 500) + "…(truncated)";
+      return v;
+    }));
+  } catch (_) {
+    return String(value).slice(0, 500);
+  }
+}
+
+// ─── Turn Helpers ───────────────────────────────────────────────────
+
 function latestTurnIndex(turns) {
   if (!Array.isArray(turns) || turns.length === 0) return -1;
   for (let index = turns.length - 1; index >= 0; index -= 1) {
@@ -77,7 +109,10 @@ function splitReasoningAndAnswer(text) {
 function commandText(event) {
   if (event?.args?.command) return String(event.args.command);
   if (event?.args?.cmd) return String(event.args.cmd);
-  return String(event?.toolName || "tool");
+  const toolName = String(event?.toolName || "tool");
+  const args = event?.args && typeof event.args === "object" ? event.args : {};
+  const path = args.path || args.file || args.filePath || args.target || args.targetPath;
+  return path ? `${toolName} ${path}` : toolName;
 }
 
 function exitCode(event) {
@@ -201,20 +236,50 @@ function setAssistantBlockText(items, contentIndex, text, now, makeId) {
   }];
 }
 
+function nextThinkingRound(items) {
+  let maxRound = 0;
+  for (const item of items) {
+    if (item.type === "thinking" && typeof item.round === "number" && item.round > maxRound) {
+      maxRound = item.round;
+    }
+  }
+  return maxRound + 1;
+}
+
+function closeLastThinkingRound(items, now) {
+  let closed = false;
+  const next = items.map((item) => {
+    if (item.type === "thinking" && !item.roundClosed && !closed) {
+      closed = true;
+      sessionDebug("thinking", "close-last-round", { round: item.round, textLen: (item.text || "").length });
+      return { ...item, roundClosed: true, status: "completed", updated_at: now };
+    }
+    return item;
+  });
+  if (!closed) sessionDebug("thinking", "no-open-round-to-close", {});
+  return next;
+}
+
 function appendThinkingText(items, delta, now, makeId) {
   if (!delta) return items;
   let updated = false;
   const next = items.map((item) => {
-    if (item.type !== "thinking") return item;
+    if (item.type !== "thinking" || item.roundClosed) return item;
     updated = true;
     return { ...item, text: `${item.text || ""}${delta}`, status: "running", updated_at: now };
   });
-  if (updated) return next;
+  if (updated) {
+    sessionDebug("thinking", "append-delta", { deltaLen: delta.length });
+    return next;
+  }
+  const round = nextThinkingRound(items);
+  sessionDebug("thinking", "new-round", { round, deltaLen: delta.length, totalRounds: round });
   return [...next, {
     id: makeId("item"),
     type: "thinking",
-    title: "思考过程",
+    title: `思考过程 ${round}`,
     text: delta,
+    round,
     status: "running",
     created_at: now,
     updated_at: now
@@ -225,16 +290,18 @@ function setThinkingText(items, text, now, makeId) {
   if (!text) return items;
   let updated = false;
   const next = items.map((item) => {
-    if (item.type !== "thinking") return item;
+    if (item.type !== "thinking" || item.roundClosed) return item;
     updated = true;
     return { ...item, text, thinking_blocks: undefined, updated_at: now };
   });
   if (updated) return next;
+  const round = nextThinkingRound(items);
   return [...next, {
     id: makeId("item"),
     type: "thinking",
-    title: "思考过程",
+    title: `思考过程 ${round}`,
     text,
+    round,
     status: "running",
     created_at: now,
     updated_at: now
@@ -246,7 +313,7 @@ function setThinkingBlockText(items, contentIndex, text, now, makeId) {
   const blockKey = contentBlockKey(contentIndex);
   let updated = false;
   const next = items.map((item) => {
-    if (item.type !== "thinking") return item;
+    if (item.type !== "thinking" || item.roundClosed) return item;
     updated = true;
     const thinking_blocks = { ...(item.thinking_blocks || {}), [blockKey]: text };
     return {
@@ -258,17 +325,59 @@ function setThinkingBlockText(items, contentIndex, text, now, makeId) {
     };
   });
   if (updated) return next;
+  const round = nextThinkingRound(items);
   const thinking_blocks = { [blockKey]: text };
   return [...next, {
     id: makeId("item"),
     type: "thinking",
-    title: "思考过程",
+    title: `思考过程 ${round}`,
     thinking_blocks,
     text: orderedBlockText(thinking_blocks),
+    round,
     status: "running",
     created_at: now,
     updated_at: now
   }];
+}
+
+function appendProcessNote(items, text, now, makeId) {
+  const value = String(text || "").trim();
+  if (!value) return items;
+  return [...items, {
+    id: makeId("item"),
+    type: "note",
+    title: "操作说明",
+    text: value,
+    status: "completed",
+    created_at: now,
+    updated_at: now
+  }];
+}
+
+function transferAssistantPreambleToProcess(items, now, makeId) {
+  let noteText = "";
+  let noteIndex = -1;
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index];
+    if (item.type !== "assistant_message") continue;
+    const text = String(item.text || "").trim();
+    if (!text) break;
+    noteText = text;
+    noteIndex = index;
+    break;
+  }
+  if (noteIndex < 0) return items;
+  const next = items.map((item, index) => {
+    if (index !== noteIndex) return item;
+    return {
+      ...item,
+      text: "",
+      text_blocks: undefined,
+      status: "running",
+      updated_at: now
+    };
+  });
+  return appendProcessNote(next, noteText, now, makeId);
 }
 
 function firstTextValue(...values) {
@@ -293,6 +402,7 @@ function routeMessageDelta(items, delta, now, makeId) {
     }, now, makeId);
   }
   if (routed.answer) {
+    next = closeLastThinkingRound(next, now);
     next = upsertProgress(appendAssistantText(next, routed.answer, now, makeId), "progress-output", {
       title: "正在输出结果",
       detail: "",
@@ -307,12 +417,11 @@ function setRoutedMessageText(items, text, now, makeId) {
   const routed = splitReasoningAndAnswer(text);
   let next = items;
   if (routed.reasoning) next = setThinkingText(next, routed.reasoning, now, makeId);
-  if (routed.answer) next = setAssistantText(next, routed.answer, now, makeId);
+  if (routed.answer) next = setAssistantText(closeLastThinkingRound(next, now), routed.answer, now, makeId);
   return next;
 }
 
 function upsertCommand(items, event, patch, now, makeId) {
-  if (event.toolName && event.toolName !== "bash") return items;
   const id = event.toolCallId ? `command-${event.toolCallId}` : makeId("command");
   let updated = false;
   const next = items.map((item) => {
@@ -324,6 +433,9 @@ function upsertCommand(items, event, patch, now, makeId) {
   return [...next, {
     id,
     type: "command",
+    toolCallId: event.toolCallId || "",
+    toolName: event.toolName || "",
+    args: event.args && typeof event.args === "object" ? event.args : {},
     command: commandText(event),
     cwd: event.cwd || "",
     output: "",
@@ -563,7 +675,7 @@ function applyEventToItems(items, event, now, makeId) {
     if (event.deltaType === "text_delta") {
       const blockText = eventBlockText(event);
       if (blockText) {
-        return upsertProgress(setAssistantBlockText(nextItems, event.contentIndex, blockText, now, makeId), "progress-output", {
+        return upsertProgress(setAssistantBlockText(closeLastThinkingRound(nextItems, now), event.contentIndex, blockText, now, makeId), "progress-output", {
           title: "正在输出结果",
           detail: "",
           status: "running"
@@ -574,7 +686,7 @@ function applyEventToItems(items, event, now, makeId) {
     if (event.deltaType === "text_end") {
       const text = firstTextValue(event.content, eventBlockText(event), event.delta);
       if (event.contentIndex !== undefined && text) {
-        return setAssistantBlockText(nextItems, event.contentIndex, text, now, makeId);
+        return setAssistantBlockText(closeLastThinkingRound(nextItems, now), event.contentIndex, text, now, makeId);
       }
       return setRoutedMessageText(nextItems, text, now, makeId);
     }
@@ -594,10 +706,10 @@ function applyEventToItems(items, event, now, makeId) {
       const updatedItems = event.contentIndex !== undefined
         ? setThinkingBlockText(nextItems, event.contentIndex, text, now, makeId)
         : setThinkingText(nextItems, text, now, makeId);
-      return upsertProgress(updatedItems, "progress-thinking", {
+      return upsertProgress(closeLastThinkingRound(updatedItems, now), "progress-thinking", {
         title: "正在思考",
         detail: "",
-        status: "running"
+        status: "completed"
       }, now, makeId);
     }
     return nextItems;
@@ -615,7 +727,10 @@ function applyEventToItems(items, event, now, makeId) {
 
   if (eventType === "tool_execution_start") {
     const command = commandText(event);
-    let nextItems = upsertProgress(upsertCommand(items, event, {
+    sessionDebug("event", "tool_execution_start", { command, toolName: event.toolName });
+    const itemsAfterNote = transferAssistantPreambleToProcess(items, now, makeId);
+    const itemsAfterThinking = closeLastThinkingRound(itemsAfterNote, now);
+    let nextItems = upsertProgress(upsertCommand(itemsAfterThinking, event, {
       command,
       cwd: event.cwd || "",
       status: "running"
@@ -659,6 +774,7 @@ function applyEventToItems(items, event, now, makeId) {
 
   if (eventType === "tool_execution_end") {
     const commandEvent = commandEventFromItems(items, event);
+    sessionDebug("event", "tool_execution_end", { command: commandText(commandEvent), isError: event.isError, exitCode: exitCode(event) });
     let nextItems = upsertProgress(upsertCommand(items, commandEvent, {
       output: resultText(event.result),
       exit_code: exitCode(event),
@@ -685,6 +801,7 @@ function applyEventToItems(items, event, now, makeId) {
   }
 
   if (eventType === "agent_end") {
+    sessionDebug("event", "agent_end", { totalItems: items.length });
     return upsertProgress(completeItems(items, "completed", now), progressKey(event), {
       title: "AI 已完成本轮任务",
       detail: "",
@@ -709,6 +826,7 @@ function applyEventToItems(items, event, now, makeId) {
 
 export function applyPiIdeTimelineEvent(turns, event, options = {}) {
   if (!event || !["timeline", "subagent"].includes(event.kind)) return turns;
+  sessionDebug("event", "incoming", { eventType: event.eventType || event.type, toolName: event.toolName, deltaType: event.deltaType });
   const list = Array.isArray(turns) ? turns : [];
   const index = latestTurnIndex(list);
   if (index < 0) return list;
@@ -721,16 +839,30 @@ export function applyPiIdeTimelineEvent(turns, event, options = {}) {
     : failedEvent ? "failed"
     : undefined;
 
-  return list.map((turn, turnIndex) => {
+  const result = list.map((turn, turnIndex) => {
     if (turnIndex !== index) return turn;
     const currentItems = Array.isArray(turn.items) ? turn.items : [];
-    return {
+    const newItems = event.kind === "subagent"
+      ? applySubagentEventToItems(currentItems, event, now, makeId)
+      : applyEventToItems(currentItems, event, now, makeId);
+    const newTurn = {
       ...turn,
       status: finalStatus || turn.status || "running",
-      items: event.kind === "subagent"
-        ? applySubagentEventToItems(currentItems, event, now, makeId)
-        : applyEventToItems(currentItems, event, now, makeId),
+      items: newItems,
       updated_at: now
     };
+    // Summarize turn state after each event
+    const summary = {
+      turnStatus: newTurn.status,
+      totalItems: newItems.length,
+      thinkingItems: newItems.filter((i) => i.type === "thinking").length,
+      openThinking: newItems.filter((i) => i.type === "thinking" && !i.roundClosed).length,
+      commandItems: newItems.filter((i) => i.type === "command").length,
+      runningCommands: newItems.filter((i) => i.type === "command" && i.status === "running").length,
+      assistantLen: (newItems.find((i) => i.type === "assistant_message")?.text || "").length
+    };
+    sessionDebug("turn", "state", summary);
+    return newTurn;
   });
+  return result;
 }

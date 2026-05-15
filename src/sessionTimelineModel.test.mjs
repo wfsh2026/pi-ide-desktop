@@ -53,16 +53,25 @@ const itemTimeline = buildSessionTimeline({
     id: "t3",
     items: [
       { type: "progress", title: "运行测试", status: "completed" },
-      { type: "thinking", text: "\u001b[33m先理解需求\u001b[0m", status: "completed" },
+      { type: "note", title: "操作说明", text: "\u001b[33m准备读取文件\u001b[0m", status: "completed" },
+      { type: "thinking", text: "\u001b[33m先理解需求\u001b[0m", round: 2, roundClosed: true, status: "completed" },
+      { type: "command", toolCallId: "call-read", toolName: "read", args: { path: "src/App.jsx" }, command: "read src/App.jsx", status: "completed" },
       { type: "file_output", files: [{ name: "App.jsx", path: "src/App.jsx" }] }
     ]
   }]
 });
 
 assert.equal(itemTimeline[0].items[0].type, "progress");
-assert.equal(itemTimeline[0].items[1].type, "thinking");
-assert.equal(itemTimeline[0].items[1].text, "先理解需求");
-assert.equal(itemTimeline[0].items[2].files[0].path, "src/App.jsx");
+assert.equal(itemTimeline[0].items[1].type, "note");
+assert.equal(itemTimeline[0].items[1].text, "准备读取文件");
+assert.equal(itemTimeline[0].items[2].type, "thinking");
+assert.equal(itemTimeline[0].items[2].text, "先理解需求");
+assert.equal(itemTimeline[0].items[2].round, 2);
+assert.equal(itemTimeline[0].items[2].roundClosed, true);
+assert.equal(itemTimeline[0].items[3].type, "command");
+assert.equal(itemTimeline[0].items[3].toolName, "read");
+assert.equal(itemTimeline[0].items[3].args.path, "src/App.jsx");
+assert.equal(itemTimeline[0].items[4].files[0].path, "src/App.jsx");
 
 const sections = splitMarkdownSections("说明\n```js\nconsole.log(1)\n```\n完成");
 assert.equal(sections.length, 3);
