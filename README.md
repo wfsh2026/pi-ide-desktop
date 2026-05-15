@@ -95,10 +95,10 @@ npm run package:release
 产物：
 
 ```text
-release/pi-ide-desktop_1.x.0_x64-setup.exe
-release/pi-ide-desktop_1.x.0_x64_en-US.msi
+release/pi-ide-desktop_2.0.0_x64-setup.exe
+release/pi-ide-desktop_2.0.0_x64_en-US.msi
 release/pi-ide-desktop.exe
-release/SHA256SUMS-1.x.0.txt
+release/SHA256SUMS-2.0.0.txt
 ```
 
 ## 本地数据位置
