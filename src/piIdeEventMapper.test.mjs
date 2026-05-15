@@ -164,6 +164,72 @@ assert.equal(command.command, "rg --files");
 assert.equal(command.output, "src/App.jsx");
 assert.equal(command.status, "completed");
 
+turns = applyPiIdeTimelineEvent(turns, {
+  kind: "subagent",
+  eventType: "subagent_start",
+  runId: "reviewer-1",
+  agentName: "reviewer",
+  task: "review current diff",
+  model: { id: "gpt-5.5", provider: "openai" }
+}, { now: "2026-05-12T00:00:03.200Z", makeId });
+
+turns = applyPiIdeTimelineEvent(turns, {
+  kind: "subagent",
+  eventType: "subagent_end",
+  runId: "reviewer-1",
+  agentName: "reviewer",
+  summary: "No blocking issues.",
+  status: "completed",
+  artifactPaths: ["C:\\repo\\.pi\\agent\\sessions\\child.jsonl"]
+}, { now: "2026-05-12T00:00:03.600Z", makeId });
+
+const subagentGroup = turns[0].items.find((item) => item.type === "subagent_group");
+assert.equal(subagentGroup.runs.length, 1);
+assert.equal(subagentGroup.runs[0].agent_name, "reviewer");
+assert.equal(subagentGroup.runs[0].task, "review current diff");
+assert.equal(subagentGroup.runs[0].status, "completed");
+assert.equal(subagentGroup.runs[0].summary, "No blocking issues.");
+assert.equal(subagentGroup.runs[0].files[0].name, "child.jsonl");
+
+let definitionTurns = applyPiIdeTimelineEvent(baseTurns, {
+  kind: "timeline",
+  eventType: "tool_execution_start",
+  toolCallId: "call-agent-write",
+  toolName: "write",
+  args: { path: "C:\\repo\\.pi\\agents\\modify-number.md" }
+}, { now: "2026-05-12T00:00:03.700Z", makeId });
+
+const definitionGroup = definitionTurns[0].items.find((item) => item.type === "subagent_group");
+assert.equal(definitionGroup.runs.length, 1);
+assert.equal(definitionGroup.runs[0].agent_name, "modify-number");
+assert.equal(definitionGroup.runs[0].status, "defined");
+assert.equal(definitionGroup.runs[0].files[0].source, "subagent-definition");
+
+let intercomTurns = applyPiIdeTimelineEvent(baseTurns, {
+  kind: "timeline",
+  eventType: "tool_execution_start",
+  toolCallId: "call-intercom",
+  toolName: "intercom",
+  args: { target: "subagent-chat-1", message: "inspect project" }
+}, { now: "2026-05-12T00:00:03.800Z", makeId });
+
+intercomTurns = applyPiIdeTimelineEvent(intercomTurns, {
+  kind: "timeline",
+  eventType: "tool_execution_end",
+  toolCallId: "call-intercom",
+  toolName: "intercom",
+  args: { target: "subagent-chat-1", message: "inspect project" },
+  result: { content: [{ type: "text", text: "Reply from subagent-chat-1: done" }] },
+  isError: false
+}, { now: "2026-05-12T00:00:04.000Z", makeId });
+
+const intercomGroup = intercomTurns[0].items.find((item) => item.type === "subagent_group");
+assert.equal(intercomGroup.runs.length, 1);
+assert.equal(intercomGroup.runs[0].agent_name, "subagent-chat-1");
+assert.equal(intercomGroup.runs[0].task, "inspect project");
+assert.equal(intercomGroup.runs[0].status, "completed");
+assert.equal(intercomGroup.runs[0].summary, "Reply from subagent-chat-1: done");
+
 const progressItems = turns[0].items.filter((item) => item.type === "progress");
 assert.equal(progressItems.some((item) => item.title === "正在思考"), true);
 assert.equal(progressItems.some((item) => item.title === "正在输出结果"), true);

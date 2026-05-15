@@ -1,8 +1,15 @@
 export const DEFAULT_STORAGE_LIMITS = {
-  terminalPreviewChars: 1024 * 1024,
-  sessionTextPreviewChars: 10 * 1024 * 1024,
-  sessionTurnLimit: 100000,
-  sessionFileRecordLimit: 10000
+  terminalPreviewChars: 64 * 1024,
+  sessionTextPreviewChars: 128 * 1024,
+  sessionTurnLimit: 50,
+  sessionFileRecordLimit: 500
+};
+
+const QUOTA_STORAGE_LIMITS = {
+  terminalPreviewChars: 1,
+  sessionTextPreviewChars: 16 * 1024,
+  sessionTurnLimit: 20,
+  sessionFileRecordLimit: 200
 };
 
 export function positiveInteger(value, fallback) {
@@ -48,6 +55,28 @@ function compactTimelineItem(item, limits) {
   if (Array.isArray(next.attachments)) {
     next.attachments = limitArrayTail(next.attachments, limits.sessionFileRecordLimit);
   }
+  if (Array.isArray(next.items)) {
+    next.items = next.items.map((child) => compactTimelineItem(child, limits));
+  }
+  if (Array.isArray(next.runs)) {
+    next.runs = next.runs.map((run) => {
+      const compactRun = { ...run };
+      for (const key of ["task", "summary", "cwd", "session_file"]) {
+        if (typeof compactRun[key] === "string") {
+          const limited = limitTextValue(compactRun[key], limits.sessionTextPreviewChars);
+          compactRun[key] = limited.text;
+          if (limited.truncated) compactRun[`${key}_truncated`] = true;
+        }
+      }
+      if (Array.isArray(compactRun.items)) {
+        compactRun.items = compactRun.items.map((child) => compactTimelineItem(child, limits));
+      }
+      if (Array.isArray(compactRun.files)) {
+        compactRun.files = limitArrayTail(compactRun.files, limits.sessionFileRecordLimit);
+      }
+      return compactRun;
+    });
+  }
   return next;
 }
 
@@ -80,5 +109,55 @@ export function normalizeStoredProjects(projects, limits = {}) {
   return (Array.isArray(projects) ? projects : []).map((project) => ({
     ...project,
     sessions: (Array.isArray(project?.sessions) ? project.sessions : []).map((session) => compactSession(session, merged))
+  }));
+}
+
+function compactModel(model) {
+  if (!model || typeof model !== "object") return null;
+  return {
+    id: model.id || model.model || "",
+    name: model.name || model.id || model.model || "",
+    provider: model.provider || "",
+    api: model.api || ""
+  };
+}
+
+function compactQuotaSession(session) {
+  const compact = compactSession(session, QUOTA_STORAGE_LIMITS);
+  return {
+    id: compact.id,
+    title: compact.title,
+    created_at: compact.created_at,
+    updated_at: compact.updated_at,
+    archived: compact.archived,
+    archived_at: compact.archived_at,
+    user_renamed: compact.user_renamed,
+    first_prompt: limitTextValue(compact.first_prompt || "", QUOTA_STORAGE_LIMITS.sessionTextPreviewChars).text,
+    draft_command: limitTextValue(compact.draft_command || "", 4096).text,
+    workdir: compact.workdir,
+    output: "",
+    output_truncated: Boolean(compact.output || compact.output_truncated),
+    output_bytes: Number(compact.output_bytes) || 0,
+    turns: compact.turns,
+    turns_truncated: compact.turns_truncated,
+    referenced_files: limitArrayTail(compact.referenced_files, QUOTA_STORAGE_LIMITS.sessionFileRecordLimit),
+    output_files: limitArrayTail(compact.output_files, QUOTA_STORAGE_LIMITS.sessionFileRecordLimit),
+    attachments: limitArrayTail(compact.attachments, 50),
+    current_model: compactModel(compact.current_model),
+    pending_model: compactModel(compact.pending_model)
+  };
+}
+
+export function normalizeStoredProjectsForQuota(projects) {
+  return (Array.isArray(projects) ? projects : []).map((project) => ({
+    id: project?.id,
+    name: project?.name,
+    path: project?.path,
+    created_at: project?.created_at,
+    updated_at: project?.updated_at,
+    collapsed: project?.collapsed,
+    archived: project?.archived,
+    archived_at: project?.archived_at,
+    sessions: (Array.isArray(project?.sessions) ? project.sessions : []).map(compactQuotaSession)
   }));
 }

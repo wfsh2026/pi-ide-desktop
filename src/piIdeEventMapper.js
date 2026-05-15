@@ -361,6 +361,184 @@ function commandEventFromItems(items, event) {
   return command ? { ...event, args: { ...(event.args || {}), command } } : event;
 }
 
+function agentDefinitionPath(event) {
+  const raw = event?.args?.path || event?.input?.path || event?.path || "";
+  const value = String(raw || "").trim();
+  if (!value) return "";
+  return /(^|[\\/])\.pi[\\/]agents[\\/][^\\/]+\.md$/i.test(value) ? value : "";
+}
+
+function fileNameFromPath(value) {
+  return String(value || "").split(/[\\/]/).filter(Boolean).pop() || String(value || "");
+}
+
+function agentNameFromPath(value) {
+  return fileNameFromPath(value).replace(/\.md$/i, "") || "subagent";
+}
+
+function isIntercomTool(event) {
+  return /^intercom$/i.test(String(event?.toolName || ""));
+}
+
+function intercomName(event) {
+  const args = event?.args || event?.input || {};
+  return String(args.target || args.to || args.session || args.sessionId || args.name || "intercom").trim();
+}
+
+function intercomTask(event) {
+  const args = event?.args || event?.input || {};
+  return String(args.message || args.task || args.prompt || args.input || commandText(event)).trim();
+}
+
+function subagentRunId(event) {
+  return String(event?.runId || event?.run_id || event?.toolCallId || event?.id || "subagent");
+}
+
+function subagentAgentName(event) {
+  return String(event?.agentName || event?.agent || event?.name || event?.role || event?.toolName || "subagent").trim();
+}
+
+function subagentStatus(eventType, event) {
+  if (event?.status) return event.status;
+  if (eventType === "subagent_definition") return "defined";
+  if (eventType === "subagent_end") return event.isError ? "failed" : "completed";
+  if (eventType === "subagent_error") return "failed";
+  return "running";
+}
+
+function appendSubagentMessage(run, text, now, makeId, append = false) {
+  const value = String(text || "").trim();
+  if (!value) return run;
+  const last = [...(run.items || [])].reverse().find((item) => item.type === "assistant_message");
+  const nextItems = (run.items || []).map((item) => {
+    if (!last || item.id !== last.id) return item;
+    return { ...item, text: append ? `${item.text || ""}${value}` : value, updated_at: now };
+  });
+  if (last) return { ...run, items: nextItems };
+  return {
+    ...run,
+    items: [...(run.items || []), {
+      id: makeId("subagent-message"),
+      type: "assistant_message",
+      text: value,
+      status: "running",
+      created_at: now,
+      updated_at: now
+    }]
+  };
+}
+
+function mergeSubagentRun(run, event, now, makeId) {
+  const eventType = event.eventType || event.type;
+  const status = subagentStatus(eventType, event);
+  let next = {
+    id: subagentRunId(event),
+    agent_name: subagentAgentName(event),
+    role: event.role || "",
+    task: event.task || "",
+    action: event.action || "",
+    model: event.model,
+    cwd: event.cwd || "",
+    status,
+    started_at: now,
+    updated_at: now,
+    items: [],
+    files: [],
+    ...(run || {})
+  };
+
+  next = {
+    ...next,
+    agent_name: subagentAgentName(event) || next.agent_name,
+    role: event.role || next.role,
+    task: event.task || next.task,
+    action: event.action || next.action,
+    model: event.model || next.model,
+    cwd: event.cwd || next.cwd,
+    status,
+    session_file: event.sessionFile || event.session_file || next.session_file,
+    updated_at: now,
+    ended_at: status === "completed" || status === "failed" ? now : next.ended_at
+  };
+
+  if (eventType === "subagent_start") {
+    next.items = upsertProgress(next.items || [], `subagent-progress-${next.id}`, {
+      title: `子 Agent ${next.agent_name} 已启动`,
+      detail: next.task,
+      status: "running"
+    }, now, makeId);
+  } else if (eventType === "subagent_message") {
+    next = appendSubagentMessage(next, event.text || event.delta || event.summary, now, makeId, Boolean(event.delta && !event.text));
+  } else if (eventType === "subagent_end") {
+    next.summary = event.summary || event.text || next.summary || "";
+    if (next.summary) next = appendSubagentMessage(next, next.summary, now, makeId);
+    next.items = upsertProgress(completeItems(next.items || [], status, now), `subagent-progress-${next.id}`, {
+      title: status === "failed" ? `子 Agent ${next.agent_name} 执行失败` : `子 Agent ${next.agent_name} 已完成`,
+      detail: "",
+      status
+    }, now, makeId);
+  } else if (eventType === "subagent_definition") {
+    next.summary = event.summary || next.summary || "";
+    next.items = upsertProgress(next.items || [], `subagent-progress-${next.id}`, {
+      title: `子 Agent ${next.agent_name} 已定义`,
+      detail: event.path || next.task,
+      status: "completed"
+    }, now, makeId);
+  } else if (eventType === "subagent_error") {
+    next.items = [...completeItems(next.items || [], "failed", now), {
+      id: makeId("subagent-error"),
+      type: "error",
+      title: `子 Agent ${next.agent_name} 执行失败`,
+      detail: event.error || event.message || "Subagent failed",
+      status: "failed",
+      created_at: now,
+      updated_at: now
+    }];
+  } else {
+    next.items = applyEventToItems(next.items || [], { ...event, kind: "timeline" }, now, makeId);
+  }
+
+  const artifactPaths = Array.isArray(event.artifactPaths) ? event.artifactPaths : [];
+  const explicitPaths = event.path ? [event.path, ...artifactPaths] : artifactPaths;
+  const files = explicitPaths.map((path) => ({
+    path,
+    name: fileNameFromPath(path),
+    source: eventType === "subagent_definition" ? "subagent-definition" : "subagent-artifact"
+  }));
+  const existing = new Set((next.files || []).map((file) => file.path || file.name));
+  next.files = [...(next.files || []), ...files.filter((file) => !existing.has(file.path || file.name))];
+  return next;
+}
+
+function applySubagentEventToItems(items, event, now, makeId) {
+  const runId = subagentRunId(event);
+  let foundGroup = false;
+  const next = items.map((item) => {
+    if (item.type !== "subagent_group") return item;
+    foundGroup = true;
+    let foundRun = false;
+    const runs = (item.runs || []).map((run) => {
+      if (String(run.id) !== runId) return run;
+      foundRun = true;
+      return mergeSubagentRun(run, event, now, makeId);
+    });
+    if (!foundRun) runs.push(mergeSubagentRun(null, event, now, makeId));
+    const status = runs.some((run) => run.status === "running") ? "running" : runs.some((run) => run.status === "failed") ? "failed" : "completed";
+    return { ...item, runs, status, updated_at: now };
+  });
+  if (foundGroup) return next;
+  const run = mergeSubagentRun(null, event, now, makeId);
+  return [...next, {
+    id: makeId("subagents"),
+    type: "subagent_group",
+    title: "子 Agent",
+    status: run.status || "running",
+    runs: [run],
+    created_at: now,
+    updated_at: now
+  }];
+}
+
 function applyEventToItems(items, event, now, makeId) {
   const eventType = event.eventType || event.type;
   const failedEvent = eventType === "extension_error" || (eventType === "auto_retry_end" && event.success === false);
@@ -437,7 +615,7 @@ function applyEventToItems(items, event, now, makeId) {
 
   if (eventType === "tool_execution_start") {
     const command = commandText(event);
-    return upsertProgress(upsertCommand(items, event, {
+    let nextItems = upsertProgress(upsertCommand(items, event, {
       command,
       cwd: event.cwd || "",
       status: "running"
@@ -446,6 +624,30 @@ function applyEventToItems(items, event, now, makeId) {
       detail: event.toolName === "bash" ? "" : command,
       status: "running"
     }, now, makeId);
+    const definitionPath = agentDefinitionPath(event);
+    if (definitionPath) {
+      nextItems = applySubagentEventToItems(nextItems, {
+        kind: "subagent",
+        eventType: "subagent_definition",
+        runId: `definition:${definitionPath}`,
+        agentName: agentNameFromPath(definitionPath),
+        task: `定义子 Agent ${agentNameFromPath(definitionPath)}`,
+        path: definitionPath,
+        summary: `已创建或更新子 Agent 定义：${definitionPath}`
+      }, now, makeId);
+    }
+    if (isIntercomTool(event)) {
+      nextItems = applySubagentEventToItems(nextItems, {
+        ...event,
+        kind: "subagent",
+        eventType: "subagent_start",
+        runId: subagentRunId(event),
+        agentName: intercomName(event),
+        task: intercomTask(event),
+        action: "intercom"
+      }, now, makeId);
+    }
+    return nextItems;
   }
 
   if (eventType === "tool_execution_update") {
@@ -457,7 +659,7 @@ function applyEventToItems(items, event, now, makeId) {
 
   if (eventType === "tool_execution_end") {
     const commandEvent = commandEventFromItems(items, event);
-    return upsertProgress(upsertCommand(items, commandEvent, {
+    let nextItems = upsertProgress(upsertCommand(items, commandEvent, {
       output: resultText(event.result),
       exit_code: exitCode(event),
       status: event.isError ? "failed" : "completed"
@@ -466,6 +668,20 @@ function applyEventToItems(items, event, now, makeId) {
       detail: "",
       status: event.isError ? "failed" : "completed"
     }, now, makeId);
+    if (isIntercomTool(event)) {
+      nextItems = applySubagentEventToItems(nextItems, {
+        ...event,
+        kind: "subagent",
+        eventType: "subagent_end",
+        runId: subagentRunId(event),
+        agentName: intercomName(event),
+        task: intercomTask(event),
+        summary: resultText(event.result),
+        status: event.isError ? "failed" : "completed",
+        isError: Boolean(event.isError)
+      }, now, makeId);
+    }
+    return nextItems;
   }
 
   if (eventType === "agent_end") {
@@ -492,7 +708,7 @@ function applyEventToItems(items, event, now, makeId) {
 }
 
 export function applyPiIdeTimelineEvent(turns, event, options = {}) {
-  if (!event || event.kind !== "timeline") return turns;
+  if (!event || !["timeline", "subagent"].includes(event.kind)) return turns;
   const list = Array.isArray(turns) ? turns : [];
   const index = latestTurnIndex(list);
   if (index < 0) return list;
@@ -507,10 +723,13 @@ export function applyPiIdeTimelineEvent(turns, event, options = {}) {
 
   return list.map((turn, turnIndex) => {
     if (turnIndex !== index) return turn;
+    const currentItems = Array.isArray(turn.items) ? turn.items : [];
     return {
       ...turn,
       status: finalStatus || turn.status || "running",
-      items: applyEventToItems(Array.isArray(turn.items) ? turn.items : [], event, now, makeId),
+      items: event.kind === "subagent"
+        ? applySubagentEventToItems(currentItems, event, now, makeId)
+        : applyEventToItems(currentItems, event, now, makeId),
       updated_at: now
     };
   });
