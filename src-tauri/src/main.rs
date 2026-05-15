@@ -518,6 +518,13 @@ mod config_tests {
   }
 
   #[test]
+  fn safe_file_name_component_replaces_path_separators() {
+    assert_eq!(safe_file_name_component("pi-run-1_session"), "pi-run-1_session");
+    assert_eq!(safe_file_name_component("pi/run:1 session"), "pi_run_1_session");
+    assert_eq!(safe_file_name_component(""), "default");
+  }
+
+  #[test]
   fn bridge_extension_handles_non_array_content() {
     let path = env::temp_dir().join(format!("pi-ide-bridge-content-{}.mjs", std::process::id()));
     let script = format!("{PI_IDE_BRIDGE_EXTENSION}\n{}", r#"
@@ -2667,17 +2674,35 @@ fn command_has_resume_flag(raw: &str) -> bool {
   raw.split_whitespace().any(|part| matches!(part, "--continue" | "-c" | "--resume" | "-r" | "--session" | "--fork"))
 }
 
+fn safe_file_name_component(value: &str) -> String {
+  let safe = value
+    .chars()
+    .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+    .collect::<String>();
+  if safe.is_empty() {
+    "default".to_string()
+  } else {
+    safe
+  }
+}
+
 #[cfg(windows)]
-fn build_pi_command(raw: &str, extra_args: &[String]) -> Result<CommandBuilder, String> {
+fn launch_script_path(script_id: Option<&str>) -> Result<PathBuf, String> {
+  let scripts_dir = storage_dir()?.join("launch-scripts");
+  fs::create_dir_all(&scripts_dir).map_err(|e| format!("创建启动脚本目录失败: {e}"))?;
+  let safe_id = safe_file_name_component(script_id.unwrap_or("default"));
+  Ok(scripts_dir.join(format!("pi-launch-{safe_id}.bat")))
+}
+
+#[cfg(windows)]
+fn build_pi_command(raw: &str, extra_args: &[String], launch_script_id: Option<&str>) -> Result<CommandBuilder, String> {
   let raw = raw.trim();
   if raw.is_empty() {
     return Err("Pi 命令为空".to_string());
   }
 
   if raw.contains('\n') || raw.contains('\r') || raw.to_ascii_lowercase().starts_with("@echo") || raw.to_ascii_lowercase().starts_with("set ") {
-    let scripts_dir = storage_dir()?.join("launch-scripts");
-    fs::create_dir_all(&scripts_dir).map_err(|e| format!("创建启动脚本目录失败: {e}"))?;
-    let script_path = scripts_dir.join("pi-launch.bat");
+    let script_path = launch_script_path(launch_script_id)?;
     let mut script = raw.replace('\r', "");
     if !script.ends_with('\n') { script.push('\n'); }
     fs::write(&script_path, script).map_err(|e| format!("写入启动脚本失败: {e}"))?;
@@ -2687,7 +2712,7 @@ fn build_pi_command(raw: &str, extra_args: &[String]) -> Result<CommandBuilder, 
     cmd.arg("/C");
     // 不要把带引号的 `call "..."` 拼成一个参数传给 cmd.exe。
     // portable-pty/CreateProcess 会再次转义内部引号，cmd 可能把
-    // `"C:\...\pi-launch.bat"` 当成带反斜杠和引号的字面命令，导致
+    // `"C:\...\pi-launch-*.bat"` 当成带反斜杠和引号的字面命令，导致
     // “不是内部或外部命令”。直接把脚本路径作为 /C 的命令参数交给
     // CommandBuilder 处理一次转义即可，含空格的用户目录也能正常启动。
     cmd.arg(script_path);
@@ -2737,7 +2762,7 @@ fn build_pi_command(raw: &str, extra_args: &[String]) -> Result<CommandBuilder, 
 }
 
 #[cfg(not(windows))]
-fn build_pi_command(raw: &str, extra_args: &[String]) -> Result<CommandBuilder, String> {
+fn build_pi_command(raw: &str, extra_args: &[String], _launch_script_id: Option<&str>) -> Result<CommandBuilder, String> {
   let parts = shell_words::split(raw).map_err(|e| format!("Pi 命令解析失败: {e}"))?;
   let (program, args) = parts.split_first().ok_or("Pi 命令为空")?;
   let mut cmd = CommandBuilder::new(program);
@@ -2910,9 +2935,9 @@ async fn start_pi_session(app: tauri::AppHandle, session_id: String, pi_command:
     extra_args,
     config_info
   ));
-  let mut cmd = build_pi_command(&raw, &extra_args)?;
   let session_dir = session_dir(&session_id)?;
   let run_id = format!("pi-run-{}-{}", chrono::Utc::now().timestamp_millis(), session_id);
+  let mut cmd = build_pi_command(&raw, &extra_args, Some(&run_id))?;
   cmd.env("PI_CODING_AGENT_SESSION_DIR", session_dir.to_string_lossy().to_string());
   cmd.env("PI_IDE_SESSION_ID", session_id.clone());
   cmd.env("PI_IDE_RUN_ID", run_id.clone());

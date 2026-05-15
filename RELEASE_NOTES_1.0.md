@@ -39,7 +39,7 @@
 - Windows 多行启动脚本已改为 `.bat`：
 
   ```text
-  ~/.pi-ide/launch-scripts/pi-launch.bat
+  ~/.pi-ide/launch-scripts/pi-launch-<run-id>.bat
   ```
 
 - 修复 Windows 启动脚本路径带引号时可能被 `cmd.exe` 误解析的问题。
@@ -62,7 +62,7 @@
 ### 增强输入与文件附件
 
 - 下方会话框支持多行输入。
-- 支持 `Ctrl/⌘ + Enter` 发送。
+- 支持 `Enter` 发送，`Ctrl/⌘ + Enter` 插入换行。
 - 支持通过“插入文件”选择文件并加入会话文件。
 - 支持从系统文件管理器拖入文件。
 - 支持从右侧目录树拖入具体文件。
