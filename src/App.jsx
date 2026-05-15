@@ -1157,7 +1157,6 @@ export default function App() {
 
   const inputRef = useRef(null);
   const outputBufferRef = useRef("");
-  const outputIdleTimersRef = useRef({});
   const startingSessionsRef = useRef(new Set());
   const sessionWarmupTimersRef = useRef({});
   const pendingPiInputsRef = useRef({});
@@ -1184,6 +1183,9 @@ export default function App() {
     () => activeProject?.sessions?.find((s) => s.id === activeProjectSessionId),
     [activeProject, activeProjectSessionId]
   );
+  const runningProjectPathsJson = useMemo(() => JSON.stringify([...new Set(
+    projects.flatMap((project) => (project.sessions || []).some((session) => piSessionStatus[session.id]?.running) ? [project.path] : [])
+  )].filter(Boolean)), [projects, piSessionStatus]);
   const isProcessing = Boolean(activeProjectSessionId && piSessionStatus[activeProjectSessionId]?.processing);
   const activeRuntimeModel = activeProjectSessionId ? piSessionStatus[activeProjectSessionId]?.model : null;
   const activePendingModel = activeProjectSession?.pending_model || null;
@@ -1516,12 +1518,6 @@ export default function App() {
     }
   }
 
-  function clearSessionIdleTimer(sessionId) {
-    const timer = outputIdleTimersRef.current[sessionId];
-    if (timer) clearTimeout(timer);
-    delete outputIdleTimersRef.current[sessionId];
-  }
-
   function updateSessionById(sessionId, updater, { persist = true } = {}) {
     if (!sessionId) return null;
     let updatedSession = null;
@@ -1726,7 +1722,6 @@ export default function App() {
         if (event.model) updateSessionModel(targetSessionId, event.model);
         const failedEvent = event.eventType === "extension_error" || (event.eventType === "auto_retry_end" && event.success === false);
         if (event.eventType === "agent_start") {
-          clearSessionIdleTimer(targetSessionId);
           setSessionRuntimeStatus(targetSessionId, { processing: true });
         }
         updateSessionById(targetSessionId, (session) => ({
@@ -1735,12 +1730,10 @@ export default function App() {
           updated_at: event.timestamp || new Date().toISOString()
         }));
         if (event.eventType === "agent_end") {
-          clearSessionIdleTimer(targetSessionId);
           setSessionRuntimeStatus(targetSessionId, { processing: false });
           markLatestTurnStatus(targetSessionId, "completed");
         }
         if (failedEvent) {
-          clearSessionIdleTimer(targetSessionId);
           setSessionRuntimeStatus(targetSessionId, { processing: false });
           markLatestTurnStatus(targetSessionId, "failed", event.error || event.finalError || event.errorMessage || "Pi 执行失败");
         }
@@ -1815,9 +1808,7 @@ export default function App() {
   }
 
   useEffect(() => {
-    const runningProjectPaths = [...new Set(
-      projects.flatMap((project) => (project.sessions || []).some((session) => piSessionStatus[session.id]?.running) ? [project.path] : [])
-    )].filter(Boolean);
+    const runningProjectPaths = JSON.parse(runningProjectPathsJson || "[]");
     if (runningProjectPaths.length === 0) return;
 
     let cancelled = false;
@@ -1838,7 +1829,7 @@ export default function App() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [projects, piSessionStatus]);
+  }, [runningProjectPathsJson]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -1894,7 +1885,6 @@ export default function App() {
         const stopped = text.includes("Pi 已停止") || text.includes("Pi 已退出");
         const previous = piSessionStatusRef.current[sessionId] || {};
         if (stopped) {
-          clearSessionIdleTimer(sessionId);
           markLatestTurnStatus(sessionId, "failed", text);
         }
         setSessionRuntimeStatus(sessionId, {
@@ -1923,17 +1913,10 @@ export default function App() {
       }
 
       if (!sessionId || !piSessionStatusRef.current[sessionId]?.processing) return;
-      clearSessionIdleTimer(sessionId);
       if (data.includes("[PTY 读取错误]") || data.includes("Pi 已停止") || data.includes("Pi 已退出")) {
         setSessionRuntimeStatus(sessionId, { processing: false });
         markLatestTurnStatus(sessionId, "failed", data);
-        return;
       }
-      outputIdleTimersRef.current[sessionId] = setTimeout(() => {
-        setSessionRuntimeStatus(sessionId, { processing: false });
-        markLatestTurnStatus(sessionId, "completed");
-        delete outputIdleTimersRef.current[sessionId];
-      }, 4000);
     }).then((f) => unsubs.push(f));
     getCurrentWebview().onDragDropEvent((event) => {
       if (event.payload?.type === "drop") {
@@ -1941,8 +1924,6 @@ export default function App() {
       }
     }).then((f) => unsubs.push(f));
     return () => {
-      Object.values(outputIdleTimersRef.current).forEach((timer) => clearTimeout(timer));
-      outputIdleTimersRef.current = {};
       Object.values(sessionWarmupTimersRef.current).forEach((timer) => clearTimeout(timer));
       sessionWarmupTimersRef.current = {};
       if (persistOutputTimerRef.current) clearTimeout(persistOutputTimerRef.current);
@@ -2461,7 +2442,6 @@ export default function App() {
 
   async function stopProjectSessionPi(sessionId, { reason = "manual" } = {}) {
     if (!sessionId) return;
-    clearSessionIdleTimer(sessionId);
     setSessionRuntimeStatus(sessionId, { idleStopping: true });
     try {
       await invoke("stop_pi_session", { sessionId });
@@ -2491,7 +2471,6 @@ export default function App() {
     const sessionId = activeProjectSessionIdRef.current;
     if (!sessionId) return;
     await sendToRunningPi(sessionId, "\x03");
-    clearSessionIdleTimer(sessionId);
     setSessionRuntimeStatus(sessionId, { processing: false });
     markLatestTurnStatus(sessionId, "cancelled");
   }
