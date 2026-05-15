@@ -27,8 +27,10 @@ export function processItemType(item) {
 }
 
 export function isSubagentTool(item) {
-  const value = `${item?.toolName || ""} ${item?.command || ""}`.toLowerCase();
-  return /\b(subagent|run_subagent|agent)\b/.test(value);
+  const toolName = String(item?.toolName || "").trim().toLowerCase();
+  const command = String(item?.command || "").trim().toLowerCase();
+  if (["subagent", "run_subagent", "spawn_agent"].includes(toolName)) return true;
+  return /^(subagent|run_subagent|spawn_agent)\b/.test(command);
 }
 
 export function commandDisplayLabel(item) {

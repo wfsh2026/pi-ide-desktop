@@ -11,6 +11,7 @@ import {
 } from "../processTimelineModel.js";
 import { buildResultView, resultStatusLabel, verificationSummary } from "../resultTimelineModel.js";
 import { buildSessionTimeline, splitMarkdownSections } from "../sessionTimelineModel.js";
+import { parseInlineTokens } from "../sessionMarkdownInlineModel.js";
 import { isTableRow, isTableSeparator, parseTableCells, tableStartsAt } from "../sessionMarkdownTableModel.js";
 
 // ─── Helpers ────────────────────────────────────────────────────────
@@ -103,37 +104,6 @@ function copyText(text) {
 }
 
 // ─── Inline Markdown ─────────────────────────────────────────────────
-
-function parseInlineTokens(text) {
-  const value = String(text || "");
-  if (!value) return [];
-  const tokenPattern = /(`[^`]+`)|(\*\*[^*]+\*\*)|(__[^_]+__)|(\*[^*]+\*)|(_[^_]+_)|(~~[^~]+~~)|(\[[^\]]+\]\([^)]+\))/g;
-  const tokens = [];
-  let lastIndex = 0;
-  let match;
-  while ((match = tokenPattern.exec(value)) !== null) {
-    if (match.index > lastIndex) tokens.push({ type: "text", text: value.slice(lastIndex, match.index) });
-    const raw = match[0];
-    if (raw.startsWith("`") && raw.endsWith("`")) {
-      tokens.push({ type: "code", text: raw.slice(1, -1) });
-    } else if ((raw.startsWith("**") && raw.endsWith("**")) || (raw.startsWith("__") && raw.endsWith("__"))) {
-      tokens.push({ type: "bold", text: raw.slice(2, -2) });
-    } else if (raw.startsWith("~~") && raw.endsWith("~~")) {
-      tokens.push({ type: "strikethrough", text: raw.slice(2, -2) });
-    } else if (raw.startsWith("*") && raw.endsWith("*")) {
-      tokens.push({ type: "italic", text: raw.slice(1, -1) });
-    } else if (raw.startsWith("_") && raw.endsWith("_")) {
-      tokens.push({ type: "italic", text: raw.slice(1, -1) });
-    } else if (raw.startsWith("[")) {
-      const linkMatch = raw.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
-      if (linkMatch) tokens.push({ type: "link", text: linkMatch[1], href: linkMatch[2] });
-      else tokens.push({ type: "text", text: raw });
-    }
-    lastIndex = tokenPattern.lastIndex;
-  }
-  if (lastIndex < value.length) tokens.push({ type: "text", text: value.slice(lastIndex) });
-  return tokens;
-}
 
 function InlineText({ text }) {
   const tokens = useMemo(() => parseInlineTokens(text), [text]);
@@ -313,6 +283,23 @@ function ChangeSummary({ files, onOpenFile }) {
           <ChevronDown size={13}/>
         </button>
       ))}
+    </div>
+  );
+}
+
+function ReferenceSection({ files, onOpenFile }) {
+  if (files.length === 0) return null;
+  return (
+    <div className="pi-session-reference-section">
+      <div className="pi-session-reference-title">参考文件</div>
+      <div className="pi-session-detail-files">
+        {files.map((file) => (
+          <button className="pi-session-reference-file" key={file.path || file.name} onClick={() => onOpenFile?.(file)}>
+            <File size={13}/>
+            <span>{file.path || file.name}</span>
+          </button>
+        ))}
+      </div>
     </div>
   );
 }
@@ -684,6 +671,7 @@ function TurnView({ turn, runtimeStatus, fallbackOutputFiles, expanded, expanded
       )}
 
       {parts.subagents.length > 0 && <SubagentInlineNotice groups={parts.subagents}/>}
+      <ReferenceSection files={parts.references} onOpenFile={onOpenFile}/>
 
       {!hasProcess && isRunning && <div className="pi-session-thinking">正在思考…</div>}
 
@@ -721,6 +709,7 @@ export default function SessionTimeline({ project, session, runtimeStatus, onOpe
   const fallbackOutputFiles = useMemo(() => uniqueFiles(session?.output_files || []).filter((f) => !turnOutputFileKeys.has(fileKey(f))), [session?.output_files, turnOutputFileKeys]);
   const fallbackOutputTurnId = useMemo(() => latestCompletedTurnId(turns), [turns]);
   const modelLabel = formatModel(runtimeStatus?.model || session?.current_model);
+  const runtimeLabel = runtimeStatus?.status ? `状态：${runtimeStatus.status}` : "";
 
   useEffect(() => { if (!active) return; const t = window.setInterval(() => setNow(Date.now()), 1000); return () => window.clearInterval(t); }, [active]);
   useEffect(() => { shouldAutoScrollRef.current = true; window.requestAnimationFrame(() => { if (viewportRef.current) viewportRef.current.scrollTop = viewportRef.current.scrollHeight; }); }, [session?.id]);
@@ -743,7 +732,7 @@ export default function SessionTimeline({ project, session, runtimeStatus, onOpe
       <div className="session-view-header">
         <div>
           <strong>{session.title || "新 Pi 会话"}</strong>
-          <small>{[project?.name || "未选择项目", modelLabel ? `模型：${modelLabel}` : ""].filter(Boolean).join(" · ")}</small>
+          <small>{[project?.name || "未选择项目", modelLabel ? `模型：${modelLabel}` : "", runtimeLabel].filter(Boolean).join(" · ")}</small>
         </div>
         <span className={`timeline-status ${active ? "active" : ""}`}>
           {active ? <Loader2 className="spin" size={14}/> : <Bot size={14}/>}

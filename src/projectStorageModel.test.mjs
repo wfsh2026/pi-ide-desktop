@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { limitTextValue, normalizeStoredProjects, normalizeStoredProjectsForQuota, positiveInteger } from "./projectStorageModel.js";
+import { limitTextValue, normalizeStoredProjects, normalizeStoredProjectsForQuota, positiveInteger, resolveActiveProjectSession } from "./projectStorageModel.js";
 
 assert.equal(positiveInteger("20", 5), 20);
 assert.equal(positiveInteger("-1", 5), 5);
@@ -63,5 +63,15 @@ assert.equal(quotaSession.output_truncated, true);
 assert.equal(quotaSession.turns.length, 20);
 assert.equal(quotaSession.available_models, undefined);
 assert.deepEqual(quotaSession.current_model, { id: "m1", name: "Model 1", provider: "p", api: "a" });
+
+const activeProjects = [
+  { id: "archived-project", archived: true, sessions: [{ id: "archived-session" }] },
+  { id: "p1", sessions: [{ id: "s1", archived: true }, { id: "s2" }] },
+  { id: "p2", sessions: [{ id: "s3" }] }
+];
+assert.deepEqual(resolveActiveProjectSession(activeProjects, "p2", "s3"), { projectId: "p2", sessionId: "s3" });
+assert.deepEqual(resolveActiveProjectSession(activeProjects, null, null), { projectId: "p1", sessionId: "s2" });
+assert.deepEqual(resolveActiveProjectSession(activeProjects, "missing", "missing"), { projectId: "p1", sessionId: "s2" });
+assert.deepEqual(resolveActiveProjectSession([{ id: "p3", archived: true, sessions: [{ id: "s4" }] }], null, null), { projectId: null, sessionId: null });
 
 console.log("project storage model ok");

@@ -4,6 +4,7 @@ import {
   commandDisplayLabel,
   commandToolIcon,
   filterProcessSteps,
+  isSubagentTool,
   normalizeProcessFilter,
   processFilterOptions,
   processSummaryText,
@@ -56,5 +57,8 @@ assert.equal(shouldAutoExpandProcessStep(view.steps.find((step) => step.id === "
 assert.equal(commandDisplayLabel({ command: "a".repeat(80) }), `${"a".repeat(72)}…`);
 assert.equal(commandToolIcon({ toolName: "read", command: "read src/App.jsx" }), "read");
 assert.equal(commandToolIcon({ toolName: "subagent", command: "subagent reviewer" }), "agent");
+assert.equal(isSubagentTool({ toolName: "bash", command: "npm view pi-coding-agent version" }), false);
+assert.equal(isSubagentTool({ toolName: "bash", command: "curl -A user-agent https://example.com" }), false);
+assert.equal(isSubagentTool({ toolName: "bash", command: "subagent reviewer" }), true);
 
 console.log("process timeline model ok");

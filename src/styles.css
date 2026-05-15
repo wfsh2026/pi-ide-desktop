@@ -40,6 +40,9 @@ label { font-size: 12px; color: var(--text-muted); display: block; margin: 10px 
 .app-error-screen strong { display: block; margin-bottom: 12px; color: var(--danger); }
 .app-error-screen pre { max-height: 360px; margin: 0; overflow: auto; color: var(--text-secondary); white-space: pre-wrap; font: 12px/1.5 Consolas, "Courier New", monospace; }
 .app { width: 100%; height: 100%; min-width: 0; display: grid; grid-template-columns: clamp(220px, 20vw, 280px) minmax(0, 1fr) clamp(240px, 24vw, 330px); background: var(--bg-app); }
+.app.directory-dragging, .app.directory-dragging * { cursor: grabbing !important; }
+.directory-drag-preview { position: fixed; z-index: 10001; pointer-events: none; display: inline-flex; align-items: center; gap: 6px; max-width: 260px; padding: 7px 9px; border: 1px solid var(--border-strong); border-radius: 8px; background: var(--bg-panel-elevated); color: var(--text-main); box-shadow: 0 10px 28px rgba(0,0,0,.36); font-size: 12px; line-height: 1; }
+.directory-drag-preview span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sidebar { min-width: 0; padding: 14px; background: var(--bg-sidebar); border-color: var(--border-subtle); display: flex; flex-direction: column; gap: 12px; min-height: 0; overflow: hidden; }
 .sidebar.left { border-right: 1px solid var(--border-subtle); }
 .sidebar.right { border-left: 1px solid var(--border-subtle); }
@@ -310,6 +313,11 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 .pi-session-detail-files { display: flex; flex-wrap: wrap; gap: 7px; }
 .pi-session-detail-files span { max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 5px 7px; border-radius: 999px; background: #242424; border: 1px solid rgba(255,255,255,.07); color: #d8d8d8; }
 .pi-session-detail-note { padding: 6px 0; color: #a8a8a8; }
+.pi-session-reference-section { display: flex; flex-direction: column; gap: 7px; color: #a8a8a8; font-size: 12px; }
+.pi-session-reference-title { color: #8f8f8f; font-weight: 700; }
+.pi-session-reference-file { max-width: 100%; display: inline-flex; align-items: center; gap: 5px; padding: 0; border: 0; background: transparent; color: #9cc4ff; }
+.pi-session-reference-file:hover { color: #c6dcff; background: transparent; }
+.pi-session-reference-file span { max-width: 260px; }
 
 /* ─── Enhanced Inline Markdown ──────────────────────────── */
 .pi-session-link { color: #8ab4f8; text-decoration: underline; text-underline-offset: 2px; }

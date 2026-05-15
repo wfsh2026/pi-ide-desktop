@@ -161,3 +161,19 @@ export function normalizeStoredProjectsForQuota(projects) {
     sessions: (Array.isArray(project?.sessions) ? project.sessions : []).map(compactQuotaSession)
   }));
 }
+
+export function resolveActiveProjectSession(projects, activeProjectId, activeSessionId) {
+  const list = Array.isArray(projects) ? projects : [];
+  const activeProject = list.find((project) => project?.id === activeProjectId && !project.archived);
+  const activeSession = activeProject?.sessions?.find((session) => session?.id === activeSessionId && !session.archived);
+  if (activeProject && activeSession) {
+    return { projectId: activeProject.id, sessionId: activeSession.id };
+  }
+
+  const nextProject = list.find((project) => !project?.archived && (project?.sessions || []).some((session) => !session?.archived));
+  const nextSession = nextProject?.sessions?.find((session) => !session?.archived);
+  return {
+    projectId: nextProject?.id || null,
+    sessionId: nextSession?.id || null
+  };
+}

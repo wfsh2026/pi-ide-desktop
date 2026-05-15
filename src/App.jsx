@@ -6,8 +6,10 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { Square, Send, FolderOpen, Plus, Folder, X, File, FileText, FolderTree, ChevronDown, ChevronRight, RefreshCw, MessageSquare, TerminalSquare, Settings, Trash2, Bot, CheckCircle2, AlertCircle, Loader2 } from "lucide-react";
 import PiTerminal from "./components/PiTerminal.jsx";
 import SessionTimeline from "./components/SessionTimeline.jsx";
+import { isComposerDropTarget, isPointerDragActive } from "./directoryDragModel.js";
+import { isLikelyFilePath, pathFromDroppedText } from "./dropPathModel.js";
 import { applyPiIdeTimelineEvent } from "./piIdeEventMapper.js";
-import { DEFAULT_STORAGE_LIMITS, limitTextValue, normalizeStoredProjects, normalizeStoredProjectsForQuota, positiveInteger } from "./projectStorageModel.js";
+import { DEFAULT_STORAGE_LIMITS, limitTextValue, normalizeStoredProjects, normalizeStoredProjectsForQuota, positiveInteger, resolveActiveProjectSession } from "./projectStorageModel.js";
 import { collectSessionSubagents, sessionSubagentSummary } from "./subagentSummary.js";
 
 const DEFAULT_COMMAND = "pi";
@@ -15,12 +17,12 @@ const PROJECTS_STORAGE_KEY = "piIdeProjects";
 const ACTIVE_PROJECT_STORAGE_KEY = "piIdeActiveProjectId";
 const ACTIVE_SESSION_STORAGE_KEY = "piIdeActiveProjectSessionId";
 const EXE_SESSION_STORAGE_KEY = "piIdeExeSessionId";
-const CENTER_VIEW_STORAGE_KEY = "piIdeCenterView";
 const TERMINAL_PREVIEW_CHARS_STORAGE_KEY = "piIdeTerminalPreviewChars";
 const SESSION_TEXT_PREVIEW_CHARS_STORAGE_KEY = "piIdeSessionTextPreviewChars";
 const SESSION_TURN_LIMIT_STORAGE_KEY = "piIdeSessionTurnLimit";
 const SESSION_FILE_RECORD_LIMIT_STORAGE_KEY = "piIdeSessionFileRecordLimit";
 const DEFAULT_BACKGROUND_PI_IDLE_STOP_MINUTES = 5;
+const MAX_LAUNCH_EVENTS = 30;
 
 function insertAtCursor(text, insert) {
   const start = text.selectionStart ?? 0;
@@ -89,6 +91,10 @@ function formatBytes(value) {
     index += 1;
   }
   return `${size.toFixed(size >= 10 || index === 0 ? 0 : 1)} ${units[index]}`;
+}
+
+function elapsedMs(startedAt) {
+  return Math.max(0, Date.now() - startedAt);
 }
 
 function limitTerminalPreview(text) {
@@ -202,8 +208,41 @@ function sessionModelOptions(session) {
   return [selected, ...list];
 }
 
-function normalizeCenterView(value) {
-  return value === "terminal" ? "terminal" : "session";
+function normalizeLaunchEvent(payload) {
+  if (!payload || typeof payload !== "object" || payload.kind !== "launch") return null;
+  return {
+    runId: payload.runId || payload.run_id || "",
+    phase: String(payload.phase || ""),
+    message: String(payload.message || payload.status || ""),
+    status: String(payload.status || payload.message || ""),
+    timestamp: payload.timestamp || new Date().toISOString(),
+    detail: payload.detail ?? null
+  };
+}
+
+function appendLaunchEvent(events, event) {
+  if (!event) return Array.isArray(events) ? events : [];
+  const list = Array.isArray(events) ? events : [];
+  const key = `${event.timestamp}:${event.runId}:${event.phase}:${event.message}`;
+  if (list.some((item) => `${item.timestamp}:${item.runId}:${item.phase}:${item.message}` === key)) return list;
+  return [...list, event].slice(-MAX_LAUNCH_EVENTS);
+}
+
+function launchPhaseState(phase, text) {
+  if (phase) {
+    const running = ["already_running", "spawned", "first_output"].includes(phase);
+    const stopped = ["exited", "stopped"].includes(phase);
+    const failed = phase === "failed";
+    return {
+      running,
+      stopped,
+      failed,
+      starting: !running && !stopped && !failed
+    };
+  }
+  const running = text.includes("Pi 已启动") || text.includes("Pi 已经在运行");
+  const stopped = text.includes("Pi 已停止") || text.includes("Pi 已退出");
+  return { running, stopped, failed: false, starting: false };
 }
 
 function latestTurnIndex(turns) {
@@ -579,7 +618,7 @@ function HighlightText({ text, query }) {
   return <>{value.slice(0, index)}<mark>{value.slice(index, index + keyword.length)}</mark>{value.slice(index + keyword.length)}</>;
 }
 
-function DirectoryTreeNodeView({ node, depth = 0, expandedPaths, loadingPaths = new Set(), searchText = "", onToggleDirectory, onOpenFile }) {
+function DirectoryTreeNodeView({ node, depth = 0, expandedPaths, loadingPaths = new Set(), searchText = "", onToggleDirectory, onOpenFile, onFilePointerDown }) {
   if (!node) return null;
   const isDir = isDirectoryNode(node);
   const children = Array.isArray(node.children) ? node.children : [];
@@ -596,11 +635,9 @@ function DirectoryTreeNodeView({ node, depth = 0, expandedPaths, loadingPaths = 
     if (!isDir && !node.omitted) onOpenFile(node.path);
   }
 
-  function handleDragStart(event) {
-    if (isDir || node.omitted) return;
-    event.dataTransfer.effectAllowed = "copy";
-    event.dataTransfer.setData("application/x-pi-file-path", node.path);
-    event.dataTransfer.setData("text/plain", quotePath(node.path));
+  function handlePointerDown(event) {
+    if (isDir || node.omitted || event.button !== 0) return;
+    onFilePointerDown?.(node.path, event);
   }
 
   return (
@@ -609,10 +646,9 @@ function DirectoryTreeNodeView({ node, depth = 0, expandedPaths, loadingPaths = 
         className={`directory-tree-row ${isDir ? "dir" : "file"} ${node.omitted ? "omitted" : ""}`}
         style={{ paddingLeft: 8 + depth * 14 }}
         title={isDir ? node.path : `${node.path}\n双击打开，或拖入下方会话框插入路径`}
-        draggable={!isDir && !node.omitted}
         onClick={handleClick}
         onDoubleClick={handleDoubleClick}
-        onDragStart={handleDragStart}
+        onPointerDown={handlePointerDown}
       >
         <span className="directory-tree-toggle">{isDir ? (loading ? "…" : (canExpand ? (expanded ? "▾" : "▸") : "•")) : ""}</span>
         {isDir ? <Folder size={14}/> : <File size={14}/>}
@@ -630,6 +666,7 @@ function DirectoryTreeNodeView({ node, depth = 0, expandedPaths, loadingPaths = 
           searchText={searchText}
           onToggleDirectory={onToggleDirectory}
           onOpenFile={onOpenFile}
+          onFilePointerDown={onFilePointerDown}
         />
       ))}
     </>
@@ -893,6 +930,7 @@ function PiSetupPanel({
   environment,
   checking,
   installing,
+  panelRef,
   onCheck,
   onInstall,
   onOpenModelConfig,
@@ -915,7 +953,7 @@ function PiSetupPanel({
 
   return (
     <div className="pi-setup-view">
-      <div className="pi-setup-card">
+      <div className="pi-setup-card" ref={panelRef}>
         <div className="pi-setup-header">
           <div>
             <h2>Pi 环境设置</h2>
@@ -1009,7 +1047,8 @@ function RightToolPanel({
   onToggleDirectoryNode,
   onOpenDirectoryFile,
   onOpenSessionFile,
-  onOpenSessionFileDirectory
+  onOpenSessionFileDirectory,
+  onDirectoryFilePointerDown
 }) {
   const [selectedSubagentId, setSelectedSubagentId] = useState(null);
   const searchText = String(directoryTreeSearch || "");
@@ -1110,6 +1149,7 @@ function RightToolPanel({
                 searchText={searchText}
                 onToggleDirectory={onToggleDirectoryNode}
                 onOpenFile={onOpenDirectoryFile}
+                onFilePointerDown={onDirectoryFilePointerDown}
               />
             </div>
           )}
@@ -1130,7 +1170,7 @@ export default function App() {
   const [clearTerminalSignal, setClearTerminalSignal] = useState(0);
   const [terminalReplaySignal, setTerminalReplaySignal] = useState(0);
   const [terminalReplayContent, setTerminalReplayContent] = useState("");
-  const [centerView, setCenterView] = useState(() => normalizeCenterView(localStorage.getItem(CENTER_VIEW_STORAGE_KEY)));
+  const [centerView, setCenterView] = useState("session");
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [piSessionStatus, setPiSessionStatus] = useState({});
   const [command, setCommand] = useState("");
@@ -1148,14 +1188,19 @@ export default function App() {
   const [piEnvironment, setPiEnvironment] = useState(null);
   const [piEnvironmentChecking, setPiEnvironmentChecking] = useState(false);
   const [piSetupOpen, setPiSetupOpen] = useState(false);
+  const [piSetupDismissed, setPiSetupDismissed] = useState(false);
   const [piInstalling, setPiInstalling] = useState(false);
   const [cacheCleaning, setCacheCleaning] = useState(false);
   const [cacheCleanResult, setCacheCleanResult] = useState(null);
   const [projects, setProjects] = useState(() => loadProjects());
-  const [activeProjectId, setActiveProjectId] = useState(null);
-  const [activeProjectSessionId, setActiveProjectSessionId] = useState(null);
+  const [activeProjectId, setActiveProjectId] = useState(() => localStorage.getItem(ACTIVE_PROJECT_STORAGE_KEY) || null);
+  const [activeProjectSessionId, setActiveProjectSessionId] = useState(() => localStorage.getItem(ACTIVE_SESSION_STORAGE_KEY) || null);
+  const [directoryDragPreview, setDirectoryDragPreview] = useState(null);
 
   const inputRef = useRef(null);
+  const modelPickerRef = useRef(null);
+  const piSetupPanelRef = useRef(null);
+  const piSetupButtonRef = useRef(null);
   const outputBufferRef = useRef("");
   const startingSessionsRef = useRef(new Set());
   const sessionWarmupTimersRef = useRef({});
@@ -1164,6 +1209,8 @@ export default function App() {
   const persistOutputTimerRef = useRef(null);
   const projectsRenderTimerRef = useRef(null);
   const fileEventSeenRef = useRef(new Set());
+  const directoryPointerDragRef = useRef(null);
+  const insertFileAttachmentsRef = useRef(null);
   const projectsRef = useRef(projects);
   const activeProjectIdRef = useRef(activeProjectId);
   const activeProjectSessionIdRef = useRef(activeProjectSessionId);
@@ -1177,6 +1224,26 @@ export default function App() {
   useEffect(() => { activeProjectIdRef.current = activeProjectId; }, [activeProjectId]);
   useEffect(() => { activeProjectSessionIdRef.current = activeProjectSessionId; }, [activeProjectSessionId]);
   useEffect(() => { piSessionStatusRef.current = piSessionStatus; }, [piSessionStatus]);
+
+  useEffect(() => {
+    if (!modelMenuOpen) return undefined;
+
+    function handlePointerDown(event) {
+      if (modelPickerRef.current?.contains(event.target)) return;
+      setModelMenuOpen(false);
+    }
+
+    function handleKeyDown(event) {
+      if (event.key === "Escape") setModelMenuOpen(false);
+    }
+
+    document.addEventListener("pointerdown", handlePointerDown, true);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown, true);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [modelMenuOpen]);
 
   const activeProject = useMemo(() => projects.find((p) => p.id === activeProjectId), [projects, activeProjectId]);
   const activeProjectSession = useMemo(
@@ -1198,7 +1265,23 @@ export default function App() {
     ? `Pi ${piEnvironment.version}`
     : `Pi >= ${piEnvironment?.minVersion || "0.74.0"}`;
   const piEnvironmentReady = Boolean(piEnvironment?.ready);
-  const showPiSetupPanel = piSetupOpen || (piEnvironment && !piEnvironment.ready);
+  const piEnvironmentNeedsSetup = Boolean(piEnvironment && !piEnvironment.ready);
+  const showPiSetupPanel = piSetupOpen || (piEnvironmentNeedsSetup && !piSetupDismissed);
+
+  function openPiSetupPanel() {
+    setPiSetupDismissed(false);
+    setPiSetupOpen(true);
+  }
+
+  function closePiSetupPanel() {
+    setPiSetupOpen(false);
+    setPiSetupDismissed(true);
+  }
+
+  function togglePiSetupPanel() {
+    if (showPiSetupPanel) closePiSetupPanel();
+    else openPiSetupPanel();
+  }
 
   function replayTerminalTail(sessionId, fallbackOutput = "") {
     const fallback = String(fallbackOutput || "");
@@ -1215,8 +1298,19 @@ export default function App() {
   }
 
   useEffect(() => {
-    safeSetStorageItem(CENTER_VIEW_STORAGE_KEY, centerView);
-  }, [centerView]);
+    if (!showPiSetupPanel) return undefined;
+
+    function handlePointerDown(event) {
+      const target = event.target;
+      if (!target) return;
+      if (piSetupPanelRef.current?.contains(target)) return;
+      if (piSetupButtonRef.current?.contains(target)) return;
+      closePiSetupPanel();
+    }
+
+    document.addEventListener("pointerdown", handlePointerDown, true);
+    return () => document.removeEventListener("pointerdown", handlePointerDown, true);
+  }, [showPiSetupPanel]);
 
   useEffect(() => {
     if (centerView !== "terminal") return;
@@ -1224,21 +1318,34 @@ export default function App() {
   }, [centerView, activeProjectSessionId]);
 
   const loadDirectoryTree = useCallback(async (projectPath = activeProject?.path) => {
+    const startedAt = Date.now();
     if (!projectPath) {
+      forceDebugLog("directoryTree load skipped", { reason: "no active project" });
       setDirectoryTree(null);
       setExpandedDirectoryPaths(new Set());
       setDirectoryTreeNodeLoadingPaths(new Set());
       setDirectoryTreeError("请先在左侧选择一个项目");
       return;
     }
+    forceDebugLog("directoryTree load start", { projectPath });
     setDirectoryTreeLoading(true);
     setDirectoryTreeError("");
     setDirectoryTreeNodeLoadingPaths(new Set());
     try {
       const result = await invoke("get_directory_tree", { path: projectPath });
+      const rootPath = result?.tree?.path || result?.root;
+      forceDebugLog("directoryTree load complete", {
+        projectPath,
+        elapsedMs: elapsedMs(startedAt),
+        root: result?.root || "",
+        children: result?.tree?.children?.length || 0,
+        hasMore: Boolean(result?.tree?.has_more),
+        truncated: Boolean(result?.truncated)
+      });
       setDirectoryTree(result);
-      setExpandedDirectoryPaths(new Set());
+      setExpandedDirectoryPaths(rootPath ? new Set([rootPath]) : new Set());
     } catch (error) {
+      forceDebugLog("directoryTree load failed", { projectPath, elapsedMs: elapsedMs(startedAt), error: errorLogData(error) });
       setDirectoryTree(null);
       setExpandedDirectoryPaths(new Set());
       setDirectoryTreeNodeLoadingPaths(new Set());
@@ -1268,9 +1375,17 @@ export default function App() {
 
   async function loadDirectoryNodeChildren(path) {
     if (!activeProject?.path || !path) return;
+    const startedAt = Date.now();
+    forceDebugLog("directoryTree children start", { projectPath: activeProject.path, path });
     setDirectoryTreeNodeLoadingPaths((prev) => new Set(prev).add(path));
     try {
       const result = await invoke("get_directory_children", { projectRoot: activeProject.path, path });
+      forceDebugLog("directoryTree children complete", {
+        path,
+        elapsedMs: elapsedMs(startedAt),
+        children: result?.children?.length || 0,
+        truncated: Boolean(result?.truncated)
+      });
       setDirectoryTree((prev) => {
         if (!prev?.tree) return prev;
         return {
@@ -1285,6 +1400,7 @@ export default function App() {
         };
       });
     } catch (error) {
+      forceDebugLog("directoryTree children failed", { path, elapsedMs: elapsedMs(startedAt), error: errorLogData(error) });
       setDirectoryTreeError(String(error));
     } finally {
       setDirectoryTreeNodeLoadingPaths((prev) => {
@@ -1382,11 +1498,18 @@ export default function App() {
     const cacheKey = projectPath || "__global__";
     const cached = piEnvironmentCacheRef.current[cacheKey];
     if (!force && cached && Date.now() - cached.checkedAt < 5 * 60 * 1000) {
+      forceDebugLog("checkPiEnvironment cache hit", {
+        projectPath,
+        ready: Boolean(cached.result?.ready),
+        ageMs: Date.now() - cached.checkedAt
+      });
       setPiEnvironment(cached.result);
-      if (!cached.result?.ready) setPiSetupOpen(true);
+      if (!cached.result?.ready) openPiSetupPanel();
       return cached.result;
     }
 
+    const startedAt = Date.now();
+    forceDebugLog("checkPiEnvironment start", { projectPath, force, showStatus });
     setPiEnvironmentChecking(true);
     try {
       const result = await invoke("check_pi_environment", {
@@ -1394,15 +1517,28 @@ export default function App() {
         legacyCommand: legacyPiCommandRef.current
       });
       piEnvironmentCacheRef.current[cacheKey] = { result, checkedAt: Date.now() };
+      forceDebugLog("checkPiEnvironment complete", {
+        projectPath,
+        elapsedMs: elapsedMs(startedAt),
+        ready: Boolean(result?.ready),
+        installed: Boolean(result?.installed),
+        version: result?.version || "",
+        issues: (result?.issues || []).map((issue) => issue?.code || issue?.message).filter(Boolean)
+      });
       setPiEnvironment(result);
       if (!result?.ready) {
-        setPiSetupOpen(true);
+        openPiSetupPanel();
         if (showStatus) setStatus("Pi 环境未就绪，请先完成安装或模型配置");
       } else if (showStatus) {
         setStatus("Pi 环境已就绪");
       }
       return result;
     } catch (error) {
+      forceDebugLog("checkPiEnvironment failed", {
+        projectPath,
+        elapsedMs: elapsedMs(startedAt),
+        error: errorLogData(error)
+      });
       const result = {
         ready: false,
         installed: false,
@@ -1413,7 +1549,7 @@ export default function App() {
       };
       piEnvironmentCacheRef.current[cacheKey] = { result, checkedAt: Date.now() };
       setPiEnvironment(result);
-      setPiSetupOpen(true);
+      openPiSetupPanel();
       if (showStatus) setStatus(`Pi 环境检测失败：${String(error)}`);
       return result;
     } finally {
@@ -1425,7 +1561,7 @@ export default function App() {
     if (piEnvironment?.ready) return;
     const result = await checkPiEnvironment(projectPath, { showStatus: true });
     if (!result?.ready) {
-      setPiSetupOpen(true);
+      openPiSetupPanel();
       throw new Error("Pi 环境未就绪，请先完成安装或模型配置");
     }
   }
@@ -1448,6 +1584,7 @@ export default function App() {
   useEffect(() => {
     setPiEnvironment(null);
     setPiSetupOpen(false);
+    setPiSetupDismissed(false);
   }, [activeProject?.path, workdir]);
 
   function showStorageQuotaWarning() {
@@ -1879,22 +2016,41 @@ export default function App() {
       const payload = event.payload;
       const sessionId = payload && typeof payload === "object" ? (payload.sessionId || payload.session_id) : null;
       const text = payload && typeof payload === "object" ? String(payload.status || "") : String(payload || "");
+      const launchEvent = normalizeLaunchEvent(payload);
+      const phase = payload && typeof payload === "object" ? String(payload.phase || "") : "";
+      if (launchEvent) {
+        forceDebugLog("pi launch event", {
+          sessionId,
+          runId: launchEvent.runId,
+          phase: launchEvent.phase,
+          message: launchEvent.message
+        });
+      }
       setStatus(text);
       if (sessionId) {
-        const running = text.includes("Pi 已启动") || text.includes("Pi 已经在运行");
-        const stopped = text.includes("Pi 已停止") || text.includes("Pi 已退出");
+        const phaseState = launchPhaseState(phase, text);
         const previous = piSessionStatusRef.current[sessionId] || {};
-        if (stopped) {
+        const launchEvents = appendLaunchEvent(previous.launchEvents, launchEvent);
+        if (launchEvent) {
+          updateSessionById(sessionId, (session) => ({
+            ...session,
+            launch_events: appendLaunchEvent(session.launch_events, launchEvent),
+            updated_at: launchEvent.timestamp || new Date().toISOString()
+          }));
+        }
+        if (phaseState.stopped || phaseState.failed) {
           markLatestTurnStatus(sessionId, "failed", text);
         }
         setSessionRuntimeStatus(sessionId, {
-          running: stopped ? false : running || previous.running || false,
-          starting: false,
-          processing: stopped ? false : previous.processing || false,
+          running: (phaseState.stopped || phaseState.failed) ? false : phaseState.running || previous.running || false,
+          starting: phaseState.starting,
+          processing: (phaseState.stopped || phaseState.failed) ? false : previous.processing || false,
           runId: payload.runId || payload.run_id || previous.runId,
+          launchPhase: phase || previous.launchPhase,
+          launchEvents,
           status: text
         });
-        if (running && !stopped) {
+        if (phaseState.running && !phaseState.stopped && !phaseState.failed) {
           flushPendingPiInputs(sessionId).catch((error) => {
             debugLog("flush pending inputs after status failed", { sessionId, error: String(error) });
             setStatus(`发送排队消息失败：${String(error)}`);
@@ -1933,6 +2089,33 @@ export default function App() {
       unsubs.forEach((f) => f());
     };
   }, []);
+
+  useEffect(() => {
+    const resolved = resolveActiveProjectSession(projects, activeProjectId, activeProjectSessionId);
+    if (!resolved.projectId || !resolved.sessionId) return;
+    if (resolved.projectId === activeProjectId && resolved.sessionId === activeProjectSessionId) return;
+
+    const project = projects.find((item) => item.id === resolved.projectId);
+    const session = project?.sessions?.find((item) => item.id === resolved.sessionId);
+    if (!project || !session) return;
+
+    forceDebugLog("restore active project session", {
+      previousProjectId: activeProjectId,
+      previousSessionId: activeProjectSessionId,
+      projectId: project.id,
+      sessionId: session.id,
+      projectPath: project.path
+    });
+    activeProjectIdRef.current = project.id;
+    activeProjectSessionIdRef.current = session.id;
+    setActiveProjectId(project.id);
+    setActiveProjectSessionId(session.id);
+    setWorkdir(project.path);
+    outputBufferRef.current = session.output || "";
+    setCommand(session.draft_command || "");
+    setAttachments(session.attachments || []);
+    replayTerminalTail(session.id, session.output || "");
+  }, [projects, activeProjectId, activeProjectSessionId]);
 
   useEffect(() => {
     const project = projects.find((p) => p.id === activeProjectId);
@@ -2220,12 +2403,23 @@ export default function App() {
   }
 
   async function startPi(options = {}) {
+    const startedAt = Date.now();
     let runWorkdir = options.workdir || activeProject?.path || workdir;
     let sessionId = options.sessionId || activeProjectSessionIdRef.current;
+    forceDebugLog("startPi request", {
+      sessionId,
+      workdir: runWorkdir,
+      hasOptionWorkdir: Boolean(options.workdir),
+      hasOptionSessionId: Boolean(options.sessionId),
+      continueSession: options.continueSession
+    });
 
     if (!runWorkdir) {
       const selected = await open({ directory: true, multiple: false, title: "选择项目目录" });
-      if (typeof selected !== "string") return;
+      if (typeof selected !== "string") {
+        forceDebugLog("startPi cancelled project picker", { elapsedMs: elapsedMs(startedAt) });
+        return;
+      }
       runWorkdir = selected;
       const created = createOrSelectProjectForPath(selected, { createNewSession: true, sessionTitle: "新 Pi 会话" });
       sessionId = created.sessionId;
@@ -2235,33 +2429,53 @@ export default function App() {
     }
 
     if (!sessionId) throw new Error("请先选择或创建一个会话");
-    await ensurePiEnvironmentReady(runWorkdir);
     if (piSessionStatusRef.current[sessionId]?.running) {
+      forceDebugLog("startPi skip running", { sessionId, elapsedMs: elapsedMs(startedAt) });
       return;
     }
     if (startingSessionsRef.current.has(sessionId)) {
+      forceDebugLog("startPi skip duplicate starting", { sessionId, elapsedMs: elapsedMs(startedAt) });
       return;
     }
-    const { session } = getSessionById(sessionId);
-    const continueSession = options.continueSession ?? shouldContinueSession(session);
 
-    if (runWorkdir) safeSetStorageItem("workdir", runWorkdir);
-    recordSessionStart(runWorkdir);
     startingSessionsRef.current.add(sessionId);
     setSessionRuntimeStatus(sessionId, { starting: true, runId: null, status: "Pi 启动中" });
+    window.setTimeout(() => {
+      forceDebugLog("startPi ui tick", { sessionId, elapsedMs: elapsedMs(startedAt) });
+    }, 0);
     try {
+      const envStartedAt = Date.now();
+      forceDebugLog("startPi ensure environment start", { sessionId, workdir: runWorkdir });
+      await ensurePiEnvironmentReady(runWorkdir);
+      forceDebugLog("startPi ensure environment complete", {
+        sessionId,
+        elapsedMs: elapsedMs(envStartedAt),
+        totalElapsedMs: elapsedMs(startedAt)
+      });
+      const { session } = getSessionById(sessionId);
+      const continueSession = options.continueSession ?? shouldContinueSession(session);
+      if (runWorkdir) safeSetStorageItem("workdir", runWorkdir);
+      recordSessionStart(runWorkdir);
+      const invokeStartedAt = Date.now();
+      forceDebugLog("startPi invoke backend start", { sessionId, workdir: runWorkdir, continueSession });
       await invoke("start_pi_session", { sessionId, piCommand: legacyPiCommandRef.current, workdir: runWorkdir, continueSession });
+      forceDebugLog("startPi invoke backend complete", {
+        sessionId,
+        elapsedMs: elapsedMs(invokeStartedAt),
+        totalElapsedMs: elapsedMs(startedAt)
+      });
       touchPiSessionActivity(sessionId, { running: true, starting: false, processing: false, status: "Pi 已启动" });
       flushPendingPiInputs(sessionId).catch((error) => {
         debugLog("flush pending inputs after start failed", { sessionId, error: String(error) });
         setStatus(`发送排队消息失败：${String(error)}`);
       });
     } catch (error) {
-      debugLog("startPi failed", { sessionId, error: String(error) });
+      forceDebugLog("startPi failed", { sessionId, elapsedMs: elapsedMs(startedAt), error: errorLogData(error) });
       setSessionRuntimeStatus(sessionId, { running: false, starting: false, processing: false, status: `Pi 启动失败：${String(error)}` });
       throw error;
     } finally {
       startingSessionsRef.current.delete(sessionId);
+      forceDebugLog("startPi finished", { sessionId, elapsedMs: elapsedMs(startedAt) });
     }
   }
 
@@ -2580,30 +2794,123 @@ export default function App() {
   function handleDrop(e) {
     e.preventDefault();
     e.stopPropagation();
-    const treeFilePath = e.dataTransfer.getData("application/x-pi-file-path");
+    const dataTransfer = e.dataTransfer;
+    const types = Array.from(dataTransfer?.types || []);
+    const getDropData = (type) => dataTransfer?.getData(type) || "";
+    forceDebugLog("drop received", {
+      types,
+      fileCount: dataTransfer?.files?.length || 0
+    });
+    const treeFilePath = getDropData("application/x-pi-file-path");
     if (treeFilePath) {
+      forceDebugLog("drop attach directory tree file", { path: treeFilePath });
       insertFileAttachments([treeFilePath]);
       return;
     }
-    const droppedText = e.dataTransfer.getData("text/plain");
-    if (droppedText?.startsWith('"') && droppedText.endsWith('"')) {
-      insertFileAttachments([droppedText.slice(1, -1).replace(/\\"/g, '"')]);
+    const uriPath = pathFromDroppedText(getDropData("text/uri-list"));
+    if (uriPath) {
+      forceDebugLog("drop attach uri file", { path: uriPath });
+      insertFileAttachments([uriPath]);
       return;
     }
-    const files = Array.from(e.dataTransfer.files || []);
+    const droppedText = getDropData("text/plain");
+    const droppedPath = pathFromDroppedText(droppedText);
+    const quotedText = /^["'].*["']$/.test(String(droppedText || "").trim());
+    if (droppedPath && (quotedText || isLikelyFilePath(droppedPath))) {
+      forceDebugLog("drop attach text file", { path: droppedPath });
+      insertFileAttachments([droppedPath]);
+      return;
+    }
+    const files = Array.from(dataTransfer?.files || []);
     const paths = files.map((f) => f.path || f.name).filter(Boolean);
-    if (paths.length) insertFileAttachments(paths);
+    if (paths.length) {
+      forceDebugLog("drop attach native files", { count: paths.length });
+      insertFileAttachments(paths);
+      return;
+    }
+    forceDebugLog("drop ignored", { types, hasText: Boolean(droppedText) });
+  }
+
+  function handleAppDragOver(e) {
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
   }
 
   function handleComposerDragOver(e) {
     e.preventDefault();
-    e.dataTransfer.dropEffect = "copy";
+    e.stopPropagation();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
   }
+
+  function handleDirectoryFilePointerDown(path, event) {
+    directoryPointerDragRef.current = {
+      path,
+      startX: event.clientX,
+      startY: event.clientY,
+      dragging: false
+    };
+    forceDebugLog("directoryTree pointer down", { path });
+  }
+
+  useEffect(() => {
+    insertFileAttachmentsRef.current = insertFileAttachments;
+  });
+
+  useEffect(() => {
+    function clearDirectoryPointerDrag() {
+      directoryPointerDragRef.current = null;
+      setDirectoryDragPreview(null);
+    }
+
+    function handlePointerMove(event) {
+      const drag = directoryPointerDragRef.current;
+      if (!drag) return;
+      const dragging = drag.dragging || isPointerDragActive(drag.startX, drag.startY, event.clientX, event.clientY);
+      if (!dragging) return;
+      event.preventDefault();
+      if (!drag.dragging) {
+        drag.dragging = true;
+        forceDebugLog("directoryTree pointer drag start", { path: drag.path });
+      }
+      setDirectoryDragPreview({ path: drag.path, x: event.clientX, y: event.clientY });
+    }
+
+    function handlePointerUp(event) {
+      const drag = directoryPointerDragRef.current;
+      if (!drag) return;
+      const wasDragging = drag.dragging;
+      clearDirectoryPointerDrag();
+      if (!wasDragging) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const target = document.elementFromPoint(event.clientX, event.clientY);
+      const droppedOnComposer = isComposerDropTarget(target);
+      forceDebugLog("directoryTree pointer drag end", {
+        path: drag.path,
+        x: event.clientX,
+        y: event.clientY,
+        droppedOnComposer
+      });
+      if (droppedOnComposer) {
+        forceDebugLog("directoryTree pointer drag attach", { path: drag.path });
+        insertFileAttachmentsRef.current?.([drag.path]);
+      }
+    }
+
+    document.addEventListener("pointermove", handlePointerMove, true);
+    document.addEventListener("pointerup", handlePointerUp, true);
+    document.addEventListener("pointercancel", clearDirectoryPointerDrag, true);
+    return () => {
+      document.removeEventListener("pointermove", handlePointerMove, true);
+      document.removeEventListener("pointerup", handlePointerUp, true);
+      document.removeEventListener("pointercancel", clearDirectoryPointerDrag, true);
+    };
+  }, []);
 
   function handleComposerAction() {
     if (isProcessing) stopCurrentRun().catch((err) => setStatus(String(err)));
     else if (!piEnvironmentReady) {
-      setPiSetupOpen(true);
+      openPiSetupPanel();
       checkPiEnvironment(activeProject?.path || workdir, { showStatus: true, force: true }).catch((err) => setStatus(String(err)));
     } else {
       sendCommand().catch((err) => setStatus(String(err)));
@@ -2628,7 +2935,13 @@ export default function App() {
   }
 
   return (
-    <div className="app" onDragOver={(e) => e.preventDefault()} onDrop={handleDrop}>
+    <div className={`app ${directoryDragPreview ? "directory-dragging" : ""}`} onDragEnter={handleAppDragOver} onDragOver={handleAppDragOver} onDrop={handleDrop}>
+      {directoryDragPreview && (
+        <div className="directory-drag-preview" style={{ left: directoryDragPreview.x + 12, top: directoryDragPreview.y + 12 }}>
+          <File size={14}/>
+          <span>{basename(directoryDragPreview.path)}</span>
+        </div>
+      )}
       <aside className="sidebar left">
         <div className="brand">Pi IDE</div>
         <ProjectPanel
@@ -2659,7 +2972,7 @@ export default function App() {
               <TerminalSquare size={15}/> 终端视图
             </button>
           </div>
-          <button className={piEnvironmentReady ? "" : "danger"} onClick={() => setPiSetupOpen((value) => !value)} title="检查和配置 Pi 环境">
+          <button ref={piSetupButtonRef} className={piEnvironmentReady ? "" : "danger"} onClick={togglePiSetupPanel} title="检查和配置 Pi 环境">
             <Settings size={15}/> 环境设置
           </button>        </header>
         <div className="center-view-wrap">
@@ -2668,6 +2981,7 @@ export default function App() {
               environment={piEnvironment}
               checking={piEnvironmentChecking}
               installing={piInstalling}
+              panelRef={piSetupPanelRef}
               onCheck={() => checkPiEnvironment(activeProject?.path || workdir, { showStatus: true, force: true })}
               onInstall={installPiCli}
               onOpenModelConfig={openPiModelConfigDir}
@@ -2675,7 +2989,7 @@ export default function App() {
               onCleanCache={cleanPiIdeCache}
               cacheCleaning={cacheCleaning}
               cacheCleanResult={cacheCleanResult}
-              onClose={() => setPiSetupOpen(false)}
+              onClose={closePiSetupPanel}
             />
           ) : centerView === "session" ? (
             <SessionTimeline
@@ -2694,7 +3008,7 @@ export default function App() {
             />
           )}
         </div>
-        <div className="composer" onDragOver={handleComposerDragOver} onDrop={handleDrop}>
+        <div className="composer" onDragEnter={handleComposerDragOver} onDragOver={handleComposerDragOver} onDrop={handleDrop}>
           <div className="composer-toolbar">
             <div className="attachment-bar inline">
               {attachments.length === 0 ? (
@@ -2719,7 +3033,7 @@ export default function App() {
           <div className="composer-actions">
             <span>当前项目：{activeProject?.name || "未选择"} / 会话：{activeProjectSession?.title || "未选择"} / {piVersionLabel}</span>
             <div className="composer-action-buttons">
-              <div className="model-picker">
+              <div className="model-picker" ref={modelPickerRef}>
                 <button className="model-picker-button" onClick={() => toggleModelMenu().catch((e) => setStatus(String(e)))} title="切换当前 Pi 会话模型">
                   模型：{activeModelLabel ? `${activeModelLabel}${activeModelPending ? "（待应用）" : ""}` : "未获取"} <ChevronDown size={13}/>
                 </button>
@@ -2770,6 +3084,7 @@ export default function App() {
           onOpenDirectoryFile={(path) => openDirectoryFile(path).catch((e) => setStatus(String(e)))}
           onOpenSessionFile={(file) => openSessionFile(file).catch((e) => setStatus(String(e)))}
           onOpenSessionFileDirectory={(file) => openSessionFileDirectory(file).catch((e) => setStatus(String(e)))}
+          onDirectoryFilePointerDown={handleDirectoryFilePointerDown}
         />
       </aside>
     </div>

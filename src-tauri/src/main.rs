@@ -3,7 +3,9 @@
 use once_cell::sync::Lazy;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, env, fs, io::{Read, Seek, SeekFrom, Write}, path::{Path, PathBuf}, process::Command, sync::Mutex as StdMutex};
+use std::{collections::HashMap, env, fs, io::{Read, Seek, SeekFrom, Write}, path::{Path, PathBuf}, process::Command, sync::Mutex as StdMutex, time::Instant};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use tauri::Emitter;
 use tokio::sync::Mutex;
 
@@ -72,7 +74,7 @@ struct DirectoryTreeConfig {
   preview_max_lines: usize,
 }
 
-const DEFAULT_DIRECTORY_TREE_INITIAL_DEPTH: usize = 0;
+const DEFAULT_DIRECTORY_TREE_INITIAL_DEPTH: usize = 1;
 const DEFAULT_DIRECTORY_TREE_MAX_ENTRIES_PER_DIRECTORY: usize = 160;
 const DEFAULT_DIRECTORY_TREE_PREVIEW_MAX_DEPTH: usize = 0;
 const DEFAULT_DIRECTORY_TREE_PREVIEW_MAX_LINES: usize = 0;
@@ -84,6 +86,8 @@ const DEFAULT_TERMINAL_LOG_MAX_BYTES: u64 = 2 * 1024 * 1024;
 const PI_PACKAGE_NAME: &str = "@earendil-works/pi-coding-agent";
 const PI_LEGACY_PACKAGE_NAME: &str = "@mariozechner/pi-coding-agent";
 const DEFAULT_MIN_PI_VERSION: &str = "0.74.0";
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 #[derive(Clone)]
 struct StorageConfig {
@@ -92,6 +96,17 @@ struct StorageConfig {
   project_event_max_bytes: u64,
   terminal_log_max_bytes: u64,
   event_mode: String,
+}
+
+struct PreparedPiLaunch {
+  raw: String,
+  pi_version: String,
+  package_detection: PiPackageDetection,
+  debug_enabled: bool,
+  storage_config: StorageConfig,
+  session_dir: PathBuf,
+  run_id: String,
+  command: CommandBuilder,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -140,6 +155,50 @@ fn append_debug_line_when(enabled: bool, line: &str) {
   if enabled {
     append_debug_line_raw(line);
   }
+}
+
+fn elapsed_ms(started_at: Instant) -> u64 {
+  started_at.elapsed().as_millis().min(u64::MAX as u128) as u64
+}
+
+#[cfg(windows)]
+fn hide_command_window(command: &mut Command) {
+  command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn hide_command_window(_command: &mut Command) {}
+
+fn append_launch_event(
+  session_id: &str,
+  run_id: Option<&str>,
+  phase: &str,
+  message: &str,
+  detail: serde_json::Value,
+) -> serde_json::Value {
+  let event = serde_json::json!({
+    "kind": "launch",
+    "sessionId": session_id,
+    "runId": run_id,
+    "phase": phase,
+    "status": message,
+    "message": message,
+    "detail": detail,
+    "timestamp": now_iso()
+  });
+  event
+}
+
+fn emit_launch_status(
+  app: &tauri::AppHandle,
+  session_id: &str,
+  run_id: Option<&str>,
+  phase: &str,
+  message: &str,
+  detail: serde_json::Value,
+) {
+  let event = append_launch_event(session_id, run_id, phase, message, detail);
+  let _ = app.emit("pi-status", event);
 }
 
 #[tauri::command]
@@ -522,6 +581,27 @@ mod config_tests {
     assert_eq!(safe_file_name_component("pi-run-1_session"), "pi-run-1_session");
     assert_eq!(safe_file_name_component("pi/run:1 session"), "pi_run_1_session");
     assert_eq!(safe_file_name_component(""), "default");
+  }
+
+  #[test]
+  fn directory_tree_node_loads_first_level_without_recursing_deeper() {
+    let root = env::temp_dir().join(format!("pi-ide-tree-{}", std::process::id()));
+    let child_dir = root.join("child");
+    fs::create_dir_all(&child_dir).unwrap();
+    fs::write(root.join("root.txt"), "root").unwrap();
+    fs::write(child_dir.join("nested.txt"), "nested").unwrap();
+
+    let mut truncated = false;
+    let node = build_directory_tree_node(&root, "root".to_string(), 0, 1, 20, &mut truncated).unwrap();
+    let _ = fs::remove_dir_all(&root);
+
+    assert_eq!(node.children.len(), 2);
+    let child = node.children.iter().find(|item| item.name == "child").unwrap();
+    assert!(child.is_dir);
+    assert!(child.children.is_empty());
+    assert!(!child.children_loaded);
+    assert!(child.has_more);
+    assert!(!truncated);
   }
 
   #[test]
@@ -1071,6 +1151,7 @@ fn build_process_command(raw: &str, extra_args: &[&str], envs: &HashMap<String, 
   for (key, value) in envs {
     command.env(key, value);
   }
+  hide_command_window(&mut command);
   Ok(command)
 }
 
@@ -1084,6 +1165,7 @@ fn build_process_command(raw: &str, extra_args: &[&str], envs: &HashMap<String, 
   for (key, value) in envs {
     command.env(key, value);
   }
+  hide_command_window(&mut command);
   Ok(command)
 }
 
@@ -1149,8 +1231,7 @@ fn assert_pi_runtime_supported(command_text: &str, envs: &HashMap<String, String
   Ok((version.unwrap_or_else(|| min_version.to_string()), detection))
 }
 
-#[tauri::command]
-fn check_pi_environment(workdir: Option<String>, legacy_command: Option<String>) -> Result<serde_json::Value, String> {
+fn check_pi_environment_blocking(workdir: Option<String>, legacy_command: Option<String>) -> Result<serde_json::Value, String> {
   let workdir_path = workdir
     .as_deref()
     .map(str::trim)
@@ -1233,6 +1314,37 @@ fn check_pi_environment(workdir: Option<String>, legacy_command: Option<String>)
 }
 
 #[tauri::command]
+async fn check_pi_environment(workdir: Option<String>, legacy_command: Option<String>) -> Result<serde_json::Value, String> {
+  let started_at = Instant::now();
+  let workdir_for_log = workdir.clone().unwrap_or_default();
+  append_debug_line_raw(&format!(
+    "[backend] check_pi_environment start workdir={workdir_for_log:?} legacy_command_present={}",
+    legacy_command.as_deref().is_some_and(|value| !value.trim().is_empty())
+  ));
+  match tauri::async_runtime::spawn_blocking(move || check_pi_environment_blocking(workdir, legacy_command)).await {
+    Ok(Ok(result)) => {
+      append_debug_line_raw(&format!(
+        "[backend] check_pi_environment complete elapsed_ms={} ready={} installed={} version={:?}",
+        elapsed_ms(started_at),
+        result.get("ready").and_then(|value| value.as_bool()).unwrap_or(false),
+        result.get("installed").and_then(|value| value.as_bool()).unwrap_or(false),
+        result.get("version").and_then(|value| value.as_str())
+      ));
+      Ok(result)
+    }
+    Ok(Err(error)) => {
+      append_debug_line_raw(&format!("[backend] check_pi_environment failed elapsed_ms={} error={error}", elapsed_ms(started_at)));
+      Err(error)
+    }
+    Err(error) => {
+      let message = format!("Pi 环境检测任务失败：{error}");
+      append_debug_line_raw(&format!("[backend] check_pi_environment task_failed elapsed_ms={} error={message}", elapsed_ms(started_at)));
+      Err(message)
+    }
+  }
+}
+
+#[tauri::command]
 async fn install_pi_cli() -> Result<serde_json::Value, String> {
   tauri::async_runtime::spawn_blocking(|| {
     #[cfg(windows)]
@@ -1242,6 +1354,7 @@ async fn install_pi_cli() -> Result<serde_json::Value, String> {
       if let Some(path) = windows_augmented_path() {
         command.env("PATH", path);
       }
+      hide_command_window(&mut command);
       command
     };
 
@@ -1249,6 +1362,7 @@ async fn install_pi_cli() -> Result<serde_json::Value, String> {
     let mut command = {
       let mut command = Command::new("npm");
       command.args(["install", "-g", "--force", "@earendil-works/pi-coding-agent"]);
+      hide_command_window(&mut command);
       command
     };
 
@@ -2367,12 +2481,18 @@ fn open_file_with_default_app(path: String) -> Result<(), String> {
 
 #[tauri::command]
 fn get_directory_tree(path: String) -> Result<DirectoryTreeResponse, String> {
+  let started_at = Instant::now();
   let root = PathBuf::from(path.trim());
+  append_debug_line_raw(&format!("[backend] get_directory_tree start path={:?}", root));
   if !root.exists() {
-    return Err(format!("目录不存在：{}", root.to_string_lossy()));
+    let message = format!("目录不存在：{}", root.to_string_lossy());
+    append_debug_line_raw(&format!("[backend] get_directory_tree failed elapsed_ms={} error={message}", elapsed_ms(started_at)));
+    return Err(message);
   }
   if !root.is_dir() {
-    return Err(format!("不是目录：{}", root.to_string_lossy()));
+    let message = format!("不是目录：{}", root.to_string_lossy());
+    append_debug_line_raw(&format!("[backend] get_directory_tree failed elapsed_ms={} error={message}", elapsed_ms(started_at)));
+    return Err(message);
   }
 
   let root_name = root
@@ -2381,9 +2501,8 @@ fn get_directory_tree(path: String) -> Result<DirectoryTreeResponse, String> {
     .unwrap_or("当前项目")
     .to_string();
   let config = resolve_directory_tree_config(Some(&root))?;
-  // 首次打开目录树时只返回根节点，不预扫描子目录。
-  // 子目录内容统一在用户点击展开目录时通过 get_directory_children 按需加载，
-  // 避免打开项目或切换项目时因为大目录遍历造成 UI 卡顿。
+  // 首次打开只加载根目录首层。更深层内容仍按需加载，避免大目录递归遍历造成 UI 卡顿。
+  let initial_depth = config.initial_depth.max(1);
   let lines = vec![format!("{}/", root_name)];
   let lines_truncated = false;
 
@@ -2392,10 +2511,18 @@ fn get_directory_tree(path: String) -> Result<DirectoryTreeResponse, String> {
     &root,
     root_name,
     0,
-    0,
+    initial_depth,
     config.max_entries_per_directory,
     &mut tree_truncated,
   )?;
+
+  append_debug_line_raw(&format!(
+    "[backend] get_directory_tree complete path={:?} elapsed_ms={} children={} truncated={}",
+    root,
+    elapsed_ms(started_at),
+    tree.children.len(),
+    lines_truncated || tree_truncated
+  ));
 
   Ok(DirectoryTreeResponse {
     root: root.to_string_lossy().to_string(),
@@ -2407,19 +2534,27 @@ fn get_directory_tree(path: String) -> Result<DirectoryTreeResponse, String> {
 
 #[tauri::command]
 fn get_directory_children(project_root: String, path: String) -> Result<DirectoryTreeChildrenResponse, String> {
+  let started_at = Instant::now();
   let root = PathBuf::from(project_root.trim());
   let target = PathBuf::from(path.trim());
+  append_debug_line_raw(&format!("[backend] get_directory_children start root={:?} path={:?}", root, target));
   if !root.exists() || !root.is_dir() {
-    return Err(format!("项目目录不存在：{}", root.to_string_lossy()));
+    let message = format!("项目目录不存在：{}", root.to_string_lossy());
+    append_debug_line_raw(&format!("[backend] get_directory_children failed elapsed_ms={} error={message}", elapsed_ms(started_at)));
+    return Err(message);
   }
   if !target.exists() || !target.is_dir() {
-    return Err(format!("目录不存在：{}", target.to_string_lossy()));
+    let message = format!("目录不存在：{}", target.to_string_lossy());
+    append_debug_line_raw(&format!("[backend] get_directory_children failed elapsed_ms={} error={message}", elapsed_ms(started_at)));
+    return Err(message);
   }
 
   let canonical_root = root.canonicalize().map_err(|e| format!("解析项目目录失败 {:?}: {e}", root))?;
   let canonical_target = target.canonicalize().map_err(|e| format!("解析目录失败 {:?}: {e}", target))?;
   if !canonical_target.starts_with(&canonical_root) {
-    return Err(format!("目录不在当前项目内：{}", target.to_string_lossy()));
+    let message = format!("目录不在当前项目内：{}", target.to_string_lossy());
+    append_debug_line_raw(&format!("[backend] get_directory_children failed elapsed_ms={} error={message}", elapsed_ms(started_at)));
+    return Err(message);
   }
 
   let config = resolve_directory_tree_config(Some(&root))?;
@@ -2437,6 +2572,14 @@ fn get_directory_children(project_root: String, path: String) -> Result<Director
     config.max_entries_per_directory,
     &mut truncated,
   )?;
+
+  append_debug_line_raw(&format!(
+    "[backend] get_directory_children complete path={:?} elapsed_ms={} children={} truncated={}",
+    target,
+    elapsed_ms(started_at),
+    node.children.len(),
+    node.has_more || truncated
+  ));
 
   Ok(DirectoryTreeChildrenResponse {
     path: target.to_string_lossy().to_string(),
@@ -2543,7 +2686,7 @@ fn find_windows_pi_command() -> Option<PathBuf> {
 
 #[cfg(windows)]
 fn find_windows_node_command() -> Option<PathBuf> {
-  find_command_in_path(&["node.exe", "node.cmd", "node.bat"])
+  find_command_in_path(&["node.exe"])
 }
 
 #[cfg(windows)]
@@ -2688,11 +2831,44 @@ fn safe_file_name_component(value: &str) -> String {
 }
 
 #[cfg(windows)]
-fn launch_script_path(script_id: Option<&str>) -> Result<PathBuf, String> {
+fn launch_script_path(script_id: Option<&str>, extension: &str) -> Result<PathBuf, String> {
   let scripts_dir = storage_dir()?.join("launch-scripts");
   fs::create_dir_all(&scripts_dir).map_err(|e| format!("创建启动脚本目录失败: {e}"))?;
   let safe_id = safe_file_name_component(script_id.unwrap_or("default"));
-  Ok(scripts_dir.join(format!("pi-launch-{safe_id}.bat")))
+  Ok(scripts_dir.join(format!("pi-launch-{safe_id}.{extension}")))
+}
+
+#[cfg(windows)]
+fn write_hidden_windows_launcher(script_path: &Path, extra_args: &[String], script_id: Option<&str>) -> Result<PathBuf, String> {
+  let launcher_path = launch_script_path(script_id, "mjs")?;
+  let args_json = serde_json::to_string(extra_args).map_err(|e| format!("生成启动参数失败: {e}"))?;
+  let script_json = serde_json::to_string(&script_path.to_string_lossy().to_string()).map_err(|e| format!("生成启动脚本路径失败: {e}"))?;
+  let launcher = format!(r#"import {{ spawn }} from "node:child_process";
+
+const script = {script_json};
+const args = {args_json};
+const shell = process.env.ComSpec || "cmd.exe";
+const child = spawn(shell, ["/D", "/C", "call", script, ...args], {{
+  shell: false,
+  stdio: "inherit",
+  windowsHide: true
+}});
+
+child.on("exit", (code, signal) => {{
+  if (signal) {{
+    process.kill(process.pid, signal);
+    return;
+  }}
+  process.exit(code ?? 1);
+}});
+
+child.on("error", (error) => {{
+  console.error(error?.message || String(error));
+  process.exit(1);
+}});
+"#);
+  fs::write(&launcher_path, launcher).map_err(|e| format!("写入隐藏启动器失败: {e}"))?;
+  Ok(launcher_path)
 }
 
 #[cfg(windows)]
@@ -2703,21 +2879,14 @@ fn build_pi_command(raw: &str, extra_args: &[String], launch_script_id: Option<&
   }
 
   if raw.contains('\n') || raw.contains('\r') || raw.to_ascii_lowercase().starts_with("@echo") || raw.to_ascii_lowercase().starts_with("set ") {
-    let script_path = launch_script_path(launch_script_id)?;
+    let script_path = launch_script_path(launch_script_id, "bat")?;
     let mut script = raw.replace('\r', "");
     if !script.ends_with('\n') { script.push('\n'); }
     fs::write(&script_path, script).map_err(|e| format!("写入启动脚本失败: {e}"))?;
-
-    let mut cmd = CommandBuilder::new("cmd.exe");
-    cmd.arg("/D");
-    cmd.arg("/C");
-    // 不要把带引号的 `call "..."` 拼成一个参数传给 cmd.exe。
-    // portable-pty/CreateProcess 会再次转义内部引号，cmd 可能把
-    // `"C:\...\pi-launch-*.bat"` 当成带反斜杠和引号的字面命令，导致
-    // “不是内部或外部命令”。直接把脚本路径作为 /C 的命令参数交给
-    // CommandBuilder 处理一次转义即可，含空格的用户目录也能正常启动。
-    cmd.arg(script_path);
-    cmd.args(extra_args);
+    let launcher_path = write_hidden_windows_launcher(&script_path, extra_args, launch_script_id)?;
+    let node = find_windows_node_command().unwrap_or_else(|| PathBuf::from("node.exe"));
+    let mut cmd = CommandBuilder::new(&node);
+    cmd.arg(&launcher_path);
     if let Some(path) = windows_augmented_path() {
       cmd.env("PATH", path);
     }
@@ -2770,6 +2939,55 @@ fn build_pi_command(raw: &str, extra_args: &[String], _launch_script_id: Option<
   cmd.args(args);
   cmd.args(extra_args);
   Ok(cmd)
+}
+
+fn prepare_pi_launch(session_id: String, pi_command: Option<String>, workdir: Option<String>, continue_session: Option<bool>) -> Result<PreparedPiLaunch, String> {
+  let workdir_path = workdir
+    .as_deref()
+    .map(str::trim)
+    .filter(|s| !s.is_empty())
+    .map(PathBuf::from);
+  let debug_enabled = resolve_debug_logging_enabled(workdir_path.as_deref(), pi_command.as_deref())?;
+  let storage_config = resolve_storage_config(workdir_path.as_deref())?;
+  let (raw, config_envs, _config_info) = resolve_pi_launch_config(workdir_path.as_deref(), pi_command.as_deref())?;
+  let min_version = resolve_min_pi_version(workdir_path.as_deref(), pi_command.as_deref())?;
+  let (pi_version, package_detection) = assert_pi_runtime_supported(&raw, &config_envs, &min_version)?;
+  let extra_args = if continue_session.unwrap_or(false) && !command_has_resume_flag(&raw) {
+    vec!["--continue".to_string()]
+  } else {
+    vec![]
+  };
+
+  let session_dir = session_dir(&session_id)?;
+  let run_id = format!("pi-run-{}-{}", chrono::Utc::now().timestamp_millis(), session_id);
+  let mut command = build_pi_command(&raw, &extra_args, Some(&run_id))?;
+  command.env("PI_CODING_AGENT_SESSION_DIR", session_dir.to_string_lossy().to_string());
+  command.env("PI_IDE_SESSION_ID", session_id);
+  command.env("PI_IDE_RUN_ID", run_id.clone());
+  command.env("PI_IDE_EVENT_MODE", storage_config.event_mode.clone());
+  command.env("PI_IDE_EVENT_TEXT_LIMIT", storage_config.event_text_limit.to_string());
+  command.env("PI_IDE_TOOL_RESULT_TEXT_LIMIT", storage_config.tool_result_text_limit.to_string());
+  command.env("PI_IDE_TERMINAL_LOG_MAX_BYTES", storage_config.terminal_log_max_bytes.to_string());
+  command.env("PI_IDE_DEBUG_ENABLED", if debug_enabled { "true" } else { "false" });
+  for (key, value) in config_envs {
+    command.env(key, value);
+  }
+
+  if let Some(dir_path) = workdir_path.as_ref() {
+    ensure_pi_ide_file_tracker(dir_path, storage_config.project_event_max_bytes)?;
+    command.cwd(dir_path);
+  }
+
+  Ok(PreparedPiLaunch {
+    raw,
+    pi_version,
+    package_detection,
+    debug_enabled,
+    storage_config,
+    session_dir,
+    run_id,
+    command,
+  })
 }
 
 fn session_dir(session_id: &str) -> Result<PathBuf, String> {
@@ -2889,30 +3107,30 @@ async fn start_pi_session(app: tauri::AppHandle, session_id: String, pi_command:
   if session_id.trim().is_empty() {
     return Err("sessionId 为空".to_string());
   }
-
-  let workdir_path = workdir
-    .as_deref()
-    .map(str::trim)
-    .filter(|s| !s.is_empty())
-    .map(PathBuf::from);
-  let debug_enabled = resolve_debug_logging_enabled(workdir_path.as_deref(), pi_command.as_deref())?;
-  let storage_config = resolve_storage_config(workdir_path.as_deref())?;
-  append_debug_line_when(debug_enabled, &format!("[backend] start_pi_session request session_id={session_id} workdir={:?} continue={:?}", workdir, continue_session));
+  let started_at = Instant::now();
+  append_debug_line_raw(&format!(
+    "[backend] start_pi_session enter session_id={session_id} workdir={:?} command_present={} continue_session={continue_session:?}",
+    workdir,
+    pi_command.as_deref().is_some_and(|value| !value.trim().is_empty())
+  ));
 
   {
     let mut sessions = PI_SESSIONS.lock().await;
     if let Some(runtime) = sessions.get_mut(&session_id) {
       match runtime.child.try_wait() {
         Ok(None) => {
+          append_debug_line_raw(&format!("[backend] start_pi_session already_running session_id={session_id} elapsed_ms={}", elapsed_ms(started_at)));
           append_debug_line_when(runtime.debug_enabled, &format!("[backend] start_pi_session already_running session_id={session_id}"));
-          let _ = app.emit("pi-status", serde_json::json!({ "sessionId": session_id, "status": "Pi 已经在运行" }));
+          emit_launch_status(&app, &session_id, None, "already_running", "Pi 已经在运行", serde_json::Value::Null);
           return Ok(());
         }
         Ok(Some(status)) => {
+          append_debug_line_raw(&format!("[backend] start_pi_session stale_child session_id={session_id} status={status} elapsed_ms={}", elapsed_ms(started_at)));
           append_debug_line_when(runtime.debug_enabled, &format!("[backend] start_pi_session stale_child session_id={session_id} status={status}"));
           sessions.remove(&session_id);
         }
         Err(e) => {
+          append_debug_line_raw(&format!("[backend] start_pi_session try_wait_error session_id={session_id} error={e} elapsed_ms={}", elapsed_ms(started_at)));
           append_debug_line_when(runtime.debug_enabled, &format!("[backend] start_pi_session try_wait_error session_id={session_id} error={e}"));
           sessions.remove(&session_id);
         }
@@ -2920,85 +3138,176 @@ async fn start_pi_session(app: tauri::AppHandle, session_id: String, pi_command:
     }
   }
 
-  let (raw, config_envs, config_info) = resolve_pi_launch_config(workdir_path.as_deref(), pi_command.as_deref())?;
-  let min_version = resolve_min_pi_version(workdir_path.as_deref(), pi_command.as_deref())?;
-  let (pi_version, package_detection) = assert_pi_runtime_supported(&raw, &config_envs, &min_version)?;
-  let extra_args = if continue_session.unwrap_or(false) && !command_has_resume_flag(&raw) {
-    vec!["--continue".to_string()]
-  } else {
-    vec![]
+  emit_launch_status(&app, &session_id, None, "checking_environment", "正在检测 Pi 环境", serde_json::Value::Null);
+  let prepare_started_at = Instant::now();
+  append_debug_line_raw(&format!("[backend] start_pi_session prepare start session_id={session_id} elapsed_ms={}", elapsed_ms(started_at)));
+  let prepare_session_id = session_id.clone();
+  let prepared = match tauri::async_runtime::spawn_blocking(move || {
+    prepare_pi_launch(prepare_session_id, pi_command, workdir, continue_session)
+  })
+    .await
+  {
+    Ok(Ok(prepared)) => {
+      append_debug_line_raw(&format!(
+        "[backend] start_pi_session prepare complete session_id={session_id} prepare_ms={} total_elapsed_ms={} pi_version={} debug_enabled={}",
+        elapsed_ms(prepare_started_at),
+        elapsed_ms(started_at),
+        prepared.pi_version,
+        prepared.debug_enabled
+      ));
+      prepared
+    }
+    Ok(Err(error)) => {
+      append_debug_line_raw(&format!(
+        "[backend] start_pi_session prepare failed session_id={session_id} prepare_ms={} total_elapsed_ms={} error={error}",
+        elapsed_ms(prepare_started_at),
+        elapsed_ms(started_at)
+      ));
+      emit_launch_status(&app, &session_id, None, "failed", &format!("Pi 启动准备失败：{error}"), serde_json::json!({ "error": error }));
+      return Err(error);
+    }
+    Err(error) => {
+      let message = format!("Pi 启动准备任务失败：{error}");
+      append_debug_line_raw(&format!(
+        "[backend] start_pi_session prepare task_failed session_id={session_id} prepare_ms={} total_elapsed_ms={} error={message}",
+        elapsed_ms(prepare_started_at),
+        elapsed_ms(started_at)
+      ));
+      emit_launch_status(&app, &session_id, None, "failed", &message, serde_json::json!({ "error": message }));
+      return Err(message);
+    }
   };
-  append_debug_line_when(debug_enabled, &format!(
-    "[backend] start_pi_session build command session_id={session_id} command_len={} pi_version={} package={:?} extra_args={:?} config={}",
-    raw.len(),
-    pi_version,
-    package_detection.active_package,
-    extra_args,
-    config_info
+
+  append_debug_line_when(prepared.debug_enabled, &format!("[backend] start_pi_session request session_id={session_id}"));
+  append_debug_line_when(prepared.debug_enabled, &format!(
+    "[backend] start_pi_session build command session_id={session_id} command_len={} pi_version={} package={:?}",
+    prepared.raw.len(),
+    prepared.pi_version,
+    prepared.package_detection.active_package
   ));
-  let session_dir = session_dir(&session_id)?;
-  let run_id = format!("pi-run-{}-{}", chrono::Utc::now().timestamp_millis(), session_id);
-  let mut cmd = build_pi_command(&raw, &extra_args, Some(&run_id))?;
-  cmd.env("PI_CODING_AGENT_SESSION_DIR", session_dir.to_string_lossy().to_string());
-  cmd.env("PI_IDE_SESSION_ID", session_id.clone());
-  cmd.env("PI_IDE_RUN_ID", run_id.clone());
-  cmd.env("PI_IDE_EVENT_MODE", storage_config.event_mode.clone());
-  cmd.env("PI_IDE_EVENT_TEXT_LIMIT", storage_config.event_text_limit.to_string());
-  cmd.env("PI_IDE_TOOL_RESULT_TEXT_LIMIT", storage_config.tool_result_text_limit.to_string());
-  cmd.env("PI_IDE_TERMINAL_LOG_MAX_BYTES", storage_config.terminal_log_max_bytes.to_string());
-  cmd.env("PI_IDE_DEBUG_ENABLED", if debug_enabled { "true" } else { "false" });
-  for (key, value) in config_envs {
-    cmd.env(key, value);
-  }
+  emit_launch_status(&app, &session_id, Some(&prepared.run_id), "prepared_command", "已准备 Pi 启动命令", serde_json::json!({
+    "piVersion": prepared.pi_version.clone(),
+    "package": prepared.package_detection.active_package.clone(),
+    "elapsedMs": elapsed_ms(started_at)
+  }));
 
-  if let Some(dir_path) = workdir_path.as_ref() {
-    ensure_pi_ide_file_tracker(dir_path, storage_config.project_event_max_bytes)?;
-    cmd.cwd(dir_path);
-  }
+  let PreparedPiLaunch {
+    raw,
+    debug_enabled,
+    storage_config,
+    session_dir,
+    run_id,
+    command: cmd,
+    ..
+  } = prepared;
 
+  emit_launch_status(&app, &session_id, Some(&run_id), "creating_pty", "正在创建内置终端", serde_json::Value::Null);
+  let pty_started_at = Instant::now();
+  append_debug_line_raw(&format!("[backend] start_pi_session openpty start session_id={session_id} run_id={run_id} elapsed_ms={}", elapsed_ms(started_at)));
   let pty_system = native_pty_system();
-  let pair = pty_system.openpty(PtySize {
+  let pair = match pty_system.openpty(PtySize {
     rows: 30,
     cols: 120,
     pixel_width: 0,
     pixel_height: 0,
-  }).map_err(|e| format!("创建伪终端失败: {e}"))?;
+  }) {
+    Ok(pair) => pair,
+    Err(error) => {
+      let message = format!("创建伪终端失败: {error}");
+      append_debug_line_raw(&format!(
+        "[backend] start_pi_session openpty failed session_id={session_id} run_id={run_id} pty_ms={} total_elapsed_ms={} error={message}",
+        elapsed_ms(pty_started_at),
+        elapsed_ms(started_at)
+      ));
+      emit_launch_status(&app, &session_id, Some(&run_id), "failed", &message, serde_json::json!({ "error": message }));
+      return Err(message);
+    }
+  };
+  append_debug_line_raw(&format!(
+    "[backend] start_pi_session openpty complete session_id={session_id} run_id={run_id} pty_ms={} total_elapsed_ms={}",
+    elapsed_ms(pty_started_at),
+    elapsed_ms(started_at)
+  ));
 
-  let child = pair.slave.spawn_command(cmd)
-    .map_err(|e| format!("启动 Pi 失败。请确认已安装 pi.dev CLI，并且命令 `{raw}` 可执行。系统错误: {e}"))?;
+  emit_launch_status(&app, &session_id, Some(&run_id), "spawning", "正在启动 Pi 进程", serde_json::Value::Null);
+  let spawn_started_at = Instant::now();
+  append_debug_line_raw(&format!("[backend] start_pi_session spawn start session_id={session_id} run_id={run_id} elapsed_ms={}", elapsed_ms(started_at)));
+  let child = match pair.slave.spawn_command(cmd) {
+    Ok(child) => child,
+    Err(error) => {
+      let message = format!("启动 Pi 失败。请确认已安装 pi.dev CLI，并且命令 `{raw}` 可执行。系统错误: {error}");
+      append_debug_line_raw(&format!(
+        "[backend] start_pi_session spawn failed session_id={session_id} run_id={run_id} spawn_ms={} total_elapsed_ms={} error={message}",
+        elapsed_ms(spawn_started_at),
+        elapsed_ms(started_at)
+      ));
+      emit_launch_status(&app, &session_id, Some(&run_id), "failed", &message, serde_json::json!({ "error": message }));
+      return Err(message);
+    }
+  };
+  append_debug_line_raw(&format!(
+    "[backend] start_pi_session spawn complete session_id={session_id} run_id={run_id} spawn_ms={} total_elapsed_ms={}",
+    elapsed_ms(spawn_started_at),
+    elapsed_ms(started_at)
+  ));
   let mut reader = pair.master.try_clone_reader().map_err(|e| format!("无法打开 Pi PTY reader: {e}"))?;
   let writer = pair.master.take_writer().map_err(|e| format!("无法打开 Pi PTY writer: {e}"))?;
 
   PI_SESSIONS.lock().await.insert(session_id.clone(), PiRuntime { writer, child, master: pair.master, debug_enabled });
+  append_debug_line_raw(&format!("[backend] start_pi_session runtime stored session_id={session_id} run_id={run_id} total_elapsed_ms={}", elapsed_ms(started_at)));
   append_debug_line_when(debug_enabled, &format!("[backend] start_pi_session spawned session_id={session_id}"));
-  let _ = app.emit("pi-status", serde_json::json!({ "sessionId": session_id, "runId": run_id, "status": format!("Pi 已启动：{}", raw) }));
+  emit_launch_status(&app, &session_id, Some(&run_id), "spawned", &format!("Pi 已启动：{}", raw), serde_json::Value::Null);
 
   let out_app = app.clone();
   let out_session_id = session_id.clone();
+  let out_run_id = run_id.clone();
   let out_terminal_log_path = session_dir.join("terminal.log");
   let out_terminal_log_max_bytes = storage_config.terminal_log_max_bytes;
   let out_debug_enabled = debug_enabled;
+  let output_started_at = Instant::now();
   std::thread::spawn(move || {
     let mut buf = vec![0u8; 8192];
+    let mut first_output_seen = false;
     loop {
       match reader.read(&mut buf) {
         Ok(0) => {
+          append_debug_line_raw(&format!(
+            "[backend] pi-output eof session_id={} run_id={} output_elapsed_ms={}",
+            out_session_id,
+            out_run_id,
+            elapsed_ms(output_started_at)
+          ));
           append_debug_line_when(out_debug_enabled, &format!("[backend] pi-output eof session_id={}", out_session_id));
-          let _ = out_app.emit("pi-status", serde_json::json!({
-            "sessionId": out_session_id,
-            "status": "Pi 已退出"
-          }));
+          emit_launch_status(&out_app, &out_session_id, Some(&out_run_id), "exited", "Pi 已退出", serde_json::Value::Null);
           break;
         }
         Ok(n) => {
           let _ = append_limited_terminal_log_bytes(&out_terminal_log_path, &buf[..n], out_terminal_log_max_bytes);
           append_debug_line_when(out_debug_enabled, &format!("[backend] pi-output session_id={} bytes={}", out_session_id, n));
+          if !first_output_seen {
+            first_output_seen = true;
+            append_debug_line_raw(&format!(
+              "[backend] pi-output first_output session_id={} run_id={} bytes={} output_elapsed_ms={}",
+              out_session_id,
+              out_run_id,
+              n,
+              elapsed_ms(output_started_at)
+            ));
+            emit_launch_status(&out_app, &out_session_id, Some(&out_run_id), "first_output", "Pi 已输出首批内容", serde_json::json!({ "bytes": n }));
+          }
           let _ = out_app.emit("pi-output", serde_json::json!({
             "sessionId": out_session_id,
             "data": String::from_utf8_lossy(&buf[..n]).to_string()
           }));
         }
         Err(e) => {
+          append_debug_line_raw(&format!(
+            "[backend] pi-output error session_id={} run_id={} output_elapsed_ms={} error={}",
+            out_session_id,
+            out_run_id,
+            elapsed_ms(output_started_at),
+            e
+          ));
           append_debug_line_when(out_debug_enabled, &format!("[backend] pi-output error session_id={} error={}", out_session_id, e));
           let _ = out_app.emit("pi-output", serde_json::json!({
             "sessionId": out_session_id,
@@ -3008,6 +3317,7 @@ async fn start_pi_session(app: tauri::AppHandle, session_id: String, pi_command:
             "sessionId": out_session_id,
             "status": "Pi 已退出"
           }));
+          emit_launch_status(&out_app, &out_session_id, Some(&out_run_id), "failed", &format!("Pi 输出读取失败：{e}"), serde_json::json!({ "error": String::from(e.to_string()) }));
           break;
         }
       }
