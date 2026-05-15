@@ -238,6 +238,7 @@ function collectTurnParts(turn, fallbackOutputFiles) {
     commands: [],
     references: [],
     outputs: [],
+    subagents: [],
     errors: []
   };
 
@@ -249,6 +250,7 @@ function collectTurnParts(turn, fallbackOutputFiles) {
     else if (item.type === "command") parts.commands.push(item);
     else if (item.type === "file_reference") parts.references.push(...(item.files || []));
     else if (item.type === "file_output") parts.outputs.push(...(item.files || []));
+    else if (item.type === "subagent_group") parts.subagents.push(item);
     else if (item.type === "error") parts.errors.push(item);
   }
 
@@ -381,6 +383,21 @@ function FileDetailList({ title, files }) {
   );
 }
 
+function SubagentInlineNotice({ groups }) {
+  const runs = groups.flatMap((group) => group.runs || []);
+  if (runs.length === 0) return null;
+  const running = runs.filter((run) => run.status === "running").length;
+  const failed = runs.filter((run) => run.status === "failed").length;
+  const detail = running > 0 ? `${running} 运行中` : failed > 0 ? `${failed} 失败` : "已完成";
+  return (
+    <div className="pi-session-subagent-inline">
+      <Bot size={14}/>
+      <span>已启动 {runs.length} 个 Subagent</span>
+      <small>{detail}，详情在工具栏的会话文件中查看</small>
+    </div>
+  );
+}
+
 function TurnDetails({ parts, expandedCommands, onToggleCommand }) {
   const hasDetails = parts.commands.length || parts.references.length || parts.progress.length || parts.thinking.length || parts.errors.length;
   if (!hasDetails) return null;
@@ -415,7 +432,7 @@ function TurnView({ turn, runtimeStatus, fallbackOutputFiles, expanded, expanded
   const active = Boolean((runtimeStatus?.processing || runtimeStatus?.starting) && turn.status === "running");
   const parts = collectTurnParts(turn, fallbackOutputFiles);
   const hasDetails = Boolean(parts.commands.length || parts.references.length || parts.progress.length || parts.thinking.length || parts.errors.length);
-  const hasVisibleWork = Boolean(parts.assistantText.trim() || parts.commands.length || parts.outputs.length || parts.errors.length);
+  const hasVisibleWork = Boolean(parts.assistantText.trim() || parts.commands.length || parts.outputs.length || parts.errors.length || parts.subagents.length);
   const status = elapsedText(turn, active, hasVisibleWork, now);
 
   return (
@@ -423,6 +440,7 @@ function TurnView({ turn, runtimeStatus, fallbackOutputFiles, expanded, expanded
       <UserMessage item={parts.user}/>
       <StatusLine label={status} expanded={expanded} canExpand={hasDetails} onToggle={onToggleTurn}/>
       <OperationRecords items={parts.progress}/>
+      <SubagentInlineNotice groups={parts.subagents}/>
       {parts.assistantText.trim() ? <MarkdownText text={parts.assistantText}/> : active ? <div className="pi-session-thinking">正在思考</div> : null}
       {parts.outputs.length > 0 && (
         <div className="pi-session-output-section">

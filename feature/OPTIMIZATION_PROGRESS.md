@@ -61,7 +61,7 @@ Pi 官方支持 RPC 模式，适合 IDE 或自定义 UI 作为结构化主通道
 
 ## 可调配置
 
-- `piIdeTerminalPreviewChars`：本地保存的终端输出预览长度，默认 `128 * 1024`。
+- `piIdeTerminalPreviewChars`：本地保存的终端输出预览长度，默认 `64 * 1024`。
 - `piIdeSessionTextPreviewChars`：本地保存的单段 timeline 文本预览长度，默认 `128 * 1024`。
 - `piIdeSessionTurnLimit`：本地保存的最近 turn 数量，默认 `50`。
 - `piIdeSessionFileRecordLimit`：本地保存的文件记录数量，默认 `500`。
@@ -75,6 +75,7 @@ Pi 官方支持 RPC 模式，适合 IDE 或自定义 UI 作为结构化主通道
 - `PI_IDE_PROTECTED_PATH_PATTERN`：受保护写入路径正则，默认保护 `.env*`、`.git`、`node_modules`。
 - `~/.pi-ide/config.json` 的 `debug.enabled`：全局 debug 日志开关，默认 `false`。
 - `<项目>/.pi.ide/config.json` 的 `debug.enabled`：项目 debug 日志开关，默认 `false`，项目配置优先。
+- `PI_IDE_SUBAGENT_DEBUG`：Subagent 事件桥接调试开关，默认关闭；设为 `true` 时写入 `subagent_trace`，用于定位工具事件是否被 Pi 暴露。
 
 ## 进度日志
 
@@ -120,3 +121,13 @@ Pi 官方支持 RPC 模式，适合 IDE 或自定义 UI 作为结构化主通道
 - 已同步清理异常文件内容：`F:\SausageProject\B-SplitProject\.pi\pi-ide-events.jsonl` 已从 103MB 清理到受控范围，`~/.pi-ide/pi-sessions` 下历史 `terminal.log` 已裁剪到默认上限范围。
 - 验证通过：`node src/projectStorageModel.test.mjs`、`node src/sessionTimelineModel.test.mjs`、`node src/piIdeEventMapper.test.mjs`、`node src/sessionMarkdownTableModel.test.mjs`、`npm run build`、`cargo test config_tests -- --nocapture`、`cargo check`。
 - 修复 Pi IDE bridge 对 `message.content` 类型的错误假设：`textContent`、`messageContentSummary` 和 `compactToolContent` 现在统一兼容字符串、数组和对象，避免 `content.map is not a function` 扩展运行时报错；已同步更新当前项目的 `.pi/extensions/pi-ide-file-tracker.ts`。
+- 修复 `localStorage` 配额满导致消息无法发送的问题：项目缓存写入失败时自动降级为瘦身快照，仍失败则只保留内存态并提示，不再中断 `sendCommand` 到 Pi 的发送链路；默认本地缓存上限同步收紧。
+
+## 2026-05-15 增量进度：Subagent 记录兼容与调试
+
+- 对照 `pi.dev` 与 `nicobailon/pi-subagents`：开源最新版通过 `pi.registerTool({ name: "subagent" })` 暴露原生 `subagent` 工具；Agent 定义文件位于 `.pi/agents/**/*.md`，可选通过 `pi-intercom` 做父子会话协调。
+- 本地运行环境的 `pi-subagents 0.24.0` 中 `pi.registerTool(tool)` 被注释，当前会话实际只暴露 `read/bash/edit/write/intercom` 等工具，因此右侧 Subagent 不能只依赖 `toolName: "subagent"`。
+- IDE 事件映射新增兼容路径：原生 `subagent/run_subagent/agent` 工具事件继续记录；`.pi/agents/*.md` 的 `write/edit` 记录为“子 Agent 已定义”；`intercom` 工具记录为跨会话子 Agent 委托。
+- Pi IDE bridge 新增 `subagent_trace` 调试事件，默认不写入；只有 `debug.enabled` 或 `PI_IDE_SUBAGENT_DEBUG` 开启时记录工具名、阶段、识别结果和输入字段。
+- 前端只在调试开启时写入 Subagent trace/debug 日志；默认状态不增加日志 I/O。
+- 验证通过：`node src/piIdeEventMapper.test.mjs`、`node src/subagentSummary.test.mjs`。

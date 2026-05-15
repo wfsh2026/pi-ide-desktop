@@ -19,10 +19,12 @@
 安装或更新 Pi CLI：
 
 ```bash
-npm install -g @earendil-works/pi-coding-agent
+npm install -g --force @earendil-works/pi-coding-agent
 ```
 
 旧包 `@mariozechner/pi-coding-agent` 已不推荐使用。
+
+Subagent 展示由 Pi IDE 原生支持，但不强制安装任何第三方扩展。IDE 会识别 `subagent` / `run_subagent` / `agent` 工具调用，并在会话视图中生成可展开的子 Agent 卡片；自定义 Pi 扩展也可以写入 `.pi/pi-ide-events.jsonl` 的 `kind: "subagent"` 事件来接入同一套展示。
 
 ## 核心功能
 

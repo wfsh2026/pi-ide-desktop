@@ -123,6 +123,30 @@ function normalizeTimelineItem(item, index) {
     };
   }
 
+  if (type === "subagent_group") {
+    return {
+      ...base,
+      title: String(item.title || "子 Agent"),
+      runs: (Array.isArray(item.runs) ? item.runs : []).map((run, runIndex) => ({
+        id: String(run.id || `subagent-${runIndex}`),
+        agent_name: String(run.agent_name || run.name || run.role || "subagent"),
+        role: String(run.role || ""),
+        task: String(run.task || ""),
+        action: String(run.action || ""),
+        status: run.status || "completed",
+        model: run.model || null,
+        cwd: String(run.cwd || ""),
+        session_file: String(run.session_file || run.sessionFile || ""),
+        summary: stripAnsiText(run.summary || ""),
+        started_at: run.started_at || run.startedAt || "",
+        ended_at: run.ended_at || run.endedAt || "",
+        updated_at: run.updated_at || run.updatedAt || "",
+        items: Array.isArray(run.items) ? run.items.map(normalizeTimelineItem) : [],
+        files: Array.isArray(run.files) ? run.files : []
+      }))
+    };
+  }
+
   return {
     ...base,
     text: stripAnsiText(item.text || item.output || "")
