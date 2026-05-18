@@ -47,6 +47,7 @@ function buildVerification(item) {
 }
 
 function resultStatus(turnStatus, verifications, errors) {
+  if (turnStatus === "cancelled") return "cancelled";
   if (turnStatus === "running") return "running";
   if (safeArray(errors).length > 0) return "failed";
   if (verifications.some((item) => item.status === "failed")) return "failed";
@@ -74,6 +75,7 @@ export function buildResultView({ conclusion = "", processItems = [], outputs = 
 export function resultStatusLabel(status) {
   if (status === "verified") return "已验证";
   if (status === "failed") return "失败";
+  if (status === "cancelled") return "已取消";
   if (status === "running") return "处理中";
   return "未验证";
 }

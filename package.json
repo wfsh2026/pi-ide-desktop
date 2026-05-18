@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
+    "test": "node --test src/*.test.mjs",
     "build": "vite build",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",

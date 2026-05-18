@@ -11,6 +11,7 @@ import { isLikelyFilePath, pathFromDroppedText } from "./dropPathModel.js";
 import { applyPiIdeTimelineEvent } from "./piIdeEventMapper.js";
 import { DEFAULT_STORAGE_LIMITS, limitTextValue, normalizeStoredProjects, normalizeStoredProjectsForQuota, positiveInteger, resolveActiveProjectSession } from "./projectStorageModel.js";
 import { collectSessionSubagents, sessionSubagentSummary } from "./subagentSummary.js";
+import { hasTauriEventRuntime, hasTauriInvokeRuntime, hasTauriWebviewRuntime, trackAsyncUnsubscribe } from "./tauriRuntime.js";
 
 const DEFAULT_COMMAND = "pi";
 const PROJECTS_STORAGE_KEY = "piIdeProjects";
@@ -308,7 +309,10 @@ function updateLatestTurnStatus(turns, status, now, errorDetail = "") {
     if (turnIndex !== index) return turn;
     const nextItems = (Array.isArray(turn.items) ? turn.items : []).map((item) => {
       if (item.type === "progress") {
-        return { ...item, status, detail: status === "completed" ? "AI 已完成本轮任务。" : item.detail, updated_at: now };
+        const detail = status === "completed" ? "AI 已完成本轮任务。"
+          : status === "cancelled" ? "已取消本轮任务。"
+          : item.detail;
+        return { ...item, status, detail, updated_at: now };
       }
       if (item.type === "assistant_message" && item.status === "running") {
         return { ...item, status, updated_at: now };
@@ -370,6 +374,7 @@ function errorLogData(error) {
 }
 
 function writeFrontendLog(message, data = undefined, force = false) {
+  if (!hasTauriInvokeRuntime()) return;
   let suffix = "";
   if (data !== undefined) {
     try {
@@ -378,7 +383,9 @@ function writeFrontendLog(message, data = undefined, force = false) {
       suffix = ` ${JSON.stringify({ serializationError: String(error) })}`;
     }
   }
-  invoke("append_debug_log", { source: "frontend", message: `${message}${suffix}`, workdir: debugLogContext.workdir || null, force }).catch(() => {});
+  try {
+    invoke("append_debug_log", { source: "frontend", message: `${message}${suffix}`, workdir: debugLogContext.workdir || null, force }).catch(() => {});
+  } catch (_) {}
 }
 
 function debugLog(message, data = undefined) {
@@ -1824,6 +1831,11 @@ export default function App() {
           updateSessionModel(targetSessionId, event.model);
           setStatus(`已切换模型：${formatModelInfo(event.model)}`);
         } else {
+          updateSessionById(targetSessionId, (session) => ({
+            ...session,
+            pending_model: null,
+            updated_at: event.timestamp || new Date().toISOString()
+          }));
           setStatus(`模型切换失败：${event.error || "未知错误"}`);
         }
         continue;
@@ -1993,93 +2005,101 @@ export default function App() {
     setTerminalReplayContent("");
     setTerminalReplaySignal((value) => value + 1);
 
-    invoke("get_launch_context").then((context) => {
-      if (launchHandledRef.current) return;
-      launchHandledRef.current = true;
-      const projectPath = context?.projectPath || context?.project_path;
-      if (projectPath) {
-        createOrSelectProjectForPath(projectPath, { createNewSession: true, sessionTitle: "右键启动" });
-        setTimeout(() => invoke("ensure_pi_ide_config", { workdir: projectPath, legacyCommand: legacyPiCommandRef.current }).catch(() => {}), 800);
-        setStatus(`已载入项目：${basename(projectPath)}`);
-      }
-    }).catch((error) => {
-      forceDebugLog("get launch context failed", { error: errorLogData(error) });
-    });
+    if (hasTauriInvokeRuntime()) {
+      invoke("get_launch_context").then((context) => {
+        if (launchHandledRef.current) return;
+        launchHandledRef.current = true;
+        const projectPath = context?.projectPath || context?.project_path;
+        if (projectPath) {
+          createOrSelectProjectForPath(projectPath, { createNewSession: true, sessionTitle: "右键启动" });
+          setTimeout(() => invoke("ensure_pi_ide_config", { workdir: projectPath, legacyCommand: legacyPiCommandRef.current }).catch(() => {}), 800);
+          setStatus(`已载入项目：${basename(projectPath)}`);
+        }
+      }).catch((error) => {
+        forceDebugLog("get launch context failed", { error: errorLogData(error) });
+      });
+    }
 
     const unsubs = [];
+    const pendingUnsubs = [];
     forceDebugLog("app mounted", {
       projectCount: projectsRef.current.length,
       activeProjectId: activeProjectIdRef.current,
       activeProjectSessionId: activeProjectSessionIdRef.current
     });
-    listen("pi-status", (event) => {
-      const payload = event.payload;
-      const sessionId = payload && typeof payload === "object" ? (payload.sessionId || payload.session_id) : null;
-      const text = payload && typeof payload === "object" ? String(payload.status || "") : String(payload || "");
-      const launchEvent = normalizeLaunchEvent(payload);
-      const phase = payload && typeof payload === "object" ? String(payload.phase || "") : "";
-      if (launchEvent) {
-        forceDebugLog("pi launch event", {
-          sessionId,
-          runId: launchEvent.runId,
-          phase: launchEvent.phase,
-          message: launchEvent.message
-        });
-      }
-      setStatus(text);
-      if (sessionId) {
-        const phaseState = launchPhaseState(phase, text);
-        const previous = piSessionStatusRef.current[sessionId] || {};
-        const launchEvents = appendLaunchEvent(previous.launchEvents, launchEvent);
+    if (hasTauriEventRuntime()) {
+      pendingUnsubs.push(trackAsyncUnsubscribe(listen("pi-status", (event) => {
+        const payload = event.payload;
+        const sessionId = payload && typeof payload === "object" ? (payload.sessionId || payload.session_id) : null;
+        const text = payload && typeof payload === "object" ? String(payload.status || "") : String(payload || "");
+        const launchEvent = normalizeLaunchEvent(payload);
+        const phase = payload && typeof payload === "object" ? String(payload.phase || "") : "";
         if (launchEvent) {
-          updateSessionById(sessionId, (session) => ({
-            ...session,
-            launch_events: appendLaunchEvent(session.launch_events, launchEvent),
-            updated_at: launchEvent.timestamp || new Date().toISOString()
-          }));
-        }
-        if (phaseState.stopped || phaseState.failed) {
-          markLatestTurnStatus(sessionId, "failed", text);
-        }
-        setSessionRuntimeStatus(sessionId, {
-          running: (phaseState.stopped || phaseState.failed) ? false : phaseState.running || previous.running || false,
-          starting: phaseState.starting,
-          processing: (phaseState.stopped || phaseState.failed) ? false : previous.processing || false,
-          runId: payload.runId || payload.run_id || previous.runId,
-          launchPhase: phase || previous.launchPhase,
-          launchEvents,
-          status: text
-        });
-        if (phaseState.running && !phaseState.stopped && !phaseState.failed) {
-          flushPendingPiInputs(sessionId).catch((error) => {
-            debugLog("flush pending inputs after status failed", { sessionId, error: String(error) });
-            setStatus(`发送排队消息失败：${String(error)}`);
+          forceDebugLog("pi launch event", {
+            sessionId,
+            runId: launchEvent.runId,
+            phase: launchEvent.phase,
+            message: launchEvent.message
           });
         }
-      }
-    }).then((f) => unsubs.push(f));
-    listen("pi-output", (event) => {
-      const payload = event.payload || {};
-      debugLog("pi-output event", { sessionId: payload.sessionId || payload.session_id, bytes: String(payload.data ?? "").length, active: activeProjectSessionIdRef.current });
-      const sessionId = payload.sessionId || payload.session_id;
-      const data = String(payload.data ?? "");
-      if (sessionId && data) {
-        touchPiSessionActivity(sessionId);
-        appendOutputToSession(sessionId, data);
-      }
+        setStatus(text);
+        if (sessionId) {
+          const phaseState = launchPhaseState(phase, text);
+          const previous = piSessionStatusRef.current[sessionId] || {};
+          const launchEvents = appendLaunchEvent(previous.launchEvents, launchEvent);
+          if (launchEvent) {
+            updateSessionById(sessionId, (session) => ({
+              ...session,
+              launch_events: appendLaunchEvent(session.launch_events, launchEvent),
+              updated_at: launchEvent.timestamp || new Date().toISOString()
+            }));
+          }
+          if (phaseState.stopped || phaseState.failed) {
+            markLatestTurnStatus(sessionId, "failed", text);
+          }
+          setSessionRuntimeStatus(sessionId, {
+            running: (phaseState.stopped || phaseState.failed) ? false : phaseState.running || previous.running || false,
+            starting: phaseState.starting,
+            processing: (phaseState.stopped || phaseState.failed) ? false : previous.processing || false,
+            runId: payload.runId || payload.run_id || previous.runId,
+            launchPhase: phase || previous.launchPhase,
+            launchEvents,
+            status: text
+          });
+          if (phaseState.running && !phaseState.stopped && !phaseState.failed) {
+            flushPendingPiInputs(sessionId).catch((error) => {
+              debugLog("flush pending inputs after status failed", { sessionId, error: String(error) });
+              setStatus(`发送排队消息失败：${String(error)}`);
+            });
+          }
+        }
+      }), unsubs, (error) => forceDebugLog("listen pi-status failed", { error: errorLogData(error) })));
+      pendingUnsubs.push(trackAsyncUnsubscribe(listen("pi-output", (event) => {
+        const payload = event.payload || {};
+        debugLog("pi-output event", { sessionId: payload.sessionId || payload.session_id, bytes: String(payload.data ?? "").length, active: activeProjectSessionIdRef.current });
+        const sessionId = payload.sessionId || payload.session_id;
+        const data = String(payload.data ?? "");
+        if (sessionId && data) {
+          touchPiSessionActivity(sessionId);
+          appendOutputToSession(sessionId, data);
+        }
 
-      if (!sessionId || !piSessionStatusRef.current[sessionId]?.processing) return;
-      if (data.includes("[PTY 读取错误]") || data.includes("Pi 已停止") || data.includes("Pi 已退出")) {
-        setSessionRuntimeStatus(sessionId, { processing: false });
-        markLatestTurnStatus(sessionId, "failed", data);
-      }
-    }).then((f) => unsubs.push(f));
-    getCurrentWebview().onDragDropEvent((event) => {
-      if (event.payload?.type === "drop") {
-        insertFileAttachments(event.payload.paths || []);
-      }
-    }).then((f) => unsubs.push(f));
+        if (!sessionId || !piSessionStatusRef.current[sessionId]?.processing) return;
+        if (data.includes("[PTY 读取错误]") || data.includes("Pi 已停止") || data.includes("Pi 已退出")) {
+          setSessionRuntimeStatus(sessionId, { processing: false });
+          markLatestTurnStatus(sessionId, "failed", data);
+        }
+      }), unsubs, (error) => forceDebugLog("listen pi-output failed", { error: errorLogData(error) })));
+    }
+    if (hasTauriWebviewRuntime()) {
+      pendingUnsubs.push(trackAsyncUnsubscribe(getCurrentWebview().onDragDropEvent((event) => {
+        if (event.payload?.type === "drop") {
+          insertFileAttachments(event.payload.paths || []);
+        }
+      }), unsubs, (error) => forceDebugLog("listen webview drop failed", { error: errorLogData(error) })));
+    }
     return () => {
+      pendingUnsubs.forEach((dispose) => dispose());
       Object.values(sessionWarmupTimersRef.current).forEach((timer) => clearTimeout(timer));
       sessionWarmupTimersRef.current = {};
       if (persistOutputTimerRef.current) clearTimeout(persistOutputTimerRef.current);
@@ -2545,12 +2565,6 @@ export default function App() {
     const payload = JSON.stringify({ provider: pending.provider, id: pending.id });
     setStatus(`正在应用待切换模型：${formatModelInfo(pending)}`);
     await sendToRunningPi(sessionId, `/pi-ide-switch-model ${payload}\r`);
-    updateSessionById(sessionId, (current) => ({
-      ...current,
-      pending_model: null,
-      current_model: pending,
-      updated_at: new Date().toISOString()
-    }));
   }
 
   async function sendToActivePi(input) {
@@ -2628,11 +2642,12 @@ export default function App() {
       const payload = JSON.stringify({ provider: model.provider, id: model.id });
       if (piSessionStatusRef.current[sessionId]?.running) {
         setStatus(`正在切换模型：${label}`);
+        const pending = normalizeModelInfo(model);
         await invoke("queue_pi_command", {
           workdir: activeProject?.path || workdir || "",
           command: JSON.stringify({ action: "switch_model", provider: model.provider, id: model.id })
         });
-        updateSessionById(sessionId, (session) => ({ ...session, pending_model: null, updated_at: new Date().toISOString() }));
+        updateSessionById(sessionId, (session) => ({ ...session, pending_model: pending, updated_at: new Date().toISOString() }));
       } else {
         const pending = normalizeModelInfo(model);
         updateSessionById(sessionId, (session) => ({

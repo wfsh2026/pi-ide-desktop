@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+import { hasTauriEventRuntime, hasTauriInvokeRuntime, trackAsyncUnsubscribe } from "../tauriRuntime.js";
 
 const TERMINAL_SCROLLBACK_STORAGE_KEY = "piIdeTerminalScrollback";
 const DEFAULT_TERMINAL_SCROLLBACK = 100000;
@@ -80,7 +81,7 @@ export default function PiTerminal({ activeSessionId, clearSignal, replaySignal 
         try {
           fit.fit();
           const sessionId = activeSessionIdRef.current;
-          if (sessionId) invoke("resize_pi", { sessionId, cols: term.cols, rows: term.rows }).catch(() => {});
+          if (sessionId && hasTauriInvokeRuntime()) invoke("resize_pi", { sessionId, cols: term.cols, rows: term.rows }).catch(() => {});
         } catch (_) {}
       });
     };
@@ -96,31 +97,33 @@ export default function PiTerminal({ activeSessionId, clearSignal, replaySignal 
       const sessionId = activeSessionIdRef.current;
       if (!sessionId) return;
       if (onTerminalInputRef.current) onTerminalInputRef.current(data).catch(() => {});
-      else invoke("send_pi_input", { sessionId, input: data }).catch(() => {});
+      else if (hasTauriInvokeRuntime()) invoke("send_pi_input", { sessionId, input: data }).catch(() => {});
     });
     const resizeObserver = new ResizeObserver(fitAndNotify);
     resizeObserver.observe(host);
     host.addEventListener("pointerdown", onHostPointerDown);
     window.addEventListener("resize", fitAndNotify);
 
-    let unsubscribeOutput = null;
-    listen("pi-output", (event) => {
-      const payload = event.payload || {};
-      const sessionId = payload.sessionId || payload.session_id;
-      const data = String(payload.data ?? "");
-      if (!sessionId || sessionId !== activeSessionIdRef.current) return;
-      writeTerminal(data);
-    }).then((unsubscribe) => {
-      unsubscribeOutput = unsubscribe;
-    });
+    const unsubs = [];
+    const pendingUnsubs = [];
+    if (hasTauriEventRuntime()) {
+      pendingUnsubs.push(trackAsyncUnsubscribe(listen("pi-output", (event) => {
+        const payload = event.payload || {};
+        const sessionId = payload.sessionId || payload.session_id;
+        const data = String(payload.data ?? "");
+        if (!sessionId || sessionId !== activeSessionIdRef.current) return;
+        writeTerminal(data);
+      }), unsubs));
+    }
 
     return () => {
+      pendingUnsubs.forEach((dispose) => dispose());
       if (resizeFrameRef.current) cancelAnimationFrame(resizeFrameRef.current);
       resizeObserver.disconnect();
       host.removeEventListener("pointerdown", onHostPointerDown);
       dataDisposable.dispose();
       window.removeEventListener("resize", fitAndNotify);
-      unsubscribeOutput?.();
+      unsubs.forEach((unsubscribe) => unsubscribe());
       term.dispose();
       terminalRef.current = null;
       fitRef.current = null;

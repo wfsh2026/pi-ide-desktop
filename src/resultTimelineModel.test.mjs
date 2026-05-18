@@ -49,4 +49,12 @@ const running = buildResultView({
 assert.equal(running.status, "running");
 assert.equal(verificationSummary(running.verifications), "1 运行中");
 
+const cancelled = buildResultView({
+  conclusion: "",
+  processItems: []
+}, "cancelled");
+
+assert.equal(cancelled.status, "cancelled");
+assert.equal(resultStatusLabel(cancelled.status), "已取消");
+
 console.log("result timeline model ok");

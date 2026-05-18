@@ -2,6 +2,7 @@ import React from "react";
 import { createRoot } from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
 import AppErrorBoundary from "./components/AppErrorBoundary.jsx";
+import { hasTauriInvokeRuntime } from "./tauriRuntime.js";
 import "@xterm/xterm/css/xterm.css";
 import "./styles.css";
 
@@ -26,13 +27,16 @@ function errorData(error, extra = {}) {
 }
 
 function bootLog(message, data = undefined, force = false) {
+  if (!hasTauriInvokeRuntime()) return;
   const suffix = data === undefined ? "" : ` ${safeLogData(data)}`;
-  invoke("append_debug_log", {
-    source: "frontend-boot",
-    message: `${message}${suffix}`,
-    workdir: null,
-    force
-  }).catch(() => {});
+  try {
+    invoke("append_debug_log", {
+      source: "frontend-boot",
+      message: `${message}${suffix}`,
+      workdir: null,
+      force
+    }).catch(() => {});
+  } catch (_) {}
 }
 
 window.addEventListener("error", (event) => {

@@ -1830,8 +1830,30 @@ export default function(pi) {
             try {
               const cmd = JSON.parse(line);
               if (cmd?.action === "switch_model" && cmd.provider && cmd.id) {
-                const model = pi.ctx?.modelRegistry?.find(cmd.provider, cmd.id);
-                if (model) pi.setModel(model).catch(() => {});
+                const ctx = pi.ctx || {};
+                const model = ctx.modelRegistry?.find(cmd.provider, cmd.id);
+                if (!model) {
+                  appendEvent(ctx, {
+                    kind: "model_switch_result",
+                    success: false,
+                    error: `Model not found: ${cmd.provider}/${cmd.id}`,
+                    requested: { provider: cmd.provider, id: cmd.id },
+                  });
+                  continue;
+                }
+                pi.setModel(model)
+                  .then((ok) => appendEvent(ctx, {
+                    kind: "model_switch_result",
+                    success: Boolean(ok),
+                    model: modelInfo(model),
+                    error: ok ? "" : "No API key or auth unavailable",
+                  }))
+                  .catch((error) => appendEvent(ctx, {
+                    kind: "model_switch_result",
+                    success: false,
+                    model: modelInfo(model),
+                    error: String(error?.message || error),
+                  }));
               }
             } catch (_) {}
           }
@@ -3047,9 +3069,9 @@ fn append_terminal_log_bytes(path: &Path, data: &[u8]) -> Result<(), String> {
     .create(true)
     .append(true)
     .open(path)
-    .map_err(|e| format!("鍐欏叆缁堢鏃ュ織澶辫触 {:?}: {e}", path))?;
+    .map_err(|e| format!("写入终端日志失败 {:?}: {e}", path))?;
   file.write_all(data)
-    .map_err(|e| format!("鍐欏叆缁堢鏃ュ織澶辫触 {:?}: {e}", path))
+    .map_err(|e| format!("写入终端日志失败 {:?}: {e}", path))
 }
 
 fn append_limited_terminal_log_bytes(path: &Path, data: &[u8], max_bytes: u64) -> Result<(), String> {
@@ -3082,14 +3104,14 @@ fn read_terminal_log_tail(session_id: String, max_bytes: Option<u64>) -> Result<
   if limit == 0 {
     return Ok(String::new());
   }
-  let mut file = fs::File::open(&path).map_err(|e| format!("璇诲彇缁堢鏃ュ織澶辫触 {:?}: {e}", path))?;
-  let len = file.metadata().map_err(|e| format!("璇诲彇缁堢鏃ュ織澶у皬澶辫触 {:?}: {e}", path))?.len();
+  let mut file = fs::File::open(&path).map_err(|e| format!("读取终端日志失败 {:?}: {e}", path))?;
+  let len = file.metadata().map_err(|e| format!("读取终端日志大小失败 {:?}: {e}", path))?.len();
   if len > limit {
     file.seek(SeekFrom::Start(len - limit))
-      .map_err(|e| format!("瀹氫綅缁堢鏃ュ織澶辫触 {:?}: {e}", path))?;
+      .map_err(|e| format!("定位终端日志失败 {:?}: {e}", path))?;
   }
   let mut bytes = Vec::new();
-  file.read_to_end(&mut bytes).map_err(|e| format!("璇诲彇缁堢鏃ュ織澶辫触 {:?}: {e}", path))?;
+  file.read_to_end(&mut bytes).map_err(|e| format!("读取终端日志失败 {:?}: {e}", path))?;
   Ok(String::from_utf8_lossy(&bytes).to_string())
 }
 
@@ -3099,7 +3121,7 @@ fn clear_terminal_log(session_id: String) -> Result<(), String> {
     return Ok(());
   }
   let path = terminal_log_path(&session_id)?;
-  fs::write(&path, "").map_err(|e| format!("娓呯┖缁堢鏃ュ織澶辫触 {:?}: {e}", path))
+  fs::write(&path, "").map_err(|e| format!("清空终端日志失败 {:?}: {e}", path))
 }
 
 #[tauri::command]
@@ -3497,7 +3519,7 @@ fn read_jsonl_values_incremental(path: PathBuf) -> Result<Vec<serde_json::Value>
   }
 
   let key = path.to_string_lossy().to_string();
-  let len = fs::metadata(&path).map_err(|e| format!("璇诲彇 JSONL 澶у皬澶辫触 {:?}: {e}", path))?.len();
+  let len = fs::metadata(&path).map_err(|e| format!("读取 JSONL 大小失败 {:?}: {e}", path))?.len();
   let start = {
     let mut offsets = PI_EVENT_OFFSETS.lock().map_err(|_| "JSONL offset lock poisoned".to_string())?;
     let saved = *offsets.get(&key).unwrap_or(&0);
@@ -3520,10 +3542,10 @@ fn read_jsonl_values_incremental(path: PathBuf) -> Result<Vec<serde_json::Value>
     return Ok(events);
   }
 
-  let mut file = fs::File::open(&path).map_err(|e| format!("璇诲彇 JSONL 澶辫触 {:?}: {e}", path))?;
-  file.seek(SeekFrom::Start(start)).map_err(|e| format!("瀹氫綅 JSONL 澶辫触 {:?}: {e}", path))?;
+  let mut file = fs::File::open(&path).map_err(|e| format!("读取 JSONL 失败 {:?}: {e}", path))?;
+  file.seek(SeekFrom::Start(start)).map_err(|e| format!("定位 JSONL 失败 {:?}: {e}", path))?;
   let mut raw = String::new();
-  file.read_to_string(&mut raw).map_err(|e| format!("璇诲彇 JSONL 澶辫触 {:?}: {e}", path))?;
+  file.read_to_string(&mut raw).map_err(|e| format!("读取 JSONL 失败 {:?}: {e}", path))?;
 
   let mut next_offset = start + raw.len() as u64;
   if !raw.is_empty() && !raw.ends_with('\n') {
