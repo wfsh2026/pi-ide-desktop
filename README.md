@@ -97,10 +97,10 @@ npm run package:release
 产物：
 
 ```text
-release/pi-agent-dock-desktop_2.0.0_x64-setup.exe
-release/pi-agent-dock-desktop_2.0.0_x64_en-US.msi
+release/pi-agent-dock-desktop_2.0.1_x64-setup.exe
+release/pi-agent-dock-desktop_2.0.1_x64_en-US.msi
 release/pi-agent-dock-desktop.exe
-release/SHA256SUMS-2.0.0.txt
+release/SHA256SUMS-2.0.1.txt
 ```
 
 ## 本地数据位置

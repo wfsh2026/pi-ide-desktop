@@ -1,6 +1,6 @@
 [package]
 name = "pi-agent-dock-desktop"
-version = "2.0.0"
+version = "2.0.1"
 description = "A lightweight desktop agent dock for pi.dev Pi Coding Agent"
 authors = ["Pi Agent Dock"]
 edition = "2021"
