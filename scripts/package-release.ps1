@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  Build and package pi-ide-desktop release artifacts.
+  Build and package Pi Agent Dock release artifacts.
 
 .DESCRIPTION
   This script is intended for Windows developers/users who want a one-command
@@ -44,7 +44,7 @@ $PackageJsonPath = Join-Path $Root "package.json"
 $PackageJson = Get-Content $PackageJsonPath -Raw | ConvertFrom-Json
 $Version = [string]$PackageJson.version
 $ProductName = [string]$PackageJson.name
-if (-not $ProductName) { $ProductName = "pi-ide-desktop" }
+if (-not $ProductName) { $ProductName = "pi-agent-dock-desktop" }
 
 $ReleaseDir = Join-Path $Root "release"
 New-Item -ItemType Directory -Force -Path $ReleaseDir | Out-Null
@@ -83,20 +83,36 @@ Write-Step "Tauri package build"
 Invoke-Step "npm" @("run", "tauri:build")
 
 Write-Step "Copy artifacts"
-$ReleaseExeSource = Join-Path $Root "src-tauri\target\release\pi-ide-desktop.exe"
-$NsisSource = Join-Path $Root "src-tauri\target\release\bundle\nsis\pi-ide-desktop_${Version}_x64-setup.exe"
-$MsiSource = Join-Path $Root "src-tauri\target\release\bundle\msi\pi-ide-desktop_${Version}_x64_en-US.msi"
+$ReleaseExeSources = @(
+  Join-Path $Root "src-tauri\target\release\pi-agent-dock-desktop.exe"
+  Join-Path $Root "src-tauri\target\release\Pi Agent Dock.exe"
+)
+$NsisSources = @(
+  Join-Path $Root "src-tauri\target\release\bundle\nsis\Pi Agent Dock_${Version}_x64-setup.exe"
+  Join-Path $Root "src-tauri\target\release\bundle\nsis\pi-agent-dock-desktop_${Version}_x64-setup.exe"
+)
+$MsiSources = @(
+  Join-Path $Root "src-tauri\target\release\bundle\msi\Pi Agent Dock_${Version}_x64_en-US.msi"
+  Join-Path $Root "src-tauri\target\release\bundle\msi\pi-agent-dock-desktop_${Version}_x64_en-US.msi"
+)
 
-$ReleaseExeTarget = Join-Path $ReleaseDir "pi-ide-desktop.exe"
-$NsisTarget = Join-Path $ReleaseDir "pi-ide-desktop_${Version}_x64-setup.exe"
-$MsiTarget = Join-Path $ReleaseDir "pi-ide-desktop_${Version}_x64_en-US.msi"
+$ReleaseExeTarget = Join-Path $ReleaseDir "pi-agent-dock-desktop.exe"
+$NsisTarget = Join-Path $ReleaseDir "pi-agent-dock-desktop_${Version}_x64-setup.exe"
+$MsiTarget = Join-Path $ReleaseDir "pi-agent-dock-desktop_${Version}_x64_en-US.msi"
 
-$Sources = @($ReleaseExeSource, $NsisSource, $MsiSource)
-foreach ($Source in $Sources) {
-  if (-not (Test-Path $Source)) {
-    throw "Expected artifact not found: $Source"
+function Resolve-ArtifactSource([string[]]$Candidates, [string]$Kind) {
+  foreach ($Candidate in $Candidates) {
+    if (Test-Path $Candidate) {
+      return $Candidate
+    }
   }
+  $Checked = $Candidates -join "; "
+  throw "Expected ${Kind} artifact not found. Checked: $Checked"
 }
+
+$ReleaseExeSource = Resolve-ArtifactSource $ReleaseExeSources "release exe"
+$NsisSource = Resolve-ArtifactSource $NsisSources "NSIS installer"
+$MsiSource = Resolve-ArtifactSource $MsiSources "MSI installer"
 
 function Copy-Artifact([string]$Source, [string]$Target, [switch]$AllowFallback) {
   try {

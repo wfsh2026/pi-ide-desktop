@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "pi-ide-desktop",
+  "productName": "Pi Agent Dock",
   "version": "2.0.0",
-  "identifier": "dev.pi.ide.desktop",
+  "identifier": "dev.pi.agent.dock.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://127.0.0.1:1420",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "pi-ide-desktop",
+        "title": "Pi Agent Dock",
         "width": 1280,
         "height": 820,
         "minWidth": 980,

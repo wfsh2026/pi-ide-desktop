@@ -1,4 +1,4 @@
-# pi-ide-desktop V1.0.1 发布说明
+# Pi Agent Dock V1.0.1 发布说明
 
 发布日期：2026-05-12
 分支：`V1.0.1`
@@ -34,15 +34,15 @@ V1.0.1 继承 V1.0.0 的完整功能：
 本分支提交以下 Windows x64 产物：
 
 ```text
-release/pi-ide-desktop.exe
-release/pi-ide-desktop_1.0.1_x64-setup.exe
-release/pi-ide-desktop_1.0.1_x64_en-US.msi
+release/pi-agent-dock-desktop.exe
+release/pi-agent-dock-desktop_1.0.1_x64-setup.exe
+release/pi-agent-dock-desktop_1.0.1_x64_en-US.msi
 ```
 
 建议优先使用：
 
 ```text
-release/pi-ide-desktop_1.0.1_x64-setup.exe
+release/pi-agent-dock-desktop_1.0.1_x64-setup.exe
 ```
 
 ## 构建验证

@@ -53,9 +53,9 @@ release/
 包括：
 
 ```text
-release/pi-ide-desktop.exe
-release/pi-ide-desktop_<version>_x64-setup.exe
-release/pi-ide-desktop_<version>_x64_en-US.msi
+release/pi-agent-dock-desktop.exe
+release/pi-agent-dock-desktop_<version>_x64-setup.exe
+release/pi-agent-dock-desktop_<version>_x64_en-US.msi
 release/SHA256SUMS-<version>.txt
 ```
 

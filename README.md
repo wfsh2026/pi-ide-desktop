@@ -1,9 +1,11 @@
-# pi-ide-desktop
+# Pi Agent Dock
 
 <img width="1282" height="852" alt="image" src="https://github.com/user-attachments/assets/8c388592-e46e-4709-a43f-a6bc4e567623" />
 
 
-面向 [Pi Coding Agent](https://pi.dev/) 的 Windows 桌面 IDE 容器，基于 Tauri + React + xterm.js。
+中文名：Pi 智能体工作坞。
+
+面向 [Pi Coding Agent](https://pi.dev/) 的 Windows 桌面智能体工作坞，基于 Tauri + React + xterm.js。
 
 将 Pi CLI 包装为桌面应用，提供项目管理、会话管理、终端交互、会话视图、目录树、文件追踪等能力。
 
@@ -24,7 +26,7 @@ npm install -g --force @earendil-works/pi-coding-agent
 
 旧包 `@mariozechner/pi-coding-agent` 已不推荐使用。
 
-Subagent 展示由 Pi IDE 原生支持，但不强制安装任何第三方扩展。IDE 会识别 `subagent` / `run_subagent` / `agent` 工具调用，并在会话视图中生成可展开的子 Agent 卡片；自定义 Pi 扩展也可以写入 `.pi/pi-ide-events.jsonl` 的 `kind: "subagent"` 事件来接入同一套展示。
+Subagent 展示由 Pi Agent Dock 原生支持，但不强制安装任何第三方扩展。应用会识别 `subagent` / `run_subagent` / `agent` 工具调用，并在会话视图中生成可展开的子 Agent 卡片；自定义 Pi 扩展也可以写入 `.pi/pi-ide-events.jsonl` 的 `kind: "subagent"` 事件来接入同一套展示。
 
 ## 核心功能
 
@@ -81,7 +83,7 @@ Subagent 展示由 Pi IDE 原生支持，但不强制安装任何第三方扩展
 ### 开发运行
 
 ```bash
-cd pi-ide-desktop
+cd pi-agent-dock-desktop
 npm install
 npm run tauri:dev
 ```
@@ -95,9 +97,9 @@ npm run package:release
 产物：
 
 ```text
-release/pi-ide-desktop_2.0.0_x64-setup.exe
-release/pi-ide-desktop_2.0.0_x64_en-US.msi
-release/pi-ide-desktop.exe
+release/pi-agent-dock-desktop_2.0.0_x64-setup.exe
+release/pi-agent-dock-desktop_2.0.0_x64_en-US.msi
+release/pi-agent-dock-desktop.exe
 release/SHA256SUMS-2.0.0.txt
 ```
 
@@ -150,7 +152,7 @@ release/SHA256SUMS-2.0.0.txt
 ## 目录结构
 
 ```text
-pi-ide-desktop/
+pi-agent-dock-desktop/
 ├─ src/
 │  ├─ App.jsx                         # 主应用
 │  ├─ main.jsx                        # 入口

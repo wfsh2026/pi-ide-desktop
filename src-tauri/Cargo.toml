@@ -1,8 +1,8 @@
 [package]
-name = "pi-ide-desktop"
+name = "pi-agent-dock-desktop"
 version = "2.0.0"
-description = "A lightweight desktop IDE container for pi.dev Pi Coding Agent"
-authors = ["Pi IDE"]
+description = "A lightweight desktop agent dock for pi.dev Pi Coding Agent"
+authors = ["Pi Agent Dock"]
 edition = "2021"
 
 [build-dependencies]

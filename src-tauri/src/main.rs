@@ -1422,7 +1422,7 @@ function limitText(value) {
   const text = String(value || "");
   const limit = eventTextLimit();
   if (text.length <= limit) return text;
-  return `${text.slice(0, limit)}\n[Pi IDE truncated ${text.length - limit} chars]`;
+  return `${text.slice(0, limit)}\n[Pi Agent Dock truncated ${text.length - limit} chars]`;
 }
 
 function toolResultTextLimit() {
@@ -1469,7 +1469,7 @@ function limitToolText(value) {
   const limit = toolResultTextLimit();
   if (text.length <= limit) return { text, truncated: false };
   return {
-    text: `${text.slice(0, limit)}\n[Pi IDE tool result truncated ${text.length - limit} chars]`,
+    text: `${text.slice(0, limit)}\n[Pi Agent Dock tool result truncated ${text.length - limit} chars]`,
     truncated: true,
   };
 }
@@ -1515,7 +1515,7 @@ function applyToolPolicy(event, ctx) {
   if (event.toolName === "bash") {
     const command = String(input.command || input.cmd || "");
     if (dangerousCommandPattern().test(command)) {
-      return blockTool(ctx, event, "Blocked dangerous shell command by Pi IDE policy");
+      return blockTool(ctx, event, "Blocked dangerous shell command by Pi Agent Dock policy");
     }
   }
 
@@ -1523,7 +1523,7 @@ function applyToolPolicy(event, ctx) {
     const rawPath = String(input.path || "");
     const normalized = normalizeFilePath(ctx?.cwd || process.cwd(), rawPath);
     if (normalized && protectedPathPattern().test(normalized)) {
-      return blockTool(ctx, event, `Blocked protected path by Pi IDE policy: ${path.basename(normalized)}`);
+      return blockTool(ctx, event, `Blocked protected path by Pi Agent Dock policy: ${path.basename(normalized)}`);
     }
   }
 
@@ -1864,14 +1864,14 @@ export default function(pi) {
     }, 800);
   } catch (_) {}
   pi.registerCommand("pi-ide-list-models", {
-    description: "Emit available models for Pi IDE Desktop",
+    description: "Emit available models for Pi Agent Dock",
     handler: async (_args, ctx) => {
       emitModels(ctx, "command");
     },
   });
 
   pi.registerCommand("pi-ide-switch-model", {
-    description: "Switch model from Pi IDE Desktop. Args: JSON { provider, id }",
+    description: "Switch model from Pi Agent Dock. Args: JSON { provider, id }",
     handler: async (args, ctx) => {
       let payload;
       try {
@@ -2240,17 +2240,17 @@ fn clear_terminal_cache_logs(dir: &Path, items: &mut Vec<serde_json::Value>) -> 
 fn ensure_pi_ide_file_tracker(workdir: &Path, project_event_max_bytes: u64) -> Result<(), String> {
   let pi_dir = workdir.join(".pi");
   let extensions_dir = pi_dir.join("extensions");
-  fs::create_dir_all(&extensions_dir).map_err(|e| format!("创建 Pi IDE 扩展目录失败: {e}"))?;
+  fs::create_dir_all(&extensions_dir).map_err(|e| format!("创建 Pi Agent Dock 扩展目录失败: {e}"))?;
   fs::write(extensions_dir.join("pi-ide-file-tracker.ts"), PI_IDE_BRIDGE_EXTENSION)
-    .map_err(|e| format!("写入 Pi IDE 事件桥扩展失败: {e}"))?;
+    .map_err(|e| format!("写入 Pi Agent Dock 事件桥扩展失败: {e}"))?;
   let events_path = pi_ide_events_path(workdir);
   if !events_path.exists() {
-    fs::write(&events_path, "").map_err(|e| format!("初始化 Pi IDE 事件流失败: {e}"))?;
+    fs::write(&events_path, "").map_err(|e| format!("初始化 Pi Agent Dock 事件流失败: {e}"))?;
   }
   clear_file_if_oversized(&events_path, project_event_max_bytes)?;
   let legacy_events_path = pi_ide_file_events_path(workdir);
   if !legacy_events_path.exists() {
-    fs::write(&legacy_events_path, "").map_err(|e| format!("初始化 Pi IDE 文件事件失败: {e}"))?;
+    fs::write(&legacy_events_path, "").map_err(|e| format!("初始化 Pi Agent Dock 文件事件失败: {e}"))?;
   }
   Ok(())
 }
@@ -2621,13 +2621,21 @@ fn register_windows_context_menu() -> Result<(), String> {
   let background_command = format!("\"{}\" \"%V\"", exe);
   let hkcu = RegKey::predef(HKEY_CURRENT_USER);
 
+  for key_path in [
+    "Software\\Classes\\Directory\\shell\\OpenWithPiDesktop",
+    "Software\\Classes\\Drive\\shell\\OpenWithPiDesktop",
+    "Software\\Classes\\Directory\\Background\\shell\\OpenWithPiDesktop",
+  ] {
+    let _ = hkcu.delete_subkey_all(key_path);
+  }
+
   for (key_path, cmd) in [
-    ("Software\\Classes\\Directory\\shell\\OpenWithPiDesktop", command.as_str()),
-    ("Software\\Classes\\Drive\\shell\\OpenWithPiDesktop", command.as_str()),
-    ("Software\\Classes\\Directory\\Background\\shell\\OpenWithPiDesktop", background_command.as_str()),
+    ("Software\\Classes\\Directory\\shell\\OpenWithPiAgentDock", command.as_str()),
+    ("Software\\Classes\\Drive\\shell\\OpenWithPiAgentDock", command.as_str()),
+    ("Software\\Classes\\Directory\\Background\\shell\\OpenWithPiAgentDock", background_command.as_str()),
   ] {
     let (key, _) = hkcu.create_subkey(key_path).map_err(|e| format!("创建右键菜单注册表失败 {key_path}: {e}"))?;
-    key.set_value("", &"Open with Pi Desktop").map_err(|e| format!("写入右键菜单名称失败: {e}"))?;
+    key.set_value("", &"Open with Pi Agent Dock").map_err(|e| format!("写入右键菜单名称失败: {e}"))?;
     key.set_value("Icon", &exe).map_err(|e| format!("写入右键菜单图标失败: {e}"))?;
     let (command_key, _) = key.create_subkey("command").map_err(|e| format!("创建右键菜单命令失败: {e}"))?;
     command_key.set_value("", &cmd).map_err(|e| format!("写入右键菜单命令失败: {e}"))?;
@@ -3633,7 +3641,7 @@ fn main() {
       }
       let handle = app.handle().clone();
       tauri::async_runtime::spawn(async move {
-        let _ = handle.emit("pi-status", "Pi IDE 已就绪");
+        let _ = handle.emit("pi-status", "Pi Agent Dock 已就绪");
       });
       Ok(())
     })

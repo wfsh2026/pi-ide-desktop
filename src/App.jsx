@@ -2958,7 +2958,7 @@ export default function App() {
         </div>
       )}
       <aside className="sidebar left">
-        <div className="brand">Pi IDE</div>
+        <div className="brand">Pi Agent Dock</div>
         <ProjectPanel
           projects={projects}
           activeProjectId={activeProjectId}

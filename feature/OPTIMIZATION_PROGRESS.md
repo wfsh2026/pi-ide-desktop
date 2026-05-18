@@ -1,10 +1,10 @@
-# Pi IDE 性能与稳定性优化进度
+# Pi Agent Dock 性能与稳定性优化进度
 
 更新时间：2026-05-13
 
 ## 目标
 
-解决 Pi IDE 在长时间使用、长输出、长内容分析、多会话并发时出现的卡顿、崩溃、存储膨胀和高频 I/O 问题。优化原则是先止血，再逐步把结构化能力迁移到 Pi RPC 或 Pi extension。
+解决 Pi Agent Dock 在长时间使用、长输出、长内容分析、多会话并发时出现的卡顿、崩溃、存储膨胀和高频 I/O 问题。优化原则是先止血，再逐步把结构化能力迁移到 Pi RPC 或 Pi extension。
 
 ## 成功标准
 
@@ -68,7 +68,7 @@ Pi 官方支持 RPC 模式，适合 IDE 或自定义 UI 作为结构化主通道
 - `PI_IDE_READ_LIMIT`：Pi extension 自动给 `read` 工具补上的读取行数上限，默认 `1200`。
 - `PI_IDE_TOOL_RESULT_TEXT_LIMIT`：Pi extension 返回给模型的单个工具结果文本上限，默认 `50000`。
 - `<项目>/.pi.ide/config.json` 或 `~/.pi-ide/config.json` 的 `storage.eventMode`：事件持久化模式，默认 `compact`，可设为 `full` 或 `off`。
-- `storage.eventTextLimit`：Pi IDE 事件写入的单段文本上限，默认 `51200`。
+- `storage.eventTextLimit`：Pi Agent Dock 事件写入的单段文本上限，默认 `51200`。
 - `storage.projectEventMaxBytes`：项目级 `.pi/pi-ide-events.jsonl` 最大保留体积，默认 `5MB`，超过后自动清空。
 - `storage.terminalLogMaxBytes`：单个 IDE 会话 `terminal.log` 最大保留体积，默认 `2MB`，设置为 `0` 表示不保留终端日志。
 - `PI_IDE_DANGEROUS_COMMAND_PATTERN`：危险 shell 命令正则，默认拦截 `rm -rf`、`git reset --hard`、`git clean -f`、`del /s`、`format`、`mkfs`、递归 `Remove-Item`。
@@ -110,17 +110,17 @@ Pi 官方支持 RPC 模式，适合 IDE 或自定义 UI 作为结构化主通道
 - 验证通过：`node src/projectStorageModel.test.mjs`、`node src/sessionTimelineModel.test.mjs`、`node src/piIdeEventMapper.test.mjs`、`npm run build`。
 - 2026-05-13：针对打开项目卡顿风险进一步收紧目录树加载规则：移除切换项目时自动加载目录树的 effect，`get_directory_tree` 首次只返回根节点且不预扫描 preview lines；用户展开目录时再调用 `get_directory_children`。验证通过：`npm run build`、`node src/projectStorageModel.test.mjs`、`node src/sessionTimelineModel.test.mjs`、`node src/piIdeEventMapper.test.mjs`、`cargo check`。
 - 2026-05-13：继续优化默认启动内容：项目打开/切换时不再自动执行 Pi 环境检测，只重置环境状态并等待用户点击“环境设置”或发送任务时检测；配置 ensure 延迟执行；非终端视图切换会话时延迟读取终端日志尾部。
-- 2026-05-13：完成会话切换体验修复和终端滚动方案重构。会话视图移除最近记录窗口限制，恢复完整 turn 渲染，并新增 Markdown 表格渲染支持；终端视图移除自定义滚动条和 wheel 事件拦截，改为完全信任 xterm 原生 viewport 滚动，同时停止过滤 ANSI 控制序列；Pi IDE bridge 事件文本上限提升到 10000000。
+- 2026-05-13：完成会话切换体验修复和终端滚动方案重构。会话视图移除最近记录窗口限制，恢复完整 turn 渲染，并新增 Markdown 表格渲染支持；终端视图移除自定义滚动条和 wheel 事件拦截，改为完全信任 xterm 原生 viewport 滚动，同时停止过滤 ANSI 控制序列；Pi Agent Dock bridge 事件文本上限提升到 10000000。
 
 ## 2026-05-14 增量进度：存储降噪与异常缓存清理
 
-- 默认存储策略改为 `compact`：Pi IDE bridge 不再持久化高频 `message_update` 和 `tool_execution_update` 事件，减少 `.pi/pi-ide-events.jsonl` 增长速度；如需完整事件，可通过 `storage.eventMode` 调整。
+- 默认存储策略改为 `compact`：Pi Agent Dock bridge 不再持久化高频 `message_update` 和 `tool_execution_update` 事件，减少 `.pi/pi-ide-events.jsonl` 增长速度；如需完整事件，可通过 `storage.eventMode` 调整。
 - 新增存储配置默认值：事件文本上限 `51200`、工具结果文本上限 `51200`、项目事件文件上限 `5MB`、单会话终端日志上限 `2MB`。
 - 新增后端清理命令 `clean_pi_ide_cache`：清空 IDE debug 日志、`~/.pi-ide/pi-sessions/**/terminal.log`、已知项目的 `.pi/pi-ide-events.jsonl` 和 `.pi/pi-ide-file-events.jsonl`；明确不删除 `~/.pi/agent/sessions`。
 - 新增“环境设置 -> 清理缓存”入口：用户可一键清理旧版本异常缓存，并看到释放空间和清理文件数；同时清空本地 `session.output` 终端预览缓存。
 - 已同步清理异常文件内容：`F:\SausageProject\B-SplitProject\.pi\pi-ide-events.jsonl` 已从 103MB 清理到受控范围，`~/.pi-ide/pi-sessions` 下历史 `terminal.log` 已裁剪到默认上限范围。
 - 验证通过：`node src/projectStorageModel.test.mjs`、`node src/sessionTimelineModel.test.mjs`、`node src/piIdeEventMapper.test.mjs`、`node src/sessionMarkdownTableModel.test.mjs`、`npm run build`、`cargo test config_tests -- --nocapture`、`cargo check`。
-- 修复 Pi IDE bridge 对 `message.content` 类型的错误假设：`textContent`、`messageContentSummary` 和 `compactToolContent` 现在统一兼容字符串、数组和对象，避免 `content.map is not a function` 扩展运行时报错；已同步更新当前项目的 `.pi/extensions/pi-ide-file-tracker.ts`。
+- 修复 Pi Agent Dock bridge 对 `message.content` 类型的错误假设：`textContent`、`messageContentSummary` 和 `compactToolContent` 现在统一兼容字符串、数组和对象，避免 `content.map is not a function` 扩展运行时报错；已同步更新当前项目的 `.pi/extensions/pi-ide-file-tracker.ts`。
 - 修复 `localStorage` 配额满导致消息无法发送的问题：项目缓存写入失败时自动降级为瘦身快照，仍失败则只保留内存态并提示，不再中断 `sendCommand` 到 Pi 的发送链路；默认本地缓存上限同步收紧。
 
 ## 2026-05-15 增量进度：Subagent 记录兼容与调试
@@ -128,6 +128,6 @@ Pi 官方支持 RPC 模式，适合 IDE 或自定义 UI 作为结构化主通道
 - 对照 `pi.dev` 与 `nicobailon/pi-subagents`：开源最新版通过 `pi.registerTool({ name: "subagent" })` 暴露原生 `subagent` 工具；Agent 定义文件位于 `.pi/agents/**/*.md`，可选通过 `pi-intercom` 做父子会话协调。
 - 本地运行环境的 `pi-subagents 0.24.0` 中 `pi.registerTool(tool)` 被注释，当前会话实际只暴露 `read/bash/edit/write/intercom` 等工具，因此右侧 Subagent 不能只依赖 `toolName: "subagent"`。
 - IDE 事件映射新增兼容路径：原生 `subagent/run_subagent/agent` 工具事件继续记录；`.pi/agents/*.md` 的 `write/edit` 记录为“子 Agent 已定义”；`intercom` 工具记录为跨会话子 Agent 委托。
-- Pi IDE bridge 新增 `subagent_trace` 调试事件，默认不写入；只有 `debug.enabled` 或 `PI_IDE_SUBAGENT_DEBUG` 开启时记录工具名、阶段、识别结果和输入字段。
+- Pi Agent Dock bridge 新增 `subagent_trace` 调试事件，默认不写入；只有 `debug.enabled` 或 `PI_IDE_SUBAGENT_DEBUG` 开启时记录工具名、阶段、识别结果和输入字段。
 - 前端只在调试开启时写入 Subagent trace/debug 日志；默认状态不增加日志 I/O。
 - 验证通过：`node src/piIdeEventMapper.test.mjs`、`node src/subagentSummary.test.mjs`。

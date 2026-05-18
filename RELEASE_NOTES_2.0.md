@@ -1,4 +1,4 @@
-# pi-ide-desktop 2.0.0 发布说明
+# Pi Agent Dock 2.0.0 发布说明
 
 > **全面进化 — 从终端容器到结构化 AI IDE**
 
@@ -7,7 +7,7 @@
 
 ## 版本定位
 
-V2.0 标志着 pi-ide-desktop 从"Pi CLI 桌面容器"正式进化为**结构化 AI IDE 工作台**。自 V1.0 以来，经过数十个迭代版本，在会话视图、终端渲染、目录树、事件追踪、子 Agent 展示、拖拽交互等核心维度实现了全面重构与能力跃升。
+V2.0 标志着 Pi Agent Dock 从"Pi CLI 桌面容器"正式进化为**结构化 AI IDE 工作台**。自 V1.0 以来，经过数十个迭代版本，在会话视图、终端渲染、目录树、事件追踪、子 Agent 展示、拖拽交互等核心维度实现了全面重构与能力跃升。
 
 ## 2.0 核心亮点
 
@@ -78,16 +78,16 @@ V2.0 标志着 pi-ide-desktop 从"Pi CLI 桌面容器"正式进化为**结构化
 ## 构建产物
 
 ```text
-release/pi-ide-desktop.exe
-release/pi-ide-desktop_2.0.0_x64-setup.exe
-release/pi-ide-desktop_2.0.0_x64_en-US.msi
+release/pi-agent-dock-desktop.exe
+release/pi-agent-dock-desktop_2.0.0_x64-setup.exe
+release/pi-agent-dock-desktop_2.0.0_x64_en-US.msi
 release/SHA256SUMS-2.0.0.txt
 ```
 
 建议优先使用：
 
 ```text
-release/pi-ide-desktop_2.0.0_x64-setup.exe
+release/pi-agent-dock-desktop_2.0.0_x64-setup.exe
 ```
 
 ## 升级说明
@@ -111,4 +111,4 @@ V2.0 完全向后兼容 V1.x 的本地数据：
 
 ## 致谢
 
-感谢所有提供反馈和贡献的用户，让 pi-ide-desktop 从一个简单的终端包装器一步步成长为真正的 AI IDE 工作台。
+感谢所有提供反馈和贡献的用户，让 Pi Agent Dock 从一个简单的终端包装器一步步成长为真正的 AI IDE 工作台。

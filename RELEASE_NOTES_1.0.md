@@ -1,4 +1,4 @@
-# pi-ide-desktop 1.0.0 发布说明
+# Pi Agent Dock 1.0.0 发布说明
 
 发布日期：2026-05-12
 分支：`main`
@@ -13,7 +13,7 @@
 
 ## 版本定位
 
-`pi-ide-desktop` 1.0.0 是面向 Pi Coding Agent 的桌面 IDE 验收版本。该版本聚焦于 Windows 桌面端使用体验，提供项目管理、Pi 终端承载、增强会话输入、目录树、会话文件追踪与安装包交付能力。
+`pi-agent-dock-desktop` 1.0.0 是面向 Pi Coding Agent 的桌面智能体工作坞验收版本。该版本聚焦于 Windows 桌面端使用体验，提供项目管理、Pi 终端承载、增强会话输入、目录树、会话文件追踪与安装包交付能力。
 
 ## 核心功能
 

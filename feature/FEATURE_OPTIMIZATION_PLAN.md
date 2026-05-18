@@ -1,10 +1,10 @@
-# pi-ide-desktop 功能优化开发计划
+# Pi Agent Dock 功能优化开发计划
 
 更新时间：2026-05-12
 
 ## 目标
 
-基于当前 `pi-ide-desktop` 已有功能，对标主流 AI Coding IDE 的使用体验，整理后续可优化方向。
+基于当前 `pi-agent-dock-desktop` 已有功能，对标主流 AI Coding IDE 的使用体验，整理后续可优化方向。
 
 当前产品已经具备：
 

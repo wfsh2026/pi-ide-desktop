@@ -1,9 +1,9 @@
-# Pi IDE Desktop 测试步骤
+# Pi Agent Dock 测试步骤
 
 ## 快速冒烟测试
 
 ```bash
-cd pi-ide-desktop
+cd pi-agent-dock-desktop
 pnpm install
 pnpm tauri:dev
 ```
